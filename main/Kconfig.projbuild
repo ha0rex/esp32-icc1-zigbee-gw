@@ -1,0 +1,145 @@
+menu "ICC-1 Zigbee Gateway"
+
+    menu "ICC UART"
+
+        config ICC_UART_PORT_NUM
+            int "UART port number"
+            range 0 1
+            default 1
+            help
+                ESP32-C3 UART port used for the ICC-1 NCP (EZSP/ASH).
+
+        config ICC_UART_TX_GPIO
+            int "UART TX GPIO (ESP -> ICC RX)"
+            default 6
+            help
+                ESP32 TX connected to ICC pad 2 / PB15 / RX.
+
+        config ICC_UART_RX_GPIO
+            int "UART RX GPIO (ESP <- ICC TX)"
+            default 7
+            help
+                ESP32 RX connected to ICC pad 3 / PB14 / TX.
+
+        config ICC_UART_BAUD
+            int "UART baud rate"
+            default 115200
+            help
+                Must match the NCP firmware (NCP_USW_115k2_* = 115200).
+
+        config ICC_UART_RX_BUF_SIZE
+            int "UART RX ring buffer size"
+            default 2048
+
+        config ICC_UART_TX_BUF_SIZE
+            int "UART TX ring buffer size"
+            default 1024
+
+    endmenu
+
+    menu "ASH / EZSP debug"
+
+        config ASH_LOG_HEX_FRAMES
+            bool "Log ASH TX/RX frames as hex"
+            default y
+
+        config EZSP_LOG_HEX_FRAMES
+            bool "Log EZSP command/response payloads as hex"
+            default y
+
+        config ASH_ACK_TIMEOUT_MS
+            int "ASH DATA ACK timeout (ms)"
+            default 1600
+
+        config ASH_CONNECT_TIMEOUT_MS
+            int "ASH RSTACK wait timeout (ms)"
+            default 3000
+
+        config ASH_RETRY_INTERVAL_MS
+            int "ICC reconnect retry interval (ms)"
+            default 5000
+
+        config EZSP_COMMAND_TIMEOUT_MS
+            int "EZSP command response timeout (ms)"
+            default 3000
+
+    endmenu
+
+    menu "Wi-Fi"
+
+        config WIFI_ENABLED
+            bool "Enable Wi-Fi (SoftAP setup + station)"
+            default y
+            help
+                Boots a SoftAP provisioning portal. Home Wi-Fi is configured
+                via the web UI and stored in NVS. Failures never block ICC probing.
+
+        config WIFI_AP_SSID_PREFIX
+            string "SoftAP SSID prefix"
+            default "ICC1-Gateway"
+            depends on WIFI_ENABLED
+            help
+                SoftAP name becomes PREFIX-XXYY using the last two MAC octets.
+
+        config WIFI_AP_CHANNEL
+            int "SoftAP channel"
+            range 1 11
+            default 1
+            depends on WIFI_ENABLED
+
+        config WIFI_AP_OPEN
+            bool "Open SoftAP (no password)"
+            default y
+            depends on WIFI_ENABLED
+            help
+                Recommended for first-time setup on a phone.
+
+        config WIFI_AP_PASSWORD
+            string "SoftAP password (WPA2, min 8 chars)"
+            default "icc1setup"
+            depends on WIFI_ENABLED && !WIFI_AP_OPEN
+
+        config WIFI_SSID
+            string "Optional default home Wi-Fi SSID (dev only)"
+            default ""
+            depends on WIFI_ENABLED
+            help
+                If NVS has no credentials, seed from this value once.
+                Prefer empty and use the SoftAP portal instead.
+
+        config WIFI_PASSWORD
+            string "Optional default home Wi-Fi password (dev only)"
+            default ""
+            depends on WIFI_ENABLED
+
+        config WIFI_MAX_RETRY
+            int "STA max retry before SoftAP-only fallback"
+            default 10
+            depends on WIFI_ENABLED
+
+        config WEB_HTTP_PORT
+            int "HTTP portal/status port"
+            default 80
+            depends on WIFI_ENABLED
+
+    endmenu
+
+    menu "HomeKit Bridge"
+        config HK_ENABLED
+            bool "Enable HomeKit bridge"
+            default y
+            help
+                Expose selected Zigbee devices to Apple Home via esp-homekit-sdk.
+
+        config HK_SETUP_CODE
+            string "HomeKit setup code (xxx-xx-xxx)"
+            default "111-22-333"
+            depends on HK_ENABLED
+
+        config HK_SETUP_ID
+            string "HomeKit setup ID (4 chars)"
+            default "ICC1"
+            depends on HK_ENABLED
+    endmenu
+
+endmenu
