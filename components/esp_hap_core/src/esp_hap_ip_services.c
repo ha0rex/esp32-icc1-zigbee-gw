@@ -1453,6 +1453,11 @@ static void hap_send_notification(void *arg)
                 _hc->owner_ctrl = 0;
             }
             if (!hap_char_is_ctrl_subscribed(hc, i)) {
+                /* Never force-EV Name/Configured Name — string EVENTs provoked
+                 * session churn and wedged C3 Wi‑Fi / the portal httpd. */
+                if (_hc->format == HAP_CHAR_FORMAT_STRING) {
+                    continue;
+                }
                 hap_char_manage_notification((hap_char_t *)hc, i, true);
             }
 
@@ -1499,9 +1504,10 @@ static void hap_send_notification(void *arg)
         hap_mdns_announce(false);
         hap_priv.disconnected_event_sent = true;
     }
-    /* No live EVENT socket, or send failed — force Home to reconnect/GET
-     * (same effect as lock→unlock). */
-    if (!ctrl_connected || !any_delivered) {
+    /* Only provoke when a controller is connected but EVENT could not be
+     * delivered. Provoking with ctrl_connected=0 used force_reannounce and
+     * starved C3 Wi‑Fi / the web UI after name or sensor EVENT queues. */
+    if (ctrl_connected && !any_delivered) {
         hap_provoke_controller_refresh();
     }
     hap_platform_memory_free(char_arr);

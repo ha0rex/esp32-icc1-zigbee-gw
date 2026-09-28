@@ -270,6 +270,59 @@ int hap_char_update_val(hap_char_t *hc, hap_val_t *val)
 	return HAP_SUCCESS;
 }
 
+int hap_char_update_val_silent(hap_char_t *hc, hap_val_t *val)
+{
+    if (!hc || !val) {
+        return HAP_FAIL;
+    }
+    __hap_char_t *_hc = (__hap_char_t *)hc;
+    _hc->update_called = true;
+    if (hap_char_check_val_constraints(_hc, val) != HAP_SUCCESS) {
+        return HAP_FAIL;
+    }
+
+    switch (_hc->format) {
+        case HAP_CHAR_FORMAT_BOOL:
+            _hc->val.b = val->b;
+            break;
+        case HAP_CHAR_FORMAT_INT:
+        case HAP_CHAR_FORMAT_UINT8:
+        case HAP_CHAR_FORMAT_UINT16:
+        case HAP_CHAR_FORMAT_UINT32:
+            _hc->val.i = val->i;
+            break;
+        case HAP_CHAR_FORMAT_FLOAT:
+            _hc->val.f = val->f;
+            break;
+        case HAP_CHAR_FORMAT_STRING:
+            if (_hc->val.s && val->s && !strcmp(_hc->val.s, val->s)) {
+                _hc->owner_ctrl = 0;
+                return HAP_SUCCESS;
+            }
+            if (_hc->val.s) {
+                hap_platform_memory_free(_hc->val.s);
+                _hc->val.s = NULL;
+            }
+            if (val->s) {
+                _hc->val.s = strdup(val->s);
+                if (!_hc->val.s) {
+                    return HAP_FAIL;
+                }
+            }
+            break;
+        case HAP_CHAR_FORMAT_DATA:
+        case HAP_CHAR_FORMAT_TLV8:
+            _hc->val.d.buf = val->d.buf;
+            _hc->val.d.buflen = val->d.buflen;
+            break;
+        default:
+            break;
+    }
+    /* No hap_queue_event — callers that need live UI use hap_char_update_val. */
+    _hc->owner_ctrl = 0;
+    return HAP_SUCCESS;
+}
+
 const hap_val_t *hap_char_get_val(hap_char_t *hc)
 {
     if (!hc)

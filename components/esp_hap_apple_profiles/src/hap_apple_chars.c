@@ -247,6 +247,20 @@ hap_char_t *hap_char_name_create(char *name)
     return hc;
 }
 
+/* Char: Configured Name — PR|PW (no EV). Portal drives the label; EV name
+ * updates flooded the HAP queue and provoked session/mDNS churn on C3. */
+hap_char_t *hap_char_configured_name_create(char *name)
+{
+    hap_char_t *hc = hap_char_string_create(HAP_CHAR_UUID_CONFIGURED_NAME,
+                                            HAP_CHAR_PERM_PR | HAP_CHAR_PERM_PW,
+                                            name);
+    if (!hc) {
+        return NULL;
+    }
+    hap_char_string_set_maxlen(hc, 64);
+    return hc;
+}
+
 /* Char: Obstruction Detected */
 hap_char_t *hap_char_obstruction_detect_create(bool obstr_detect)
 {

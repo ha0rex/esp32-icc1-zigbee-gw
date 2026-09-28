@@ -1246,8 +1246,8 @@ esp_err_t web_server_start(void)
     config.lru_purge_enable = true;
     config.max_uri_handlers = 32;
     config.stack_size = 12288;
-    config.recv_wait_timeout = 10;
-    config.send_wait_timeout = 10;
+    config.recv_wait_timeout = 4;
+    config.send_wait_timeout = 4;
     config.max_open_sockets = 4; /* Keep room for HAP (needs ~8) under LWIP socket budget */
 
     esp_err_t err = httpd_start(&s_server, &config);

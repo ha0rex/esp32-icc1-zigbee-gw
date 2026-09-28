@@ -163,12 +163,8 @@ static void hap_common_sm(hap_internal_event_t event)
             ESP_LOGI("hap", "provoke refresh: close %d session(s) + mDNS s#", n);
             hap_close_all_sessions();
             hap_priv.disconnected_event_sent = false;
-            if (n == 0) {
-                /* No socket to RST — gently re-advertise so Home rediscovers. */
-                hap_mdns_force_reannounce();
-            } else {
-                hap_mdns_announce(false);
-            }
+            /* Never force_reannounce here — mdns stop/start starved C3 Wi‑Fi. */
+            hap_mdns_announce(false);
             return;
         }
         case HAP_INTERNAL_EVENT_NETWORK_SWITCH:

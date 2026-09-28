@@ -59,6 +59,7 @@ extern "C" {
 #define HAP_CHAR_UUID_MODEL                                     "21"
 #define HAP_CHAR_UUID_MOTION_DETECTED                           "22"
 #define HAP_CHAR_UUID_NAME                                      "23"
+#define HAP_CHAR_UUID_CONFIGURED_NAME                           "E3"
 #define HAP_CHAR_UUID_OBSTRUCTION_DETECTED                      "24"
 #define HAP_CHAR_UUID_ON                                        "25"
 #define HAP_CHAR_UUID_OUTLET_IN_USE                             "26"
@@ -345,6 +346,12 @@ hap_char_t *hap_char_motion_detected_create(bool motion_detected);
  * @return NULL on failure
  */
 hap_char_t *hap_char_name_create(char *name);
+
+/**
+ * Create Configured Name Characteristic (user-editable service name).
+ * Required for renaming multi-service accessory tiles in Home (iOS 16+).
+ */
+hap_char_t *hap_char_configured_name_create(char *name);
 
 /** Create Obstruction Detected Characteristic
  *

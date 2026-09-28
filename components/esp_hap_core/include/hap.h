@@ -1047,6 +1047,15 @@ int hap_acc_add_serv(hap_acc_t *ha, hap_serv_t *hs);
 int hap_char_update_val(hap_char_t *hc, hap_val_t *val);
 
 /**
+ * @brief Update characteristic value without queuing an EVENT notification.
+ *
+ * Use for Name / Configured Name and other display-only fields where a live
+ * EVENT storm would stall Wi‑Fi / httpd. Controllers pick up the new value on
+ * the next GET (or after a gentle config/state bump elsewhere).
+ */
+int hap_char_update_val_silent(hap_char_t *hc, hap_val_t *val);
+
+/**
  * @brief Get the current value of characteristic
  *
  * @param[in] hc HAP characteristic object handle

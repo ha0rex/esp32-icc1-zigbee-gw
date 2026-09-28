@@ -43,11 +43,11 @@ static uint32_t s_inv_sig_cached;
 static bool s_inv_sig_cached_valid;
 
 /** Bump when remote accessory service layout changes (forces rebuild). */
-#define REMOTE_LAYOUT_VER 20
+#define REMOTE_LAYOUT_VER 26
 /**
  * One bridged accessory per remote, with each physical button as its own
- * Switch / Stateless Programmable Switch service (linked). Home shows the
- * remote as one device with buttons underneath.
+ * Switch / Stateless Programmable Switch service (linked). Sub-tile names
+ * come from the web UI (Name + Configured Name, silent updates).
  */
 
 /** Mark inventory dirty so announce_inventory_if_changed() bumps c# once (not per add). */
@@ -79,6 +79,7 @@ struct hk_bridged {
     hap_char_t *btn_event_char[ZB_REMOTE_MAX_BUTTONS];
     hap_char_t *btn_on_char[ZB_REMOTE_MAX_BUTTONS];
     hap_char_t *btn_name_char[ZB_REMOTE_MAX_BUTTONS];
+    hap_char_t *btn_cfg_name_char[ZB_REMOTE_MAX_BUTTONS];
     uint8_t btn_mode_snap[ZB_REMOTE_MAX_BUTTONS];
     char btn_name_snap[ZB_REMOTE_MAX_BUTTONS][24];
     hk_btn_priv_t btn_priv[ZB_REMOTE_MAX_BUTTONS];
@@ -169,7 +170,7 @@ static void update_accessory_name(hk_bridged_t *slot, const char *name)
         return;
     }
     hap_val_t val = {.s = (char *)name};
-    if (hap_char_update_val(hc, &val) == HAP_SUCCESS) {
+    if (hap_char_update_val_silent(hc, &val) == HAP_SUCCESS) {
         snprintf(slot->acc_name, sizeof(slot->acc_name), "%s", name);
     }
 }
@@ -447,8 +448,11 @@ static int remote_btn_switch_write(hap_write_data_t write_data[], int count, voi
             *(w->status) = HAP_STATUS_SUCCESS;
             ESP_LOGI(TAG, "HomeKit remote btn %u latch -> %s", (unsigned)btn,
                      w->val.b ? "ON" : "OFF");
+        } else if (!strcmp(uuid, HAP_CHAR_UUID_CONFIGURED_NAME)) {
+            /* Allow Home to ack rename; portal names remain the source of truth. */
+            hap_char_update_val(w->hc, &w->val);
+            *(w->status) = HAP_STATUS_SUCCESS;
         } else {
-            /* Service Name is PR only — rename via the web portal. */
             *(w->status) = HAP_STATUS_RES_ABSENT;
             ret = HAP_FAIL;
         }
@@ -744,7 +748,8 @@ static void update_char_string(hap_char_t *hc, const char *s)
         return;
     }
     hap_val_t val = {.s = (char *)s};
-    hap_char_update_val(hc, &val);
+    /* Silent — name EVENTs provoked session closes and wedged Wi‑Fi/httpd. */
+    hap_char_update_val_silent(hc, &val);
 }
 
 static const char *remote_button_name(uint8_t nbtn, uint8_t idx)
@@ -805,7 +810,8 @@ static bool remote_btn_layout_ok(const zb_device_t *d, uint8_t nbtn)
 
 /**
  * One HomeKit accessory for the remote. Each button is a Switch (stateful) or
- * Stateless Programmable Switch service under it; Home shows them as sub-tiles.
+ * Stateless Programmable Switch service under it; Home shows them as sub-tiles
+ * named from the web UI (Name + Configured Name).
  */
 static esp_err_t add_bridged_remote(const zb_device_t *d)
 {
@@ -876,24 +882,34 @@ static esp_err_t add_bridged_remote(const zb_device_t *d)
         slot->btn_event_char[i] = NULL;
         slot->btn_on_char[i] = NULL;
         slot->btn_name_char[i] = NULL;
+        slot->btn_cfg_name_char[i] = NULL;
 
-        hap_char_t *name_ch =
-            hap_char_string_create(HAP_CHAR_UUID_NAME, HAP_CHAR_PERM_PR, bname);
-        if (!name_ch) {
+        hap_char_t *name_ch = hap_char_name_create(bname);
+        hap_char_t *cfg_ch = hap_char_configured_name_create(bname);
+        if (!name_ch || !cfg_ch) {
+            if (name_ch) {
+                hap_char_delete(name_ch);
+            }
+            if (cfg_ch) {
+                hap_char_delete(cfg_ch);
+            }
             hap_acc_delete(acc);
             return ESP_ERR_NO_MEM;
         }
         hap_char_string_set_maxlen(name_ch, 23);
+        hap_char_string_set_maxlen(cfg_ch, 23);
 
         hap_serv_t *serv = NULL;
         if (mode == ZB_BTN_MODE_STATEFUL) {
             serv = hap_serv_switch_create(d->btn_on[i]);
             if (!serv) {
                 hap_char_delete(name_ch);
+                hap_char_delete(cfg_ch);
                 hap_acc_delete(acc);
                 return ESP_ERR_NO_MEM;
             }
             hap_serv_add_char(serv, name_ch);
+            hap_serv_add_char(serv, cfg_ch);
             hap_serv_set_write_cb(serv, remote_btn_switch_write);
             hap_serv_set_priv(serv, &slot->btn_priv[i]);
             slot->btn_on_char[i] = hap_serv_get_char_by_uuid(serv, HAP_CHAR_UUID_ON);
@@ -901,10 +917,12 @@ static esp_err_t add_bridged_remote(const zb_device_t *d)
             serv = hap_serv_stateless_programmable_switch_create(0);
             if (!serv) {
                 hap_char_delete(name_ch);
+                hap_char_delete(cfg_ch);
                 hap_acc_delete(acc);
                 return ESP_ERR_NO_MEM;
             }
             hap_serv_add_char(serv, name_ch);
+            hap_serv_add_char(serv, cfg_ch);
             hap_serv_set_write_cb(serv, remote_btn_switch_write);
             hap_serv_set_priv(serv, &slot->btn_priv[i]);
             hap_char_t *ev =
@@ -916,6 +934,7 @@ static esp_err_t add_bridged_remote(const zb_device_t *d)
             slot->btn_event_char[i] = ev;
         }
         slot->btn_name_char[i] = name_ch;
+        slot->btn_cfg_name_char[i] = cfg_ch;
         btn_servs[i] = serv;
         hap_acc_add_serv(acc, serv);
         if (!primary) {
@@ -1021,7 +1040,6 @@ static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8
     hap_char_enable_notif_all_sessions(ev);
     hap_val_t val = {.i = (int)event};
     hap_char_update_val(ev, &val);
-    /* Same as stateful: EVENT path provokes only if undelivered. */
     if (s_sync_mu) {
         xSemaphoreGive(s_sync_mu);
     }
@@ -1455,8 +1473,12 @@ static void sync_from_zigbee(void)
                     if (s_bridged[i].btn_name_char[bi]) {
                         update_char_string(s_bridged[i].btn_name_char[bi], bname);
                     }
+                    if (s_bridged[i].btn_cfg_name_char[bi]) {
+                        update_char_string(s_bridged[i].btn_cfg_name_char[bi], bname);
+                    }
                     snprintf(s_bridged[i].btn_name_snap[bi],
                              sizeof(s_bridged[i].btn_name_snap[bi]), "%s", bname);
+                    ESP_LOGI(TAG, "HomeKit remote btn %u name -> '%s'", (unsigned)bi, bname);
                 }
             }
             if (d.has_battery && s_bridged[i].batt_char) {
