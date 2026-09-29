@@ -45,6 +45,16 @@ static const char *TAG = "wifi_mgr";
 #define SOFTAP_STOP_DELAY_MS 8000
 /** SoftAP only after this many failed STA retries (not on the first blip). */
 #define SOFTAP_AFTER_RETRY 5
+/** Health loop period. */
+#define WIFI_HEALTH_MS 10000
+/** Ignore health shortly after join. */
+#define GOT_IP_GRACE_US 15000000LL
+/** Recent portal/HAP hit ⇒ radio healthy. */
+#define INBOUND_OK_US 40000000LL
+/** No portal/HAP for this long ⇒ treat as classic silent STA (even if GW probe OK). */
+#define INBOUND_SILENT_US 55000000LL
+/** Cap how long soft-reconnect / radio-cycle owns the STA stack. */
+#define RECOVERY_TIMEOUT_US 20000000LL
 
 static EventGroupHandle_t s_wifi_events;
 static wifi_manager_status_t s_status;
@@ -62,7 +72,8 @@ static uint8_t s_recovery_depth; /* 0=none, 1=reconnect done, 2=stop/start done 
 static bool s_bssid_locked;
 static uint8_t s_locked_bssid[6];
 static volatile bool s_in_recovery;
-/** SoftAP raised because STA inbound is dead — do not auto-tear it down. */
+static int64_t s_recovery_started_us;
+/** SoftAP raised because STA inbound is dead — unused (SoftAP lifeline regresses C3). */
 static bool s_softap_lifeline;
 /** Consecutive successful portal/HAP hits while SoftAP lifeline is up. */
 static uint8_t s_traffic_good_streak;
@@ -225,19 +236,21 @@ static void wifi_soft_reconnect(const char *why)
     s_got_ip_us = 0;
     s_traffic_good_streak = 0;
     s_in_recovery = true;
+    s_recovery_started_us = esp_timer_get_time();
     /* Drop any BSSID pin so reconnect can pick the stronger AP. */
     s_bssid_locked = false;
     memset(s_locked_bssid, 0, sizeof(s_locked_bssid));
+    /* Disconnect first — never esp_wifi_set_config while associated (wedges C3). */
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(400));
     wifi_config_t cfg = {0};
     if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.bssid_set) {
         cfg.sta.bssid_set = false;
         memset(cfg.sta.bssid, 0, sizeof(cfg.sta.bssid));
         esp_wifi_set_config(WIFI_IF_STA, &cfg);
     }
-    esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(500));
     esp_wifi_connect();
-    s_in_recovery = false;
+    /* Keep s_in_recovery until GOT_IP or RECOVERY_TIMEOUT — do not clear here. */
 }
 
 static void wifi_force_radio_cycle(const char *why)
@@ -252,12 +265,13 @@ static void wifi_force_radio_cycle(const char *why)
     s_bssid_locked = false;
     memset(s_locked_bssid, 0, sizeof(s_locked_bssid));
     s_in_recovery = true;
+    s_recovery_started_us = esp_timer_get_time();
     esp_wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_wifi_stop();
     vTaskDelay(pdMS_TO_TICKS(300));
     esp_wifi_start(); /* STA_START handler calls esp_wifi_connect() */
-    s_in_recovery = false;
+    /* Keep s_in_recovery until GOT_IP or timeout. */
 }
 
 void wifi_manager_soft_reconnect(void)
@@ -277,24 +291,39 @@ void wifi_manager_force_radio_cycle(void)
     wifi_force_radio_cycle("app request");
 }
 
-/** Keep STA alive without false reconnects.
- * TCP probes to the gateway often fail on filtered LAN ports while the portal
- * still works — reconnect then kills a healthy STA ~1–2 min after boot.
- * Only treat outbound probe failure as TX-dead after a long inbound quiet
- * window (real silence). SoftAP stays setup/fail-only (APSTA starves C3 TX). */
+/**
+ * Detect associated-but-silent C3 STA and recover without SoftAP.
+ *
+ * Classic failure mode: still associated, GW TCP probe may succeed, but LAN
+ * clients cannot reach the portal/HomeKit. The old health path only recovered
+ * when the GW probe failed — which left silent STA wedged forever.
+ *
+ * Escalation (STA-only): soft reconnect → wifi stop/start. Never SoftAP lifeline.
+ */
 static void wifi_health_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(15000));
-        if (!s_started || s_in_recovery) {
+        vTaskDelay(pdMS_TO_TICKS(WIFI_HEALTH_MS));
+        if (!s_started) {
             continue;
         }
+
+        int64_t now = esp_timer_get_time();
+        if (s_in_recovery) {
+            if (s_recovery_started_us && (now - s_recovery_started_us) > RECOVERY_TIMEOUT_US) {
+                ESP_LOGW(TAG, "STA recovery timeout — releasing ownership");
+                s_in_recovery = false;
+                s_recovery_started_us = 0;
+            } else {
+                continue;
+            }
+        }
+
         if (s_status.state != WIFI_MGR_CONNECTED) {
             continue;
         }
-        int64_t now = esp_timer_get_time();
-        if (s_got_ip_us && (now - s_got_ip_us) < 20000000LL) {
+        if (s_got_ip_us && (now - s_got_ip_us) < GOT_IP_GRACE_US) {
             continue;
         }
 
@@ -310,10 +339,10 @@ static void wifi_health_task(void *arg)
         }
         s_status.rssi = ap.rssi;
 
-        /* Any successful HTTP/HAP in the last 2 minutes ⇒ leave the radio alone. */
-        const bool recent_inbound =
-            s_last_traffic_us && (now - s_last_traffic_us) < 120000000LL;
-        if (recent_inbound) {
+        const int64_t quiet_us =
+            s_last_traffic_us ? (now - s_last_traffic_us)
+                              : (s_got_ip_us ? (now - s_got_ip_us) : INBOUND_SILENT_US);
+        if (quiet_us < INBOUND_OK_US) {
             s_silent_strikes = 0;
             if (s_status.ap_active && !s_softap_lifeline) {
                 schedule_softap_stop();
@@ -322,34 +351,48 @@ static void wifi_health_task(void *arg)
         }
 
         int pr = probe_gateway_tx();
-        if (pr < 0) {
-            continue;
-        }
+        bool escalate = false;
+        const char *why = NULL;
+
         if (pr == 0) {
             s_silent_strikes++;
-            ESP_LOGW(TAG, "STA health: quiet + gateway unreachable (strike %u, rssi=%d depth=%u)",
+            ESP_LOGW(TAG, "STA health: quiet + gateway unreachable (strike %u rssi=%d depth=%u)",
                      (unsigned)s_silent_strikes, (int)ap.rssi, (unsigned)s_recovery_depth);
-            if (s_silent_strikes >= 3) {
-                s_silent_strikes = 0;
-                s_traffic_good_streak = 0;
-                if (s_status.ap_active) {
-                    softap_stop();
-                }
-                if (s_recovery_depth < 1) {
-                    s_recovery_depth = 1;
-                    wifi_soft_reconnect("gateway TX dead");
-                } else {
-                    s_recovery_depth = 2;
-                    wifi_force_radio_cycle("gateway TX dead");
-                }
+            if (s_silent_strikes >= 2) {
+                escalate = true;
+                why = "gateway TX dead";
             }
+        } else if (quiet_us >= INBOUND_SILENT_US) {
+            /* Probe OK/skipped but nobody can talk to us — classic silent STA. */
+            s_silent_strikes++;
+            ESP_LOGW(TAG,
+                     "STA health: inbound silent %llds (probe=%d strike %u rssi=%d depth=%u)",
+                     (long long)(quiet_us / 1000000LL), pr, (unsigned)s_silent_strikes,
+                     (int)ap.rssi, (unsigned)s_recovery_depth);
+            if (s_silent_strikes >= 2) {
+                escalate = true;
+                why = "silent STA inbound";
+            }
+        } else {
+            ESP_LOGD(TAG, "STA health: watching quiet=%llds probe=%d",
+                     (long long)(quiet_us / 1000000LL), pr);
+        }
+
+        if (!escalate) {
             continue;
         }
 
         s_silent_strikes = 0;
-        remember_sta_bssid();
-        if (s_status.ap_active && !s_softap_lifeline) {
-            schedule_softap_stop();
+        s_traffic_good_streak = 0;
+        if (s_status.ap_active) {
+            softap_stop();
+        }
+        if (s_recovery_depth < 1) {
+            s_recovery_depth = 1;
+            wifi_soft_reconnect(why);
+        } else {
+            s_recovery_depth = 2;
+            wifi_force_radio_cycle(why);
         }
     }
 }
@@ -628,7 +671,11 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         snprintf(s_status.ip, sizeof(s_status.ip), "-");
         cancel_softap_stop();
         if (s_in_recovery) {
-            /* wifi_soft_reconnect / force_radio_cycle owns the reconnect. */
+            /* Soft reconnect / radio cycle owns reconnect — stay STA-only. */
+            if (s_status.has_sta_credentials) {
+                s_status.state = WIFI_MGR_CONNECTING;
+                esp_wifi_connect();
+            }
             return;
         }
         if (!s_status.has_sta_credentials) {
@@ -667,11 +714,12 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         ESP_LOGI(TAG, "STA connected to '%s', IP %s RSSI %d", s_status.ssid, s_status.ip,
                  s_status.rssi);
         s_got_ip_us = esp_timer_get_time();
+        s_in_recovery = false;
+        s_recovery_started_us = 0;
+        s_silent_strikes = 0;
         /* Re-apply after every join — stop/start and roam drop these. */
         wifi_apply_sta_radio_quirks();
-        /* Do not seed s_last_traffic_us here — that blocked TX-dead recovery for 2 minutes. */
-        /* If SoftAP was up (portal / reconnect), tear it down after HAP/httpd settle.
-         * Booting with saved credentials uses STA-only from the start — no teardown. */
+        /* Do not seed s_last_traffic_us here — that blocked TX-dead recovery. */
         if (s_status.ap_active) {
             schedule_softap_stop();
         }

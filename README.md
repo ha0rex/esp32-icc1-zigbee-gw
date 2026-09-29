@@ -190,7 +190,7 @@ See `sdkconfig.defaults`:
 | --- | --- |
 | RX bytes = 0 / no RSTACK | TX↔RX crossed? Common GND? ICC on **3.3V**? NCP image flashed? |
 | CRC / garbage | Baud **115200**; correct 115k2 NCP build |
-| Portal dies, ping fails, USB still up | Classic C3 silent STA — power-cycle or USB reset; SoftAP should not stay up beside STA |
+| Portal dies, ping fails, USB still up | ESP32-C3 “silent STA”. Firmware auto-recovers (~1 min quiet): soft reconnect, then Wi‑Fi stop/start — no SoftAP. If it stays down, USB reset once. |
 | HomeKit “No Response” | Wait for deferred start; confirm `:8118`; try lock→unlock once after large inventory changes |
 | Remote does nothing in Home | Mode = HomeKit buttons? Exposed? For control mode, complete Touchlink to a **bulb** |
 | Sensor stuck / empty readings | **Read values** + wake the sleepy end device with its button |

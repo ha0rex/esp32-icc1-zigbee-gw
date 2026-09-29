@@ -1504,6 +1504,7 @@ static void hap_send_notification(void *arg)
         } else {
             ESP_LOGW("hap", "EVENT send failed fd=%d hdr=%d sep=%d body=%d — closing session",
                      fd, hdr_ok, sep_ok, body_ok);
+            wifi_manager_note_tx_fail();
             hap_close_session(session);
             continue;
         }
