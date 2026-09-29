@@ -141,7 +141,7 @@ Limits: up to **32** devices, **8** groups × **8** members, **5** buttons per r
 
 ## OTA updates (`main` channel)
 
-Pushes to **`main`** build firmware and refresh a rolling GitHub Release tagged **`ota`**:
+Pushes to **`main`** (firmware changes) build with the `espressif/idf:latest` image and refresh a rolling GitHub Release tagged **`ota`**:
 
 - Manifest: https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/manifest.json
 - Binary: https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/esp32_icc1_zigbee_gw.bin

@@ -7,6 +7,11 @@ name: OTA release (main)
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "README.md"
+      - ".cursor/**"
+      - ".gitignore"
+      - "docs/**"
   workflow_dispatch:
 
 permissions:
@@ -30,13 +35,14 @@ jobs:
           VER="${BASE}-${DAY}.${SHA}"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "OTA version: $VER"
-          # Embed CI version into the app descriptor for this build only
           sed -i -E "s/set\(PROJECT_VER \"[^\"]+\"\)/set(PROJECT_VER \"$VER\")/" CMakeLists.txt
 
+      # esp_idf_version must be a real Docker Hub tag under espressif/idf
+      # (e.g. latest, release-v5.5). "master" is NOT published → docker exit 125.
       - name: Build (ESP-IDF)
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: master
+          esp_idf_version: latest
           target: esp32c3
           path: .
           command: idf.py build
@@ -46,19 +52,24 @@ jobs:
           mkdir -p dist
           BIN=build/esp32_icc1_zigbee_gw.bin
           test -f "$BIN"
-          cp "$BIN" "dist/esp32_icc1_zigbee_gw.bin"
+          cp "$BIN" dist/esp32_icc1_zigbee_gw.bin
           SHA256=$(sha256sum "$BIN" | awk '{print $1}')
           VER="${{ steps.ver.outputs.version }}"
-          cat > dist/manifest.json <<EOF
-          {
-            "version": "${VER}",
-            "url": "https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/esp32_icc1_zigbee_gw.bin",
-            "sha256": "${SHA256}",
-            "built": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "commit": "$(git rev-parse HEAD)"
+          python3 - <<PY
+          import json, subprocess, datetime
+          ver = "${VER}"
+          sha = "${SHA256}"
+          commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          manifest = {
+              "version": ver,
+              "url": "https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/esp32_icc1_zigbee_gw.bin",
+              "sha256": sha,
+              "built": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "commit": commit,
           }
-          EOF
-          cat dist/manifest.json
+          open("dist/manifest.json", "w").write(json.dumps(manifest, indent=2) + "\n")
+          print(json.dumps(manifest, indent=2))
+          PY
 
       - name: Publish rolling release "ota"
         uses: softprops/action-gh-release@v2
@@ -66,6 +77,7 @@ jobs:
           tag_name: ota
           name: OTA channel (main)
           prerelease: false
+          make_latest: true
           generate_release_notes: false
           body: |
             Rolling firmware channel built from **main**.
