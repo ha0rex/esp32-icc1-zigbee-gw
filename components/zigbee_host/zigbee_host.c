@@ -6,6 +6,7 @@
 #include "zigbee_host.h"
 
 #include <ctype.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -1063,10 +1064,22 @@ static void relay_remote_to_target_locked(const zb_device_t *remote, uint8_t but
     s_room_on = desired_on;
 
     /* Targets are in the Touchlink group — native On/Off/Toggle already hit them.
-     * Sending MoveToLevel again causes a visible double flash. Only track state. */
+     * Sending MoveToLevel again causes a visible double flash. Mirror desired
+     * state into the inventory so HomeKit/portal stay in sync (IKEA drivers
+     * often skip OnOff attribute reports after groupcast). */
     if (remote->remote_group_id != 0) {
         ESP_LOGI(TAG, "CONTROL power native group %u → room %s (no unicast)",
                  (unsigned)remote->remote_group_id, desired_on ? "ON" : "OFF");
+        for (uint8_t i = 0; i < n; i++) {
+            zb_device_t *t = targets[i];
+            t->has_onoff = true;
+            t->onoff_on = desired_on;
+            if (!desired_on) {
+                t->level = 0;
+            } else if (t->has_level && t->level == 0) {
+                t->level = 254;
+            }
+        }
         return;
     }
 
@@ -1739,6 +1752,11 @@ static void nvs_save_devices_locked(void)
 {
     /* Rare paths (device edit / join). Button latch uses dirty + unlocked flush. */
     uint16_t n = nvs_pack_devices_locked();
+    if (n == 0) {
+        /* Never wipe a populated table with an empty pack (e.g. save-before-load race). */
+        ESP_LOGW(TAG, "Skip NVS device save — inventory empty");
+        return;
+    }
     s_devices_nvs_dirty = false;
     nvs_commit_scratch(n);
 }
@@ -1767,6 +1785,12 @@ static void nvs_flush_devices_if_dirty(bool force)
     }
     status_lock();
     uint16_t n = nvs_pack_devices_locked();
+    if (n == 0) {
+        status_unlock();
+        xSemaphoreGive(s_op_mutex);
+        ESP_LOGW(TAG, "Skip deferred NVS device flush — inventory empty");
+        return;
+    }
     s_devices_nvs_dirty = false;
     status_unlock();
     nvs_commit_scratch(n);
@@ -4023,6 +4047,42 @@ void zigbee_host_get_status(zigbee_host_status_t *out)
     ezsp_get_stats(&s_status.ezsp_stats);
     s_status.ash_state = ash_get_state();
     update_permit_remaining();
-    *out = s_status;
+    /* Copy header + used slots only — a full 32-device struct assign (~14KB)
+     * under the lock starved the portal httpd on the unicore C3. */
+    size_t hdr = offsetof(zigbee_host_status_t, devices);
+    memcpy(out, &s_status, hdr);
+    memset(out->devices, 0, sizeof(out->devices));
+    for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
+        if (s_status.devices[i].used) {
+            out->devices[i] = s_status.devices[i];
+        }
+    }
+    memcpy(out->last_error, s_status.last_error, sizeof(out->last_error));
     xSemaphoreGive(s_status_mutex);
+}
+
+/** Flush deferred device NVS now (portal/HomeKit names, modes, expose flags). */
+esp_err_t zigbee_host_save_devices_now(void)
+{
+    if (!s_op_mutex || !s_status_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    nvs_flush_devices_if_dirty(true);
+    /* Always pack+commit so a backup/reboot cannot lose the last portal edits. */
+    if (xSemaphoreTake(s_op_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    status_lock();
+    uint16_t n = nvs_pack_devices_locked();
+    if (n == 0) {
+        status_unlock();
+        xSemaphoreGive(s_op_mutex);
+        ESP_LOGW(TAG, "Skip force NVS device save — inventory empty");
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_devices_nvs_dirty = false;
+    status_unlock();
+    nvs_commit_scratch(n);
+    xSemaphoreGive(s_op_mutex);
+    return ESP_OK;
 }

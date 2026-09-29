@@ -94,6 +94,8 @@ int hap_char_check_val_constraints(__hap_char_t *_hc, hap_val_t *val);
 int hap_event_queue_init();
 int hap_event_queue_deinit();
 hap_char_t * hap_get_pending_notif_char();
+/** True if characteristic notifications are waiting to be sent. */
+bool hap_notif_pending(void);
 #ifdef __cplusplus
 }
 #endif

@@ -22,26 +22,50 @@
  *
  */
 #include <esp_http_server.h>
+#include <esp_log.h>
+#include <esp_heap_caps.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static const char *TAG = "hap_httpd";
 
 httpd_handle_t *int_handle;
 int hap_platform_httpd_start(httpd_handle_t *handle)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.task_priority  = tskIDLE_PRIORITY+5;
+    config.task_priority  = tskIDLE_PRIORITY+3;
     config.stack_size         = CONFIG_HAP_HTTP_STACK_SIZE;
     config.server_port        = CONFIG_HAP_HTTP_SERVER_PORT;
     config.ctrl_port          = CONFIG_HAP_HTTP_CONTROL_PORT;
     config.max_open_sockets   = CONFIG_HAP_HTTP_MAX_OPEN_SOCKETS;
     config.max_uri_handlers   = CONFIG_HAP_HTTP_MAX_URI_HANDLERS;
     config.max_resp_headers   = 8;
-    config.backlog_conn       = 5;
+    config.backlog_conn       = 2;
     config.lru_purge_enable   = true;
-    config.recv_wait_timeout  = 5;
-    config.send_wait_timeout  = 5;
+    /* Short timeouts — blocked EVENT sends were wedging the HAP httpd task. */
+    config.recv_wait_timeout  = 2;
+    config.send_wait_timeout  = 2;
+    config.keep_alive_enable  = false;
 
-    esp_err_t err =  httpd_start(handle, &config);
-    if (err == ESP_OK) {
-        int_handle = handle;
+    esp_err_t err = ESP_FAIL;
+    /* C3 DRAM is tight after bridged accessories — fall back to a leaner httpd. */
+    const int sock_tries[] = {CONFIG_HAP_HTTP_MAX_OPEN_SOCKETS, 4};
+    const int stack_tries[] = {CONFIG_HAP_HTTP_STACK_SIZE, 8192};
+    for (int attempt = 1; attempt <= 6; attempt++) {
+        config.max_open_sockets = sock_tries[(attempt > 2) ? 1 : 0];
+        config.stack_size = stack_tries[(attempt > 3) ? 1 : 0];
+        size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        ESP_LOGI(TAG, "httpd_start try %d (port %d socks %d stack %d free=%u largest=%u)",
+                 attempt, config.server_port, config.max_open_sockets, config.stack_size,
+                 (unsigned)free_heap, (unsigned)largest);
+        err = httpd_start(handle, &config);
+        if (err == ESP_OK) {
+            int_handle = handle;
+            return err;
+        }
+        ESP_LOGW(TAG, "httpd_start failed: %s — retry", esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(400 * attempt));
     }
     return err;
 }

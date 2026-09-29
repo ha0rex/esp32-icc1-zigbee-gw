@@ -24,6 +24,20 @@
 
 static const char *TAG = "app_main";
 
+#if CONFIG_HK_ENABLED
+/** Defer HomeKit: HAP/mDNS right after STA IP wedges C3 TX. */
+static void delayed_hk_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(45000));
+    esp_err_t e = homekit_bridge_start();
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "HomeKit bridge start failed: %s", esp_err_to_name(e));
+    }
+    vTaskDelete(NULL);
+}
+#endif
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "================================================");
@@ -51,9 +65,14 @@ void app_main(void)
     ESP_ERROR_CHECK(thermostat_start());
 
 #if CONFIG_HK_ENABLED
-    err = homekit_bridge_start();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "HomeKit bridge start failed: %s", esp_err_to_name(err));
+    if (xTaskCreate(delayed_hk_task, "hk_delay", 4096, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "HomeKit delay task failed — starting immediately");
+        err = homekit_bridge_start();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "HomeKit bridge start failed: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGI(TAG, "HomeKit start deferred 45s (Wi‑Fi settle)");
     }
 #endif
 }

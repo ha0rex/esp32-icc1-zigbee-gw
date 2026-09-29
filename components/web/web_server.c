@@ -28,11 +28,24 @@
 static const char *TAG = "web";
 static httpd_handle_t s_server;
 static SemaphoreHandle_t s_scan_mutex;
+static SemaphoreHandle_t s_root_mu; /**< At most one full portal HTML send */
 static char s_scan_json[2048];
 static char s_scan_ssids[16][33];
 static char s_json[24576];
 /* Heap buffer for status snapshot — avoids multi-KB stack copies. */
 static zigbee_host_status_t s_zb_snap;
+static int64_t s_last_handler_us; /**< Last successful URI handler completion */
+static int64_t s_root_held_us;    /**< When root HTML mutex was taken (0 = free) */
+static TaskHandle_t s_watch_task;
+
+static void web_note_handler_ok(void)
+{
+    s_last_handler_us = esp_timer_get_time();
+    wifi_manager_note_traffic();
+}
+
+static void web_watchdog_task(void *arg);
+static esp_err_t web_server_restart(void);
 
 /** snprintf into buffer with truncation-safe position advance. */
 static size_t json_append(char *buf, size_t bufsz, size_t pos, const char *fmt, ...)
@@ -142,30 +155,69 @@ static void json_escape(const char *in, char *out, size_t out_len)
 
 static esp_err_t root_get(httpd_req_t *req)
 {
+    /* Only one full HTML transfer at a time — concurrent tab/captive downloads
+     * used to occupy every httpd socket until send timeouts, hanging the portal. */
+    if (!s_root_mu || xSemaphoreTake(s_root_mu, 0) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_hdr(req, "Connection", "close");
+        httpd_resp_set_hdr(req, "Retry-After", "1");
+        return httpd_resp_sendstr(req, "busy");
+    }
+    s_root_held_us = esp_timer_get_time();
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    /* Chunk the ~36KB portal — a single send often stalls on weak Wi‑Fi and looks
-     * like the UI is down. */
+    httpd_resp_set_hdr(req, "Connection", "close");
     const char *html = WEB_APP_HTML;
     size_t len = strlen(html);
-    const size_t chunk = 1024;
+    const size_t chunk = 2048;
+    esp_err_t err = ESP_OK;
     for (size_t off = 0; off < len; off += chunk) {
         size_t n = len - off;
         if (n > chunk) {
             n = chunk;
         }
-        esp_err_t err = httpd_resp_send_chunk(req, html + off, n);
+        err = httpd_resp_send_chunk(req, html + off, n);
         if (err != ESP_OK) {
             httpd_resp_send_chunk(req, NULL, 0);
-            return err;
+            break;
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        if ((off & 0xFFF) == 0) {
+            vTaskDelay(1);
+        }
     }
-    return httpd_resp_send_chunk(req, NULL, 0);
+    if (err == ESP_OK) {
+        err = httpd_resp_send_chunk(req, NULL, 0);
+        if (err == ESP_OK) {
+            web_note_handler_ok();
+        }
+    }
+    s_root_held_us = 0;
+    xSemaphoreGive(s_root_mu);
+    return err;
+}
+
+/** Captive-portal probes must NOT get the full UI — that pinned all web sockets. */
+static esp_err_t captive_ok(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    web_note_handler_ok();
+    return httpd_resp_send(req, NULL, 0);
+}
+
+static esp_err_t api_ping(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    web_note_handler_ok();
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 static esp_err_t api_status(httpd_req_t *req)
 {
+    httpd_resp_set_hdr(req, "Connection", "close");
     wifi_manager_status_t wifi;
     zigbee_host_get_status(&s_zb_snap);
     wifi_manager_get_status(&wifi);
@@ -421,7 +473,11 @@ static esp_err_t api_status(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_sendstr(req, s_json);
+    esp_err_t err = httpd_resp_sendstr(req, s_json);
+    if (err == ESP_OK) {
+        web_note_handler_ok();
+    }
+    return err;
 }
 
 static esp_err_t api_wifi_scan(httpd_req_t *req)
@@ -1240,24 +1296,33 @@ esp_err_t web_server_start(void)
     if (!s_scan_mutex) {
         s_scan_mutex = xSemaphoreCreateMutex();
     }
+    if (!s_root_mu) {
+        s_root_mu = xSemaphoreCreateMutex();
+    }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = CONFIG_WEB_HTTP_PORT;
+    /* Above HAP httpd (idle+5) so a busy Home session cannot starve the portal. */
+    config.task_priority = tskIDLE_PRIORITY + 6;
     config.lru_purge_enable = true;
     config.max_uri_handlers = 32;
     config.stack_size = 12288;
-    config.recv_wait_timeout = 4;
-    config.send_wait_timeout = 4;
-    config.max_open_sockets = 4; /* Keep room for HAP (needs ~8) under LWIP socket budget */
+    config.recv_wait_timeout = 1;
+    config.send_wait_timeout = 1;
+    config.max_open_sockets = 5; /* Headroom for status/ping while one HTML send runs */
+    config.keep_alive_enable = false;
+    config.backlog_conn = 2;
 
     esp_err_t err = httpd_start(&s_server, &config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(err));
+        s_server = NULL;
         return err;
     }
 
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = root_get},
+        {.uri = "/api/ping", .method = HTTP_GET, .handler = api_ping},
         {.uri = "/api/status", .method = HTTP_GET, .handler = api_status},
         {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = api_wifi_scan},
         {.uri = "/wifi/save", .method = HTTP_POST, .handler = wifi_save},
@@ -1278,14 +1343,62 @@ esp_err_t web_server_start(void)
         {.uri = "/api/thermostats/create", .method = HTTP_POST, .handler = api_thermo_create},
         {.uri = "/api/thermostats/update", .method = HTTP_POST, .handler = api_thermo_update},
         {.uri = "/api/thermostats/remove", .method = HTTP_POST, .handler = api_thermo_remove},
-        {.uri = "/generate_204", .method = HTTP_GET, .handler = root_get},
-        {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = root_get},
+        {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_ok},
+        {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_ok},
+        {.uri = "/library/test/success.html", .method = HTTP_GET, .handler = captive_ok},
+        {.uri = "/ncsi.txt", .method = HTTP_GET, .handler = captive_ok},
+        {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = captive_ok},
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         httpd_register_uri_handler(s_server, &routes[i]);
+    }
+
+    /* Do not call web_note_handler_ok() here — that seeded fake STA traffic and
+     * delayed silent-STA SoftAP recovery by ~25s after every boot/restart. */
+    if (!s_watch_task) {
+        xTaskCreate(web_watchdog_task, "web_wd", 3072, NULL, 3, &s_watch_task);
     }
 
     ESP_LOGI(TAG, "Production portal on port %d", CONFIG_WEB_HTTP_PORT);
     return ESP_OK;
 #endif
 }
+
+#if CONFIG_WIFI_ENABLED
+static esp_err_t web_server_restart(void)
+{
+    if (s_server) {
+        ESP_LOGW(TAG, "Restarting portal httpd (socket recovery)");
+        httpd_stop(s_server);
+        s_server = NULL;
+        s_root_held_us = 0;
+        if (s_root_mu) {
+            /* Ensure HTML mutex is free after stop. */
+            xSemaphoreGive(s_root_mu);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return web_server_start();
+}
+
+static void web_watchdog_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(15000));
+        if (!s_server) {
+            (void)web_server_start();
+            continue;
+        }
+        /* Only bounce if a full HTML send has been stuck past send timeouts. */
+        if (s_root_held_us > 0) {
+            int64_t held = esp_timer_get_time() - s_root_held_us;
+            if (held > 20000000LL) { /* 20s */
+                ESP_LOGW(TAG, "Portal HTML send stuck for %lld ms — restarting httpd",
+                         (long long)(held / 1000LL));
+                (void)web_server_restart();
+            }
+        }
+    }
+}
+#endif

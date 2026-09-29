@@ -210,6 +210,8 @@ esp_err_t zigbee_host_remove_device(const uint8_t eui64[8]);
 bool zigbee_host_get_device(const uint8_t eui64[8], zb_device_t *out);
 /** Copy device at slot index (0 .. ZB_HOST_MAX_DEVICES-1). Returns false if empty. */
 bool zigbee_host_get_device_at(uint16_t index, zb_device_t *out);
+/** Force-flush device inventory (names, modes, expose) to NVS now. */
+esp_err_t zigbee_host_save_devices_now(void);
 /** How many devices currently have homekit_expose enabled. */
 uint16_t zigbee_host_count_homekit_exposed(void);
 /** Register / refresh a device in the local inventory (e.g. recover after NVS loss). */

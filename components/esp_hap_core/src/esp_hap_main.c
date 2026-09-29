@@ -203,12 +203,19 @@ static void hap_common_sm(hap_internal_event_t event)
 static void hap_loop_task(void *param)
 {
     hap_state_t cur_state = HAP_STATE_NONE;
-    xQueue = xQueueCreate( 10, sizeof(hap_event_ctx_t) );
+    /* Larger than stock 10 so button TRIGGER_NOTIF is not dropped under load. */
+    xQueue = xQueueCreate( 32, sizeof(hap_event_ctx_t) );
     hap_event_ctx_t hap_event;
     bool loop_continue = true;
     ESP_MFI_DEBUG(ESP_MFI_DEBUG_INFO, "HAP Main Loop Started");
     while (loop_continue) {
-        if (xQueueReceive(xQueue, &hap_event, portMAX_DELAY) != pdTRUE) {
+        /* Only short-poll when notifs are pending (deferred TRIGGER). A permanent
+         * 100ms idle flush starved Wi‑Fi; blocking forever left EVENTs stuck. */
+        TickType_t wait = hap_notif_pending() ? pdMS_TO_TICKS(40) : portMAX_DELAY;
+        if (xQueueReceive(xQueue, &hap_event, wait) != pdTRUE) {
+            if (hap_notif_pending()) {
+                hap_http_send_notif();
+            }
             continue;
         }
         if (hap_event.event == HAP_INTERNAL_EVENT_LOOP_STOP) {
@@ -254,7 +261,9 @@ int hap_send_event(hap_internal_event_t event)
     if (xPortInIsrContext() == pdTRUE) {
         ret = xQueueSendFromISR(xQueue, &hap_event, NULL);
     } else {
-        ret = xQueueSend(xQueue, &hap_event, 0);
+        /* Never drop notification triggers — Home misses On state otherwise. */
+        TickType_t wait = (event == HAP_INTERNAL_EVENT_TRIGGER_NOTIF) ? pdMS_TO_TICKS(200) : 0;
+        ret = xQueueSend(xQueue, &hap_event, wait);
     }
     if (ret == pdTRUE) {
         return HAP_SUCCESS;

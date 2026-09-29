@@ -23,6 +23,7 @@
 
 #include "zigbee_host.h"
 #include "thermostat.h"
+#include "wifi_manager.h"
 
 static const char *TAG = "homekit";
 
@@ -43,11 +44,11 @@ static uint32_t s_inv_sig_cached;
 static bool s_inv_sig_cached_valid;
 
 /** Bump when remote accessory service layout changes (forces rebuild). */
-#define REMOTE_LAYOUT_VER 26
+#define REMOTE_LAYOUT_VER 28
 /**
  * One bridged accessory per remote, with each physical button as its own
  * Switch / Stateless Programmable Switch service (linked). Sub-tile names
- * come from the web UI (Name + Configured Name, silent updates).
+ * come from the web UI (Name + Configured Name).
  */
 
 /** Mark inventory dirty so announce_inventory_if_changed() bumps c# once (not per add). */
@@ -943,7 +944,6 @@ static esp_err_t add_bridged_remote(const zb_device_t *d)
         }
     }
 
-    /* Link sibling button services so Home presents them as one device. */
     if (primary) {
         for (uint8_t i = 1; i < nbtn; i++) {
             if (btn_servs[i]) {
@@ -985,9 +985,24 @@ static esp_err_t add_bridged_remote(const zb_device_t *d)
 
 static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8_t event)
 {
-    if (!eui64 || !s_started) {
+    if (!eui64) {
         return;
     }
+    zb_device_t d;
+    bool have_d = zigbee_host_get_device(eui64, &d);
+    uint8_t mode = ZB_BTN_MODE_STATELESS;
+    if (have_d && button_index < ZB_REMOTE_MAX_BUTTONS) {
+        mode = (d.btn_mode[button_index] == ZB_BTN_MODE_STATEFUL) ? ZB_BTN_MODE_STATEFUL
+                                                                  : ZB_BTN_MODE_STATELESS;
+    }
+
+    if (!s_started) {
+        if (mode == ZB_BTN_MODE_STATEFUL) {
+            (void)zigbee_host_btn_toggle(eui64, button_index);
+        }
+        return;
+    }
+
     if (s_sync_mu) {
         xSemaphoreTake(s_sync_mu, portMAX_DELAY);
     }
@@ -997,15 +1012,11 @@ static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8
         if (s_sync_mu) {
             xSemaphoreGive(s_sync_mu);
         }
+        if (mode == ZB_BTN_MODE_STATEFUL) {
+            (void)zigbee_host_btn_toggle(eui64, button_index);
+        }
         ESP_LOGW(TAG, "Remote btn %u: no HomeKit accessory for this eui", (unsigned)button_index);
         return;
-    }
-
-    uint8_t mode = slot->btn_mode_snap[button_index];
-    zb_device_t d;
-    if (zigbee_host_get_device(eui64, &d) && button_index < ZB_REMOTE_MAX_BUTTONS) {
-        mode = (d.btn_mode[button_index] == ZB_BTN_MODE_STATEFUL) ? ZB_BTN_MODE_STATEFUL
-                                                                  : ZB_BTN_MODE_STATELESS;
     }
 
     if (mode == ZB_BTN_MODE_STATEFUL) {
@@ -1022,6 +1033,9 @@ static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8
         if (s_sync_mu) {
             xSemaphoreGive(s_sync_mu);
         }
+        /* Do NOT provoke here — it flooded the HAP loop queue (size was 10) and
+         * dropped TRIGGER_NOTIF so EVENT never left the device. Undelivered
+         * EVENTs provoke from the HAP notify path instead. */
         ESP_LOGI(TAG, "HomeKit remote button %u stateful toggle -> %s", (unsigned)button_index,
                  on ? "ON" : "OFF");
         return;
@@ -1755,8 +1769,25 @@ esp_err_t homekit_bridge_sync_devices(void)
 static void homekit_start_task(void *arg)
 {
     (void)arg;
-    /* Give Wi-Fi / Zigbee a moment to settle. */
-    vTaskDelay(pdMS_TO_TICKS(2500));
+    /* Wait for STA IP. Defer HAP until portal traffic proves TX is alive — starting
+     * HAP/mDNS while STA is still settling is what wedges C3 (“associated but silent”). */
+    for (int i = 0; i < 80; i++) {
+        if (wifi_manager_is_connected() && !wifi_manager_is_ap_active()) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    /* Keep probing until outbound TX works, or give up after ~20s. */
+    for (int i = 0; i < 20; i++) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (wifi_manager_is_connected()) {
+            /* Portal may already be answering; treat connected+no-AP as good enough after 5s. */
+            if (i >= 4) {
+                break;
+            }
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
     snprintf(s_st.setup_code, sizeof(s_st.setup_code), "%s", CONFIG_HK_SETUP_CODE);
     snprintf(s_st.setup_id, sizeof(s_st.setup_id), "%s", CONFIG_HK_SETUP_ID);
@@ -1764,7 +1795,7 @@ static void homekit_start_task(void *arg)
 
     hap_cfg_t hap_cfg;
     hap_get_config(&hap_cfg);
-    hap_cfg.task_priority = 5; /* Above zigbee host / portal so Home reads stay snappy */
+    hap_cfg.task_priority = 3; /* Below Wi‑Fi/lwIP; was 5 and starved STA on C3 */
     hap_cfg.task_stack_size = 12288;
     hap_cfg.max_event_notif_chars = 48; /* Sensors + 5 remote buttons must not drop EV */
     /* Re-attaching bridged sensors on boot must not bump c# — that makes Home
@@ -1809,8 +1840,19 @@ static void homekit_start_task(void *arg)
     /* Must attach bridged accessories before advertising — incomplete lists wipe Home rooms/names. */
     attach_exposed_before_advertise();
 
-    if (hap_start() != HAP_SUCCESS) {
+    int hap_rc = HAP_FAIL;
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        hap_rc = hap_start();
+        if (hap_rc == HAP_SUCCESS) {
+            break;
+        }
+        ESP_LOGW(TAG, "hap_start failed (try %d/5) — retrying", attempt);
+        snprintf(s_st.status, sizeof(s_st.status), "hap_start retry %d", attempt);
+        vTaskDelay(pdMS_TO_TICKS(1500 * attempt));
+    }
+    if (hap_rc != HAP_SUCCESS) {
         snprintf(s_st.status, sizeof(s_st.status), "hap_start failed");
+        ESP_LOGE(TAG, "HomeKit hap_start failed permanently — portal stays up");
         vTaskDelete(NULL);
         return;
     }

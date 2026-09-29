@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "homekit_bridge.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_hap_core esp_hap_apple_profiles zigbee_host thermostat freertos nvs_flash
+    REQUIRES esp_hap_core esp_hap_apple_profiles zigbee_host thermostat freertos nvs_flash wifi_manager
     PRIV_REQUIRES log
 )

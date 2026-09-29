@@ -32,7 +32,7 @@ typedef struct {
 /**
  * Start Wi-Fi: STA-only when home credentials exist (no SoftAP beacon).
  * SoftAP setup portal is enabled only with no credentials, or after STA loss.
- * SoftAP used during portal provisioning is disabled ~60s after home IP.
+ * SoftAP used during portal provisioning is disabled a few seconds after home IP.
  * Failures never block ICC probing.
  */
 esp_err_t wifi_manager_start(void);
@@ -41,6 +41,24 @@ void wifi_manager_get_status(wifi_manager_status_t *out);
 bool wifi_manager_is_connected(void);
 bool wifi_manager_is_started(void);
 bool wifi_manager_is_ap_active(void);
+
+/**
+ * Mark that application traffic succeeded on STA (portal / HomeKit).
+ * Used by the Wi‑Fi health watchdog to detect “associated but silent” C3 stalls.
+ */
+void wifi_manager_note_traffic(void);
+
+/**
+ * Mark that an app-level STA TX failed (e.g. HomeKit EVENT send).
+ * Accelerates recovery from associated-but-silent stalls.
+ */
+void wifi_manager_note_tx_fail(void);
+
+/** Soft STA reconnect (less disruptive than wifi stop/start). */
+void wifi_manager_soft_reconnect(void);
+
+/** Full wifi stop/start — clears C3 associated-but-silent TX stalls. */
+void wifi_manager_force_radio_cycle(void);
 
 /**
  * Save home Wi-Fi credentials to NVS and begin STA connection.

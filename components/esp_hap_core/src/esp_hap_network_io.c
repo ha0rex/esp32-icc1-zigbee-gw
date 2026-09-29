@@ -23,7 +23,10 @@
  */
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 
 #include <sodium/crypto_aead_chacha20poly1305.h>
 #include <byte_convert.h>
@@ -154,6 +157,34 @@ int hap_decrypt_data(hap_decrypt_frame_t *frame, hap_secure_session_t *session,
 	return bytes;
 }
 
+/** Non-blocking send with a short wait — dead Home sessions must not stall
+ * the HAP loop (that dropped TRIGGER_NOTIF and killed the portal). */
+static int hap_sock_send(int sockfd, const void *buf, size_t len, int flags)
+{
+    size_t off = 0;
+    while (off < len) {
+        int n = send(sockfd, (const uint8_t *)buf + off, len - off, flags | MSG_DONTWAIT);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(sockfd, &wfds);
+            struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
+            int sel = select(sockfd + 1, NULL, &wfds, NULL, &tv);
+            if (sel > 0) {
+                continue;
+            }
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        return -1;
+    }
+    return (int)len;
+}
+
 int hap_httpd_send(httpd_handle_t hd, int sockfd, const char *buf, unsigned buf_len, int flags)
 {
 	hap_secure_session_t *session = httpd_sess_get_ctx(hap_priv.server, sockfd);
@@ -165,7 +196,7 @@ int hap_httpd_send(httpd_handle_t hd, int sockfd, const char *buf, unsigned buf_
 			memset(&encrypt_frame, 0, sizeof(encrypt_frame));
 			int len = min(tmp_buf_len, HAP_MAX_NW_FRAME_SIZE);
 			int send_len = hap_encrypt_data(&encrypt_frame, session, buf_ptr, len);
-			if (send(sockfd, (uint8_t *)&encrypt_frame, send_len, flags) <= 0)
+			if (hap_sock_send(sockfd, (uint8_t *)&encrypt_frame, (size_t)send_len, flags) <= 0)
 				return HAP_FAIL;
 			tmp_buf_len -= len;
 			buf_ptr += len;
@@ -174,7 +205,7 @@ int hap_httpd_send(httpd_handle_t hd, int sockfd, const char *buf, unsigned buf_
 		 */
 		return buf_len;
 	}
-	return send(sockfd, buf, buf_len, flags);
+	return hap_sock_send(sockfd, buf, buf_len, flags);
 }
 
 int hap_httpd_recv(httpd_handle_t hd, int sockfd, char *buf, unsigned buf_len, int flags)

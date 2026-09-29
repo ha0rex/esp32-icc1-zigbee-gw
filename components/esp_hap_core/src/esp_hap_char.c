@@ -25,6 +25,7 @@
 #include <hap_platform_memory.h>
 #include <math.h>
 #include <string.h>
+#include <esp_log.h>
 #include "esp_mfi_debug.h"
 
 #include <esp_hap_main.h>
@@ -90,16 +91,22 @@ int hap_event_queue_deinit()
 hap_char_t * hap_get_pending_notif_char()
 {
     hap_char_t *hc;
-    if (xQueueReceive(hap_event_queue, &hc, 0) != pdTRUE) {
+    if (!hap_event_queue || xQueueReceive(hap_event_queue, &hc, 0) != pdTRUE) {
         return NULL;
     }
     return hc;
+}
+
+bool hap_notif_pending(void)
+{
+    return hap_event_queue && uxQueueMessagesWaiting(hap_event_queue) > 0;
 }
 
 static int hap_queue_event(hap_char_t *hc)
 {
     int ret;
     if (!hap_event_queue) {
+        ESP_LOGW("hap", "notif queue not ready");
         return HAP_FAIL;
     }
     if (xPortInIsrContext() == pdTRUE) {
@@ -108,9 +115,15 @@ static int hap_queue_event(hap_char_t *hc)
         ret = xQueueSend(hap_event_queue, &hc, 0);
     }
     if (ret == pdTRUE) {
-        hap_send_event(HAP_INTERNAL_EVENT_TRIGGER_NOTIF);
+        if (hap_send_event(HAP_INTERNAL_EVENT_TRIGGER_NOTIF) != HAP_SUCCESS) {
+            /* HAP loop busy/stuck — flush inline so Home still gets the edge.
+             * Direct send on the session fd is safe (same as hap_http_send_notif). */
+            ESP_LOGW("hap", "TRIGGER_NOTIF deferred — inline EVENT flush");
+            hap_http_send_notif();
+        }
         return HAP_SUCCESS;
     }
+    ESP_LOGW("hap", "notif char queue full");
     return HAP_FAIL;
 }
 

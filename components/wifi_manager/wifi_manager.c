@@ -18,15 +18,21 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include "freertos/timers.h"
+#include "lwip/sockets.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
+#include <fcntl.h>
+#include <errno.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static const char *TAG = "wifi_mgr";
 
@@ -35,8 +41,10 @@ static const char *TAG = "wifi_mgr";
 #define NVS_KEY_PASS        "pass"
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
-/** Delay SoftAP teardown until STA + HAP/httpd are settled (avoids C3 radio silence). */
-#define SOFTAP_STOP_DELAY_MS 60000
+/** Tear SoftAP down soon after STA IP — APSTA on C3 starves portal/HAP TX. */
+#define SOFTAP_STOP_DELAY_MS 8000
+/** SoftAP only after this many failed STA retries (not on the first blip). */
+#define SOFTAP_AFTER_RETRY 5
 
 static EventGroupHandle_t s_wifi_events;
 static wifi_manager_status_t s_status;
@@ -46,9 +54,267 @@ static esp_netif_t *s_netif_ap;
 static esp_netif_t *s_netif_sta;
 static TimerHandle_t s_softap_stop_timer;
 static TaskHandle_t s_softap_work_task;
+static TaskHandle_t s_wifi_health_task;
+static int64_t s_last_traffic_us;
+static int64_t s_got_ip_us;
+static uint8_t s_silent_strikes;
+static uint8_t s_recovery_depth; /* 0=none, 1=reconnect done, 2=stop/start done */
+static bool s_bssid_locked;
+static uint8_t s_locked_bssid[6];
+static volatile bool s_in_recovery;
+/** SoftAP raised because STA inbound is dead — do not auto-tear it down. */
+static bool s_softap_lifeline;
+/** Consecutive successful portal/HAP hits while SoftAP lifeline is up. */
+static uint8_t s_traffic_good_streak;
 
 static esp_err_t softap_start(void);
 static esp_err_t softap_stop(void);
+static void schedule_softap_stop(void);
+static void cancel_softap_stop(void);
+
+/**
+ * Remember current BSSID for the *next* connect only.
+ * Never call esp_wifi_set_config() while associated — that wedges C3
+ * (health blocks forever on later wifi API calls; portal/HomeKit die).
+ */
+static void remember_sta_bssid(void)
+{
+    if (s_bssid_locked) {
+        return;
+    }
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return;
+    }
+    if (ap.rssi < -65) {
+        ESP_LOGW(TAG, "Skip BSSID remember at weak rssi=%d", (int)ap.rssi);
+        return;
+    }
+    memcpy(s_locked_bssid, ap.bssid, sizeof(s_locked_bssid));
+    s_bssid_locked = true;
+    ESP_LOGI(TAG, "Remembered STA BSSID %02x:%02x:%02x:%02x:%02x:%02x (rssi=%d) for next join",
+             ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
+             (int)ap.rssi);
+}
+
+void wifi_manager_note_traffic(void)
+{
+    s_last_traffic_us = esp_timer_get_time();
+    s_silent_strikes = 0;
+    s_recovery_depth = 0;
+    if (s_traffic_good_streak < 255) {
+        s_traffic_good_streak++;
+    }
+    remember_sta_bssid();
+    /* SoftAP in APSTA often starves STA inbound on C3 — only drop it after
+     * sustained LAN traffic, not a single lucky hit. */
+    if (s_softap_lifeline && s_status.ap_active && s_traffic_good_streak >= 10) {
+        ESP_LOGI(TAG, "STA inbound stable (%u hits) — releasing SoftAP lifeline",
+                 (unsigned)s_traffic_good_streak);
+        s_softap_lifeline = false;
+        schedule_softap_stop();
+    }
+}
+
+void wifi_manager_note_tx_fail(void)
+{
+    /* Invalidate traffic grace so health can recover quickly. */
+    s_last_traffic_us = 0;
+    s_silent_strikes++;
+    ESP_LOGW(TAG, "STA TX fail noted (strike %u)", (unsigned)s_silent_strikes);
+}
+
+/** True if STA can open a TCP connection toward the gateway (TX path alive).
+ * Returns true on success OR when the check cannot run (no free sockets) —
+ * never treat resource exhaustion as a dead radio. */
+static int probe_gateway_tx(void)
+{
+    if (!s_netif_sta) {
+        return -1; /* skip */
+    }
+    esp_netif_ip_info_t info;
+    if (esp_netif_get_ip_info(s_netif_sta, &info) != ESP_OK || info.gw.addr == 0) {
+        return -1;
+    }
+    int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s < 0) {
+        /* HAP/portal often hold all LWIP sockets — not a TX fault. */
+        ESP_LOGD(TAG, "STA health: probe skipped (no socket, errno=%d)", errno);
+        return -1;
+    }
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    }
+    struct sockaddr_in dest = {0};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(53); /* DNS on the router — connect SYN is enough */
+    dest.sin_addr.s_addr = info.gw.addr;
+    int cr = connect(s, (struct sockaddr *)&dest, sizeof(dest));
+    if (cr == 0) {
+        close(s);
+        return 1;
+    }
+    if (errno != EINPROGRESS && errno != EALREADY) {
+        close(s);
+        return 0;
+    }
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(s, &wfds);
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 500000};
+    int sel = select(s + 1, NULL, &wfds, NULL, &tv);
+    close(s);
+    /* Connection succeeded, or RST/refused — either means our TX reached the LAN. */
+    return (sel > 0) ? 1 : 0;
+}
+
+static void wifi_soft_reconnect(const char *why)
+{
+    ESP_LOGW(TAG, "STA recovery (%s) — disconnect/reconnect", why ? why : "unknown");
+    s_status.state = WIFI_MGR_CONNECTING;
+    snprintf(s_status.ip, sizeof(s_status.ip), "-");
+    s_silent_strikes = 0;
+    s_got_ip_us = 0;
+    s_in_recovery = true;
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_wifi_connect();
+    s_in_recovery = false;
+}
+
+static void wifi_force_radio_cycle(const char *why)
+{
+    ESP_LOGW(TAG, "STA recovery (%s) — wifi stop/start", why ? why : "unknown");
+    s_status.state = WIFI_MGR_CONNECTING;
+    snprintf(s_status.ip, sizeof(s_status.ip), "-");
+    s_retry = 0;
+    s_silent_strikes = 0;
+    s_got_ip_us = 0;
+    s_in_recovery = true;
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_wifi_start(); /* STA_START handler calls esp_wifi_connect() */
+    s_in_recovery = false;
+}
+
+void wifi_manager_soft_reconnect(void)
+{
+    if (!s_started) {
+        return;
+    }
+    wifi_soft_reconnect("app request");
+}
+
+void wifi_manager_force_radio_cycle(void)
+{
+    if (!s_started) {
+        return;
+    }
+    s_recovery_depth = 2;
+    wifi_force_radio_cycle("app request");
+}
+
+/** Keep STA alive.
+ * - Gateway TX dead → reconnect / radio cycle
+ * - No app traffic for a long time after join → one-shot reconnect (silent STA),
+ *   then SoftAP lifeline. Do NOT loop every 20s (that killed HomeKit). */
+static void wifi_health_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        if (!s_started || s_in_recovery) {
+            continue;
+        }
+        if (s_status.state != WIFI_MGR_CONNECTED) {
+            continue;
+        }
+        int64_t now = esp_timer_get_time();
+        if (s_got_ip_us && (now - s_got_ip_us) < 15000000LL) {
+            continue;
+        }
+        if (s_last_traffic_us && (now - s_last_traffic_us) < 45000000LL) {
+            s_silent_strikes = 0;
+            s_recovery_depth = 0;
+            continue;
+        }
+
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+            s_silent_strikes++;
+            ESP_LOGW(TAG, "STA health: no AP info (strike %u)", (unsigned)s_silent_strikes);
+            if (s_silent_strikes >= 2) {
+                wifi_force_radio_cycle("no AP info");
+                s_silent_strikes = 0;
+            }
+            continue;
+        }
+        s_status.rssi = ap.rssi;
+
+        int pr = probe_gateway_tx();
+        if (pr < 0) {
+            continue;
+        }
+        if (pr == 0) {
+            s_silent_strikes++;
+            ESP_LOGW(TAG, "STA health: gateway unreachable (strike %u, rssi=%d)",
+                     (unsigned)s_silent_strikes, (int)ap.rssi);
+            if (s_silent_strikes >= 2) {
+                s_silent_strikes = 0;
+                s_bssid_locked = false;
+                memset(s_locked_bssid, 0, sizeof(s_locked_bssid));
+                if (s_status.ap_active) {
+                    softap_stop();
+                }
+                if (s_recovery_depth < 1) {
+                    s_recovery_depth = 1;
+                    wifi_soft_reconnect("gateway TX dead");
+                } else {
+                    s_recovery_depth = 0;
+                    wifi_force_radio_cycle("gateway TX dead");
+                }
+            }
+            continue;
+        }
+
+        /* Outbound OK. If also no inbound app traffic since join for long enough,
+         * treat as silent STA once — then SoftAP for phone, then stop looping. */
+        const bool quiet =
+            !s_last_traffic_us || (now - s_last_traffic_us) > 45000000LL;
+        const bool past_grace = s_got_ip_us && (now - s_got_ip_us) > 40000000LL;
+        if (quiet && past_grace && s_recovery_depth < 2) {
+            ESP_LOGW(TAG, "STA health: outbound OK but no inbound (rssi=%d depth=%u)",
+                     (int)ap.rssi, (unsigned)s_recovery_depth);
+            s_traffic_good_streak = 0;
+            s_bssid_locked = false;
+            memset(s_locked_bssid, 0, sizeof(s_locked_bssid));
+            if (s_recovery_depth < 1) {
+                if (s_status.ap_active) {
+                    softap_stop();
+                }
+                s_recovery_depth = 1;
+                wifi_soft_reconnect("silent STA (one-shot)");
+            } else {
+                cancel_softap_stop();
+                s_softap_lifeline = true;
+                if (!s_status.ap_active) {
+                    softap_start();
+                }
+                s_recovery_depth = 2; /* stop further auto reconnect loops */
+                ESP_LOGW(TAG, "SoftAP lifeline up — join ICC1-Gateway if portal still dark");
+            }
+            continue;
+        }
+
+        remember_sta_bssid();
+        if (s_status.ap_active && !s_softap_lifeline) {
+            schedule_softap_stop();
+        }
+    }
+}
 
 /** Dedicated task — never call esp_wifi_* from the timer service or Wi-Fi event loop. */
 static void softap_work_task(void *arg)
@@ -56,7 +322,7 @@ static void softap_work_task(void *arg)
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        if (s_status.state != WIFI_MGR_CONNECTED || !s_status.ap_active) {
+        if (s_status.state != WIFI_MGR_CONNECTED || !s_status.ap_active || s_softap_lifeline) {
             continue;
         }
         ESP_LOGI(TAG, "Home Wi-Fi stable — disabling SoftAP setup portal");
@@ -192,7 +458,13 @@ static esp_err_t configure_softap(void)
     wifi_config_t ap = {0};
     strncpy((char *)ap.ap.ssid, s_status.ap_ssid, sizeof(ap.ap.ssid));
     ap.ap.ssid_len = (uint8_t)strlen(s_status.ap_ssid);
-    ap.ap.channel = CONFIG_WIFI_AP_CHANNEL;
+    /* APSTA requires SoftAP on the same channel as STA. */
+    uint8_t ch = CONFIG_WIFI_AP_CHANNEL;
+    wifi_ap_record_t sta_ap;
+    if (esp_wifi_sta_get_ap_info(&sta_ap) == ESP_OK && sta_ap.primary >= 1) {
+        ch = sta_ap.primary;
+    }
+    ap.ap.channel = ch;
     ap.ap.max_connection = 4;
     ap.ap.beacon_interval = 100;
 
@@ -219,7 +491,8 @@ static esp_err_t configure_softap(void)
         snprintf(s_status.ap_ip, sizeof(s_status.ap_ip), "192.168.4.1");
     }
     s_status.ap_active = true;
-    ESP_LOGI(TAG, "SoftAP SSID='%s' IP=%s (open setup portal)", s_status.ap_ssid, s_status.ap_ip);
+    ESP_LOGI(TAG, "SoftAP SSID='%s' IP=%s ch=%u (open setup portal)", s_status.ap_ssid,
+             s_status.ap_ip, (unsigned)ch);
     return ESP_OK;
 }
 
@@ -238,6 +511,10 @@ static esp_err_t configure_sta(const char *ssid, const char *pass)
         sta.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     } else {
         sta.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
+    if (s_bssid_locked) {
+        memcpy(sta.sta.bssid, s_locked_bssid, sizeof(sta.sta.bssid));
+        sta.sta.bssid_set = true;
     }
 
     esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &sta);
@@ -283,6 +560,7 @@ static esp_err_t softap_stop(void)
     }
     s_status.ap_active = false;
     s_status.ap_ip[0] = '\0';
+    s_softap_lifeline = false;
     ESP_LOGI(TAG, "SoftAP stopped — home Wi-Fi only (secured)");
     return ESP_OK;
 }
@@ -313,6 +591,10 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         s_status.reconnects++;
         snprintf(s_status.ip, sizeof(s_status.ip), "-");
         cancel_softap_stop();
+        if (s_in_recovery) {
+            /* wifi_soft_reconnect / force_radio_cycle owns the reconnect. */
+            return;
+        }
         if (!s_status.has_sta_credentials) {
             softap_start();
             s_status.state = WIFI_MGR_AP_MODE;
@@ -321,8 +603,9 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         if (s_retry < CONFIG_WIFI_MAX_RETRY) {
             s_retry++;
             s_status.state = WIFI_MGR_CONNECTING;
-            /* Keep SoftAP available while reconnecting so setup/portal still works. */
-            if (!s_status.ap_active) {
+            /* APSTA while STA is flapping kills C3 TX (portal + HomeKit hang).
+             * Only bring SoftAP back after several STA failures. */
+            if (s_retry >= SOFTAP_AFTER_RETRY && !s_status.ap_active) {
                 softap_start();
             }
             ESP_LOGW(TAG, "STA disconnected, retry %d/%d", s_retry, CONFIG_WIFI_MAX_RETRY);
@@ -347,6 +630,8 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         }
         ESP_LOGI(TAG, "STA connected to '%s', IP %s RSSI %d", s_status.ssid, s_status.ip,
                  s_status.rssi);
+        s_got_ip_us = esp_timer_get_time();
+        /* Do not seed s_last_traffic_us here — that blocked TX-dead recovery for 2 minutes. */
         /* If SoftAP was up (portal / reconnect), tear it down after HAP/httpd settle.
          * Booting with saved credentials uses STA-only from the start — no teardown. */
         if (s_status.ap_active) {
@@ -429,6 +714,17 @@ esp_err_t wifi_manager_start(void)
     } else {
         ESP_LOGI(TAG, "Wi-Fi power save disabled (keep portal/HomeKit reachable)");
     }
+    /* 11n/HT enables AMPDU BA — with this AP that yields associated-but-silent STA.
+     * Force b/g only (sdkconfig also disables AMPDU). */
+    uint8_t proto = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G;
+    esp_err_t pr = esp_wifi_set_protocol(WIFI_IF_STA, proto);
+    if (pr != ESP_OK) {
+        ESP_LOGW(TAG, "set_protocol(b/g) failed: %s", esp_err_to_name(pr));
+    } else {
+        ESP_LOGI(TAG, "STA protocol 11b/g only (no HT/AMPDU)");
+    }
+
+    /* Do NOT scan here — active scan during STA bring-up wedges C3 TX. */
 
     if (!s_softap_work_task) {
         if (xTaskCreate(softap_work_task, "ap_work", 3072, NULL, 5, &s_softap_work_task) !=
@@ -442,6 +738,13 @@ esp_err_t wifi_manager_start(void)
                                            NULL, softap_stop_timer_cb);
         if (!s_softap_stop_timer) {
             ESP_LOGW(TAG, "SoftAP stop timer create failed");
+        }
+    }
+    if (!s_wifi_health_task) {
+        if (xTaskCreate(wifi_health_task, "wifi_health", 8192, NULL, 4, &s_wifi_health_task) !=
+            pdPASS) {
+            s_wifi_health_task = NULL;
+            ESP_LOGW(TAG, "Wi-Fi health task create failed");
         }
     }
 
@@ -492,6 +795,8 @@ esp_err_t wifi_manager_clear_sta(void)
     s_status.has_sta_credentials = false;
     s_status.ssid[0] = '\0';
     s_status.rssi = 0;
+    s_bssid_locked = false;
+    memset(s_locked_bssid, 0, sizeof(s_locked_bssid));
     snprintf(s_status.ip, sizeof(s_status.ip), "-");
     s_retry = CONFIG_WIFI_MAX_RETRY; /* stop reconnect loop */
     esp_wifi_disconnect();

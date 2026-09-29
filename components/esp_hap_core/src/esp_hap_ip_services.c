@@ -26,6 +26,7 @@
 #include <json_parser.h>
 #include <hap_platform_memory.h>
 #include <esp_log.h>
+#include <string.h>
 #include <esp_mfi_debug.h>
 #include <esp_hap_main.h>
 #include <esp_hap_pair_setup.h>
@@ -33,6 +34,12 @@
 #include <esp_hap_pairings.h>
 #include <esp_hap_network_io.h>
 #include <esp_hap_secure_message.h>
+
+/* Optional — provided by wifi_manager when linked into the gateway app. */
+void wifi_manager_note_traffic(void) __attribute__((weak));
+void wifi_manager_note_traffic(void) {}
+void wifi_manager_note_tx_fail(void) __attribute__((weak));
+void wifi_manager_note_tx_fail(void) {}
 #include <esp_hap_acc.h>
 #include <esp_hap_serv.h>
 #include <esp_hap_char.h>
@@ -1288,6 +1295,7 @@ get_char_return:
     }
 
     hap_report_event(HAP_EVENT_GET_CHAR_COMPLETED, NULL, 0);
+    wifi_manager_note_traffic();
 	return HAP_SUCCESS;
 }
 static struct httpd_uri hap_characteristics_get = {
@@ -1399,26 +1407,32 @@ static struct httpd_uri hap_prepare = {
 static void hap_send_notification(void *arg)
 {
     int num_char = hap_priv.cfg.max_event_notif_chars;
-    hap_char_t *hc;
-    hap_char_t **char_arr = hap_platform_memory_calloc(num_char, sizeof(hap_char_t *));
-
-    if (!char_arr) {
-        return;
+    if (num_char < 1) {
+        num_char = 8;
     }
+    if (num_char > 48) {
+        num_char = 48;
+    }
+    /* Keep notify locals lean — HAP loop stack is shared; large frames here
+     * plus frequent EVENT under load contributed to C3 instability. */
+    hap_char_t *char_arr_local[16];
+    hap_char_t **char_arr = char_arr_local;
+    if (num_char > 16) {
+        num_char = 16;
+    }
+    memset(char_arr, 0, sizeof(hap_char_t *) * (size_t)num_char);
 
     int i, num_notif_chars;
     for (i = 0; i < num_char; i++) {
-        hc = hap_get_pending_notif_char();
+        hap_char_t *hc = hap_get_pending_notif_char();
         if (hc) {
             char_arr[i] = hc;
         } else {
             break;
         }
     }
-    /* If no characteristic notifications are pending, free char_arr and exit */ 
+    /* If no characteristic notifications are pending, exit */
     if (i == 0) {
-        ESP_LOGD("hap", "EVENT: no pending chars");
-	hap_platform_memory_free(char_arr); 
         return;
     }
     num_notif_chars = i;
@@ -1445,7 +1459,7 @@ static void hap_send_notification(void *arg)
         int j;
         bool notif_to_send = false;
         for (j = 0; j < num_notif_chars; j++) {
-            hc = char_arr[j];
+            hap_char_t *hc = char_arr[j];
             __hap_char_t *_hc = ( __hap_char_t *)hc;
             /* Owner skip is only for write-echo. External/hardware updates must
              * always reach Home — clear owner and deliver. */
@@ -1488,14 +1502,19 @@ static void hap_send_notification(void *arg)
         if (hdr_ok > 0 && sep_ok > 0 && body_ok > 0) {
             any_delivered = true;
         } else {
-            ESP_LOGW("hap", "EVENT send failed fd=%d hdr=%d sep=%d body=%d", fd, hdr_ok, sep_ok,
-                     body_ok);
+            ESP_LOGW("hap", "EVENT send failed fd=%d hdr=%d sep=%d body=%d — closing session",
+                     fd, hdr_ok, sep_ok, body_ok);
+            hap_close_session(session);
+            continue;
         }
         httpd_sess_update_lru_counter(hap_priv.server, fd);
 		ESP_LOGI("hap", "EVENT notif → fd=%d (%d char) %s", fd, num_notif_chars, notif_json);
 	}
     ESP_LOGI("hap", "EVENT batch: %d char(s), ctrl_connected=%d delivered=%d", num_notif_chars,
              (int)ctrl_connected, (int)any_delivered);
+    if (any_delivered) {
+        wifi_manager_note_traffic();
+    }
     /* If no controller was connected and no disconnected event was sent,
      * reannaounce mDNS. That will increment state number as required
      * by HAP Spec R15.
@@ -1504,13 +1523,12 @@ static void hap_send_notification(void *arg)
         hap_mdns_announce(false);
         hap_priv.disconnected_event_sent = true;
     }
-    /* Only provoke when a controller is connected but EVENT could not be
-     * delivered. Provoking with ctrl_connected=0 used force_reannounce and
-     * starved C3 Wi‑Fi / the web UI after name or sensor EVENT queues. */
+    /* Undelivered EVENT is common (stale Home session). Do not call
+     * wifi_manager_note_tx_fail() here — that stacked silent_strikes and
+     * force_radio_cycle() until STA went silent and the portal died. */
     if (ctrl_connected && !any_delivered) {
-        hap_provoke_controller_refresh();
+        ESP_LOGW("hap", "EVENT undelivered (%d char)", num_notif_chars);
     }
-    hap_platform_memory_free(char_arr);
 }
 
 void hap_http_debug_enable()
@@ -1541,7 +1559,7 @@ void hap_provoke_controller_refresh(void)
     static int64_t s_last_us;
     int64_t now = esp_timer_get_time();
     /* Debounce — rapid remote presses share one reconnect; also protects C3 Wi‑Fi. */
-    if (s_last_us && (now - s_last_us) < 2500000) {
+    if (s_last_us && (now - s_last_us) < 4000000) {
         return;
     }
     s_last_us = now;
