@@ -25,11 +25,12 @@
 static const char *TAG = "app_main";
 
 #if CONFIG_HK_ENABLED
-/** Defer HomeKit: HAP/mDNS right after STA IP wedges C3 TX. */
+/** Defer HomeKit briefly: HAP/mDNS right after STA IP can wedge C3 TX.
+ * Keep this short — a long window makes every reboot look like “No Response”. */
 static void delayed_hk_task(void *arg)
 {
     (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(45000));
+    vTaskDelay(pdMS_TO_TICKS(12000));
     esp_err_t e = homekit_bridge_start();
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "HomeKit bridge start failed: %s", esp_err_to_name(e));
@@ -72,7 +73,7 @@ void app_main(void)
             ESP_LOGW(TAG, "HomeKit bridge start failed: %s", esp_err_to_name(err));
         }
     } else {
-        ESP_LOGI(TAG, "HomeKit start deferred 45s (Wi‑Fi settle)");
+        ESP_LOGI(TAG, "HomeKit start deferred 12s (Wi‑Fi settle)");
     }
 #endif
 }

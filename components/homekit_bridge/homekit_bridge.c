@@ -44,7 +44,7 @@ static uint32_t s_inv_sig_cached;
 static bool s_inv_sig_cached_valid;
 
 /** Bump when remote accessory service layout changes (forces rebuild). */
-#define REMOTE_LAYOUT_VER 28
+#define REMOTE_LAYOUT_VER 30
 /**
  * One bridged accessory per remote, with each physical button as its own
  * Switch / Stateless Programmable Switch service (linked). Sub-tile names
@@ -924,6 +924,8 @@ static esp_err_t add_bridged_remote(const zb_device_t *d)
             }
             hap_serv_add_char(serv, name_ch);
             hap_serv_add_char(serv, cfg_ch);
+            /* Service Label Index is for SPS / multi-instance; not on Switch. */
+            hap_serv_add_char(serv, hap_char_service_label_index_create((uint8_t)(i + 1)));
             hap_serv_set_write_cb(serv, remote_btn_switch_write);
             hap_serv_set_priv(serv, &slot->btn_priv[i]);
             hap_char_t *ev =
@@ -949,6 +951,21 @@ static esp_err_t add_bridged_remote(const zb_device_t *d)
             if (btn_servs[i]) {
                 hap_serv_link_serv(primary, btn_servs[i]);
             }
+        }
+    }
+
+    /* Only needed when any button is a stateless programmable switch. */
+    bool any_sps = false;
+    for (uint8_t i = 0; i < nbtn; i++) {
+        if (d->btn_mode[i] != ZB_BTN_MODE_STATEFUL) {
+            any_sps = true;
+            break;
+        }
+    }
+    if (any_sps) {
+        hap_serv_t *label_serv = hap_serv_service_label_create(1); /* dots */
+        if (label_serv) {
+            hap_acc_add_serv(acc, label_serv);
         }
     }
 
@@ -1022,29 +1039,25 @@ static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8
     if (mode == ZB_BTN_MODE_STATEFUL) {
         bool on = zigbee_host_btn_toggle(eui64, button_index);
         hap_char_t *hc = slot->btn_on_char[button_index];
+        /* Release before EVENT I/O — holding s_sync_mu during hap_http_send_notif
+         * blocked the HK sync task and stalled controller sessions. */
+        if (s_sync_mu) {
+            xSemaphoreGive(s_sync_mu);
+        }
         if (!hc) {
-            if (s_sync_mu) {
-                xSemaphoreGive(s_sync_mu);
-            }
             ESP_LOGW(TAG, "Remote btn %u stateful but On char NULL", (unsigned)button_index);
             return;
         }
         update_char_bool_notify(hc, on);
-        if (s_sync_mu) {
-            xSemaphoreGive(s_sync_mu);
-        }
-        /* Do NOT provoke here — it flooded the HAP loop queue (size was 10) and
-         * dropped TRIGGER_NOTIF so EVENT never left the device. Undelivered
-         * EVENTs provoke from the HAP notify path instead. */
         ESP_LOGI(TAG, "HomeKit remote button %u stateful toggle -> %s", (unsigned)button_index,
                  on ? "ON" : "OFF");
         return;
     }
     hap_char_t *ev = slot->btn_event_char[button_index];
+    if (s_sync_mu) {
+        xSemaphoreGive(s_sync_mu);
+    }
     if (!ev) {
-        if (s_sync_mu) {
-            xSemaphoreGive(s_sync_mu);
-        }
         ESP_LOGW(TAG, "Remote btn %u stateless but event char NULL", (unsigned)button_index);
         return;
     }
@@ -1054,9 +1067,6 @@ static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8
     hap_char_enable_notif_all_sessions(ev);
     hap_val_t val = {.i = (int)event};
     hap_char_update_val(ev, &val);
-    if (s_sync_mu) {
-        xSemaphoreGive(s_sync_mu);
-    }
     ESP_LOGI(TAG, "HomeKit remote button %u event %u (single=0 double=1 long=2)",
              (unsigned)button_index, (unsigned)event);
 }
@@ -1769,25 +1779,16 @@ esp_err_t homekit_bridge_sync_devices(void)
 static void homekit_start_task(void *arg)
 {
     (void)arg;
-    /* Wait for STA IP. Defer HAP until portal traffic proves TX is alive — starting
-     * HAP/mDNS while STA is still settling is what wedges C3 (“associated but silent”). */
-    for (int i = 0; i < 80; i++) {
+    /* Wait for STA IP. Defer HAP until STA has settled — starting HAP/mDNS
+     * immediately after GOT_IP can wedge C3 TX. */
+    for (int i = 0; i < 40; i++) {
         if (wifi_manager_is_connected() && !wifi_manager_is_ap_active()) {
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(250));
     }
-    /* Keep probing until outbound TX works, or give up after ~20s. */
-    for (int i = 0; i < 20; i++) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        if (wifi_manager_is_connected()) {
-            /* Portal may already be answering; treat connected+no-AP as good enough after 5s. */
-            if (i >= 4) {
-                break;
-            }
-        }
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    /* Short settle after link-up (app_main already waited ~12s). */
+    vTaskDelay(pdMS_TO_TICKS(2000));
 
     snprintf(s_st.setup_code, sizeof(s_st.setup_code), "%s", CONFIG_HK_SETUP_CODE);
     snprintf(s_st.setup_id, sizeof(s_st.setup_id), "%s", CONFIG_HK_SETUP_ID);

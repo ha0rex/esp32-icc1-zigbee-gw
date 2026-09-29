@@ -699,15 +699,19 @@ static void handle_unsolicited(uint16_t fid, const uint8_t *params, size_t param
                     static uint16_t s_last_synth_cluster;
                     static uint16_t s_last_synth_gid;
                     int64_t now = ezsp_now_ms();
+                    /* OnOff: wider window — one press → messageSent + delayed real RX. */
+                    int64_t dup_ms = (cluster == ZCL_CLUSTER_ON_OFF) ? 2500 : 400;
                     bool dup = (cluster == s_last_synth_cluster) && (learn_gid == s_last_synth_gid) &&
-                               (now - s_last_synth_ms) < 200;
-                    /* Real button cmd OR any group multicast (light report) — skip invent. */
+                               (now - s_last_synth_ms) < dup_ms;
+                    /* Real button cmd OR any group multicast (light report) — skip invent.
+                     * OnOff power presses often deliver real RX 0.5–2s after messageSent. */
+                    int64_t skip_ms = (cluster == ZCL_CLUSTER_ON_OFF) ? 2500 : 600;
                     bool real_recent = (learn_gid == s_last_real_btn_gid) &&
                                        (cluster == s_last_real_btn_cluster) &&
-                                       (now - s_last_real_btn_rx_ms) < 450;
+                                       (now - s_last_real_btn_rx_ms) < skip_ms;
                     bool mcast_recent = (learn_gid == s_last_mcast_rx_gid) &&
                                         (cluster == s_last_mcast_rx_cluster) &&
-                                        (now - s_last_mcast_rx_ms) < 600;
+                                        (now - s_last_mcast_rx_ms) < skip_ms;
                     if (syn.len > 0 && !dup && !real_recent && !mcast_recent) {
                         s_last_synth_ms = now;
                         s_last_synth_cluster = cluster;

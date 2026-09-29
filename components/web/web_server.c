@@ -1053,9 +1053,29 @@ static esp_err_t api_zigbee_sniff(httpd_req_t *req)
 {
     /* Must be static: EZSP_SNIFF_LOG entries are too large for the httpd task stack
      * (stack overflow → random reboot whenever the Sniffer tab polls). */
-    static char sniff_json[12288];
+    static char sniff_json[8192];
     static ezsp_sniff_entry_t s_entries[EZSP_SNIFF_LOG];
     static SemaphoreHandle_t s_sniff_api_mu;
+    const uint32_t seq = ezsp_sniff_seq();
+
+    /* ?since=<seq> → tiny ack when nothing new (UI used to pull ~12KB every 400ms
+     * and wedge C3 STA TX the moment the Sniffer tab opened). */
+    char qbuf[48];
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
+        char since_s[16];
+        if (httpd_query_key_value(qbuf, "since", since_s, sizeof(since_s)) == ESP_OK) {
+            unsigned long since = strtoul(since_s, NULL, 10);
+            if (since == (unsigned long)seq) {
+                char tiny[64];
+                snprintf(tiny, sizeof(tiny), "{\"ok\":true,\"seq\":%lu,\"unchanged\":true}",
+                         (unsigned long)seq);
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+                return httpd_resp_sendstr(req, tiny);
+            }
+        }
+    }
+
     if (!s_sniff_api_mu) {
         s_sniff_api_mu = xSemaphoreCreateMutex();
     }
@@ -1064,12 +1084,18 @@ static esp_err_t api_zigbee_sniff(httpd_req_t *req)
     }
 
     uint8_t n = ezsp_copy_sniff_log(s_entries, EZSP_SNIFF_LOG);
+    /* Cap payload — newest 24 frames is enough for the live log. */
+    uint8_t start = 0;
+    if (n > 24) {
+        start = (uint8_t)(n - 24);
+        n = 24;
+    }
     size_t pos = 0;
     pos += (size_t)snprintf(sniff_json + pos, sizeof(sniff_json) - pos,
                             "{\"ok\":true,\"seq\":%lu,\"count\":%u,\"entries\":[",
-                            (unsigned long)ezsp_sniff_seq(), (unsigned)n);
+                            (unsigned long)seq, (unsigned)n);
     for (uint8_t i = 0; i < n && pos + 220 < sizeof(sniff_json); i++) {
-        const ezsp_sniff_entry_t *e = &s_entries[i];
+        const ezsp_sniff_entry_t *e = &s_entries[start + i];
         char hex[EZSP_SNIFF_DATA * 3 + 1];
         size_t h = 0;
         for (uint8_t b = 0; b < e->len && h + 3 < sizeof(hex); b++) {

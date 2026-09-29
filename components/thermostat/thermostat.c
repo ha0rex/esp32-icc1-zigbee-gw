@@ -562,6 +562,8 @@ esp_err_t group_update(uint8_t id, const group_update_t *upd)
                upd->member_count <= GROUP_MAX_MEMBERS) {
         g->member_count = upd->member_count;
         memcpy(g->members, upd->members, (size_t)upd->member_count * 8);
+        g->is_light_group = false;
+        refresh_runtime_locked(g);
     }
     nvs_save_locked();
     if (g->type == GROUP_TYPE_THERMOSTAT) {

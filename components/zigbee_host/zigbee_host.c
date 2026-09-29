@@ -994,7 +994,9 @@ static void relay_remote_to_target_locked(const zb_device_t *remote, uint8_t but
     static uint16_t s_room_node;
     int64_t now = now_ms();
     uint32_t debounce_ms = 350;
-    if (button_index == 1 || button_index == 2) {
+    if (button_index == 0) {
+        debounce_ms = 2500; /* power: synth + delayed real Off/Toggle */
+    } else if (button_index == 1 || button_index == 2) {
         debounce_ms = (event == HK_BTN_EVENT_LONG) ? 320 : 200;
     }
     if (remote->node_id == s_last_node && button_index == s_last_btn &&
@@ -1116,22 +1118,23 @@ static void emit_remote_button(const zb_device_t *d, uint8_t button_index, uint8
     if (nb == 0 || button_index >= nb) {
         return;
     }
-    /* messageSent synth + real multicast RX can both fire for one physical press. */
+    /* messageSent synth + real multicast RX can both fire for one physical press.
+     * Power (btn 0): synth Toggle then real On/Off/Toggle often 0.5–2s apart —
+     * without a wide window the stateful HK switch flips twice (off→on→off). */
     static int64_t s_emit_ms;
     static uint16_t s_emit_node;
     static uint8_t s_emit_btn;
-    static uint8_t s_emit_ev;
     int64_t now = now_ms();
-    /* Power (btn 0) needs a wider window — OnOff Toggle often arrives twice ~300–500ms apart. */
-    int64_t debounce_ms = (button_index == 0) ? 600 : 280;
-    if (d->node_id == s_emit_node && button_index == s_emit_btn && event == s_emit_ev &&
+    int64_t debounce_ms = (button_index == 0) ? 2500 : 350;
+    if (d->node_id == s_emit_node && button_index == s_emit_btn &&
         (now - s_emit_ms) < debounce_ms) {
+        ESP_LOGI(TAG, "Remote btn %u debounced (%lld ms)", (unsigned)button_index,
+                 (long long)(now - s_emit_ms));
         return;
     }
     s_emit_ms = now;
     s_emit_node = d->node_id;
     s_emit_btn = button_index;
-    s_emit_ev = event;
 
     ESP_LOGI(TAG, "Remote button eui=..%02X%02X btn=%u event=%u type=%u", d->eui64[0], d->eui64[1],
              (unsigned)button_index, (unsigned)event, (unsigned)d->remote_type);
@@ -1538,9 +1541,11 @@ static void handle_remote_cluster_cmd(zb_device_t *d, uint16_t cluster, uint8_t 
         } else if (cmd == ZCL_CMD_ON) {
             emit_remote_button(d, 0, HK_BTN_EVENT_SINGLE);
         } else if (cmd == ZCL_CMD_OFF) {
-            uint8_t idx = (nbtn >= 4) ? 1 : 0;
-            if (nbtn == 5) {
-                idx = 0;
+            /* 5-btn IKEA power is one button — map Off to btn0 (same as On/Toggle)
+             * so synth Toggle + real Off debounce together instead of double-latch. */
+            uint8_t idx = 0;
+            if (nbtn == 4 || nbtn == 2) {
+                idx = 1;
             }
             emit_remote_button(d, idx, HK_BTN_EVENT_SINGLE);
         }
