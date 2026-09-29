@@ -18,7 +18,7 @@ Phone / Home app / browser
      Zigbee mesh
 ```
 
-**Current firmware version:** `0.3.0` (see `PROJECT_VER` in `CMakeLists.txt`)
+**Current firmware version:** `0.3.1` (see `PROJECT_VER` in `CMakeLists.txt`)
 
 **Repo:** [ha0rex/esp32-icc1-zigbee-gw](https://github.com/ha0rex/esp32-icc1-zigbee-gw)
 
@@ -35,7 +35,7 @@ Phone / Home app / browser
 | **Grouped devices** | Combine members into one HomeKit accessory; thermostat mode (sensor + heater, ±0.5 °C) |
 | **Portal** | SoftAP Wi‑Fi setup + full management UI on home Wi‑Fi |
 | **Sniffer** | Live Zigbee RX/TX/EVT log with friendly device names |
-| **OTA** | Dual-slot HTTPS update from GitHub `main` (rolling `ota` release) |
+| **OTA** | Dual-slot update: browser fetches GitHub `ota` branch, uploads over local HTTP |
 
 ---
 
@@ -141,12 +141,18 @@ Limits: up to **32** devices, **8** groups × **8** members, **5** buttons per r
 
 ## OTA updates (`main` channel)
 
-Pushes to **`main`** (firmware changes) build with the `espressif/idf:latest` image and refresh a rolling GitHub Release tagged **`ota`**:
+Pushes to **`main`** (firmware changes) build with the `espressif/idf:latest` image and publish:
 
-- Manifest: https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/manifest.json
-- Binary: https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/esp32_icc1_zigbee_gw.bin
+- GitHub Release tag **`ota`** (browser downloads)
+- Branch **`ota`** with raw files for the gateway (ESP32 HTTPS)
 
-On the device (home Wi‑Fi): **System → Check for update → Install update**. The gateway reboots into the new slot. Keep power applied during the download.
+Device manifest:
+
+https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/manifest.json
+
+On the device (home Wi‑Fi): **System → Check for update → Install update**.
+
+The browser fetches the manifest/firmware from GitHub (CORS), then uploads the image to the gateway over local HTTP — the ESP32-C3 does **not** run HTTPS itself (not enough RAM with HomeKit). Keep power applied during install; the gateway reboots when done.
 
 **Branches**
 
@@ -169,7 +175,7 @@ On the device (home Wi‑Fi): **System → Check for update → Install update**
 | `homekit_bridge` | HAP bridge + bridged accessories / EVENTs |
 | `wifi_manager` | SoftAP provisioning + STA (C3-safe AMPDU/HT off) |
 | `web` | Embedded portal + JSON APIs |
-| `fw_ota` | HTTPS OTA from GitHub `ota` release |
+| `fw_ota` | Browser-fed OTA (offer + HTTP upload; no on-device TLS) |
 
 ---
 
@@ -194,7 +200,7 @@ See `sdkconfig.defaults`:
 | HomeKit “No Response” | Wait for deferred start; confirm `:8118`; try lock→unlock once after large inventory changes |
 | Remote does nothing in Home | Mode = HomeKit buttons? Exposed? For control mode, complete Touchlink to a **bulb** |
 | Sensor stuck / empty readings | **Read values** + wake the sleepy end device with its button |
-| OTA check fails | Home STA online? GitHub reachable? First CI `ota` release published from `main`? |
+| OTA check fails | Browser can reach GitHub raw? Portal on home Wi‑Fi (not SoftAP-only)? `ota` branch published? |
 
 ### Serial success snapshot
 

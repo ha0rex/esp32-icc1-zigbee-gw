@@ -1,8 +1,11 @@
 name: OTA release (main)
 
-# Build firmware on every push to main and publish a rolling GitHub Release
-# tagged "ota" (manifest.json + .bin). The gateway checks:
-#   https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/manifest.json
+# Build firmware on every push to main and publish:
+#   1) GitHub Release tag "ota" (human downloads)
+#   2) orphan branch "ota" with raw files (ESP32 HTTPS — no release redirects)
+#
+# Device manifest:
+#   https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/manifest.json
 
 on:
   push:
@@ -37,8 +40,6 @@ jobs:
           echo "OTA version: $VER"
           sed -i -E "s/set\(PROJECT_VER \"[^\"]+\"\)/set(PROJECT_VER \"$VER\")/" CMakeLists.txt
 
-      # esp_idf_version must be a real Docker Hub tag under espressif/idf
-      # (e.g. latest, release-v5.5). "master" is NOT published → docker exit 125.
       - name: Build (ESP-IDF)
         uses: espressif/esp-idf-ci-action@v1
         with:
@@ -55,6 +56,7 @@ jobs:
           cp "$BIN" dist/esp32_icc1_zigbee_gw.bin
           SHA256=$(sha256sum "$BIN" | awk '{print $1}')
           VER="${{ steps.ver.outputs.version }}"
+          RAW_BIN="https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/esp32_icc1_zigbee_gw.bin"
           python3 - <<PY
           import json, subprocess, datetime
           ver = "${VER}"
@@ -62,14 +64,31 @@ jobs:
           commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           manifest = {
               "version": ver,
-              "url": "https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/esp32_icc1_zigbee_gw.bin",
+              "url": "${RAW_BIN}",
               "sha256": sha,
-              "built": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "built": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "commit": commit,
           }
           open("dist/manifest.json", "w").write(json.dumps(manifest, indent=2) + "\n")
           print(json.dumps(manifest, indent=2))
           PY
+
+      - name: Publish ota branch (raw URLs for the gateway)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          WORK=$(mktemp -d)
+          cp dist/esp32_icc1_zigbee_gw.bin dist/manifest.json "$WORK/"
+          cd "$WORK"
+          git init
+          git checkout -b ota
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add esp32_icc1_zigbee_gw.bin manifest.json
+          git commit -m "OTA ${{ steps.ver.outputs.version }}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/ha0rex/esp32-icc1-zigbee-gw.git"
+          git push -f origin ota
 
       - name: Publish rolling release "ota"
         uses: softprops/action-gh-release@v2
@@ -83,7 +102,8 @@ jobs:
             Rolling firmware channel built from **main**.
             Version: `${{ steps.ver.outputs.version }}`
 
-            The gateway System tab checks `manifest.json` on this release.
+            Gateway checks the **ota** branch raw URL (not this release redirect):
+            `https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/manifest.json`
           files: |
             dist/esp32_icc1_zigbee_gw.bin
             dist/manifest.json

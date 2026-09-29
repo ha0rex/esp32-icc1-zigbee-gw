@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -21,21 +22,24 @@ typedef enum {
 
 typedef struct {
     fw_ota_state_t state;
-    char running_version[32];
-    char available_version[32];
+    char running_version[48];
+    char available_version[48];
+    char firmware_url[256];
     char message[96];
     bool update_available;
-    int progress_pct; /**< 0–100 while updating; -1 if unknown */
+    int progress_pct;
 } fw_ota_status_t;
 
-/** Read running app version into status; safe to call before any check. */
 void fw_ota_get_status(fw_ota_status_t *out);
 
-/** Fetch OTA manifest from the configured GitHub release URL (blocking ~few s). */
-esp_err_t fw_ota_check(void);
+/** Browser-fed offer after the portal fetched the GitHub manifest (no device TLS). */
+esp_err_t fw_ota_offer(const char *version, const char *url);
 
-/** Start HTTPS OTA in a background task (call after fw_ota_check finds an update). */
-esp_err_t fw_ota_start_upgrade(void);
+/** Stream firmware image written by the portal (HTTP upload, no device TLS). */
+esp_err_t fw_ota_upload_begin(size_t image_len);
+esp_err_t fw_ota_upload_write(const void *data, size_t len);
+esp_err_t fw_ota_upload_finish(void);
+esp_err_t fw_ota_upload_abort(void);
 
 const char *fw_ota_state_str(fw_ota_state_t st);
 

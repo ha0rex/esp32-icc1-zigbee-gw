@@ -10,9 +10,9 @@ menu "Firmware OTA (GitHub main)"
     config FW_OTA_MANIFEST_URL
         string "OTA manifest URL"
         depends on FW_OTA_ENABLED
-        default "https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/manifest.json"
+        default "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/manifest.json"
         help
-            HTTPS JSON with version + firmware URL. CI on main refreshes the
-            rolling "ota" release assets.
+            HTTPS JSON with version + firmware URL. Prefer raw.githubusercontent.com
+            (ota branch) — GitHub Releases redirect through hosts that fail on C3.
 
 endmenu

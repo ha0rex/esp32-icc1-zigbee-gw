@@ -26,6 +26,7 @@
 #include "ezsp.h"
 #include "fw_ota.h"
 #include "esp_app_desc.h"
+#include "esp_system.h"
 
 static const char *TAG = "web";
 static httpd_handle_t s_server;
@@ -33,7 +34,7 @@ static SemaphoreHandle_t s_scan_mutex;
 static SemaphoreHandle_t s_root_mu; /**< At most one full portal HTML send */
 static char s_scan_json[2048];
 static char s_scan_ssids[16][33];
-static char s_json[24576];
+static char s_json[16384];
 /* Heap buffer for status snapshot — avoids multi-KB stack copies. */
 static zigbee_host_status_t s_zb_snap;
 static int64_t s_last_handler_us; /**< Last successful URI handler completion */
@@ -486,58 +487,108 @@ static esp_err_t api_status(httpd_req_t *req)
     return err;
 }
 
+static esp_err_t read_body(httpd_req_t *req, char *buf, size_t buflen);
+static bool json_get_string(const char *body, const char *key, char *out, size_t out_len);
+
 static esp_err_t api_ota_status(httpd_req_t *req)
 {
     fw_ota_status_t st;
     fw_ota_get_status(&st);
-    char msg[128], run[48], av[48];
+    char msg[128], run[64], av[64], url[280];
     json_escape(st.message, msg, sizeof(msg));
     json_escape(st.running_version, run, sizeof(run));
     json_escape(st.available_version, av, sizeof(av));
-    char body[384];
+    json_escape(st.firmware_url, url, sizeof(url));
+    char body[768];
     snprintf(body, sizeof(body),
              "{\"ok\":true,\"state\":\"%s\",\"running\":\"%s\",\"available\":\"%s\","
-             "\"update_available\":%s,\"progress\":%d,\"message\":\"%s\"}",
-             fw_ota_state_str(st.state), run, av, st.update_available ? "true" : "false",
+             "\"url\":\"%s\",\"update_available\":%s,\"progress\":%d,\"message\":\"%s\"}",
+             fw_ota_state_str(st.state), run, av, url, st.update_available ? "true" : "false",
              st.progress_pct, msg);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_sendstr(req, body);
 }
 
-static esp_err_t api_ota_check(httpd_req_t *req)
+static esp_err_t api_ota_offer(httpd_req_t *req)
 {
-    esp_err_t err = fw_ota_check();
+    char body[512];
+    if (read_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"bad body\"}");
+    }
+    char version[48] = {0}, url[256] = {0};
+    json_get_string(body, "version", version, sizeof(version));
+    json_get_string(body, "url", url, sizeof(url));
+    esp_err_t err = fw_ota_offer(version, url);
     fw_ota_status_t st;
     fw_ota_get_status(&st);
-    char msg[128], run[48], av[48];
+    char msg[128], run[64], av[64];
     json_escape(st.message, msg, sizeof(msg));
     json_escape(st.running_version, run, sizeof(run));
     json_escape(st.available_version, av, sizeof(av));
-    char body[400];
-    snprintf(body, sizeof(body),
+    char resp[420];
+    snprintf(resp, sizeof(resp),
              "{\"ok\":%s,\"state\":\"%s\",\"running\":\"%s\",\"available\":\"%s\","
              "\"update_available\":%s,\"message\":\"%s\"}",
              err == ESP_OK ? "true" : "false", fw_ota_state_str(st.state), run, av,
              st.update_available ? "true" : "false", msg);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_sendstr(req, body);
+    return httpd_resp_sendstr(req, resp);
 }
 
-static esp_err_t api_ota_upgrade(httpd_req_t *req)
+static esp_err_t api_ota_upload(httpd_req_t *req)
 {
-    esp_err_t err = fw_ota_start_upgrade();
-    fw_ota_status_t st;
-    fw_ota_get_status(&st);
-    char msg[128];
-    json_escape(st.message, msg, sizeof(msg));
-    char body[256];
-    snprintf(body, sizeof(body), "{\"ok\":%s,\"state\":\"%s\",\"message\":\"%s\"}",
-             err == ESP_OK ? "true" : "false", fw_ota_state_str(st.state), msg);
+    int total = req->content_len;
+    if (total <= 0) {
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"empty body\"}");
+    }
+    esp_err_t err = fw_ota_upload_begin((size_t)total);
+    if (err != ESP_OK) {
+        fw_ota_status_t st;
+        fw_ota_get_status(&st);
+        char msg[128];
+        json_escape(st.message, msg, sizeof(msg));
+        char resp[200];
+        snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"%s\"}", msg);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, resp);
+    }
+
+    char buf[1024];
+    int remaining = total;
+    while (remaining > 0) {
+        int n = remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining;
+        int r = httpd_req_recv(req, buf, n);
+        if (r <= 0) {
+            fw_ota_upload_abort();
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"recv failed\"}");
+        }
+        err = fw_ota_upload_write(buf, (size_t)r);
+        if (err != ESP_OK) {
+            char resp[120];
+            snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"%s\"}", esp_err_to_name(err));
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, resp);
+        }
+        remaining -= r;
+    }
+
+    err = fw_ota_upload_finish();
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_sendstr(req, body);
+    if (err != ESP_OK) {
+        char resp[120];
+        snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"%s\"}", esp_err_to_name(err));
+        return httpd_resp_sendstr(req, resp);
+    }
+    /* Reply first; reboot after the TCP send completes. */
+    esp_err_t send_err =
+        httpd_resp_sendstr(req, "{\"ok\":true,\"rebooting\":true,\"message\":\"Update OK — rebooting\"}");
+    vTaskDelay(pdMS_TO_TICKS(400));
+    esp_restart();
+    return send_err;
 }
 
 static esp_err_t api_wifi_scan(httpd_req_t *req)
@@ -1113,7 +1164,7 @@ static esp_err_t api_zigbee_sniff(httpd_req_t *req)
 {
     /* Must be static: EZSP_SNIFF_LOG entries are too large for the httpd task stack
      * (stack overflow → random reboot whenever the Sniffer tab polls). */
-    static char sniff_json[8192];
+    static char sniff_json[4096];
     static ezsp_sniff_entry_t s_entries[EZSP_SNIFF_LOG];
     static SemaphoreHandle_t s_sniff_api_mu;
     const uint32_t seq = ezsp_sniff_seq();
@@ -1393,8 +1444,9 @@ esp_err_t web_server_start(void)
     config.lru_purge_enable = true;
     config.max_uri_handlers = 36;
     config.stack_size = 12288;
-    config.recv_wait_timeout = 1;
-    config.send_wait_timeout = 1;
+    /* OTA upload streams ~1 MiB; keep headroom between flash-write chunks. */
+    config.recv_wait_timeout = 30;
+    config.send_wait_timeout = 5;
     config.max_open_sockets = 5; /* Headroom for status/ping while one HTML send runs */
     config.keep_alive_enable = false;
     config.backlog_conn = 2;
@@ -1430,8 +1482,8 @@ esp_err_t web_server_start(void)
         {.uri = "/api/thermostats/update", .method = HTTP_POST, .handler = api_thermo_update},
         {.uri = "/api/thermostats/remove", .method = HTTP_POST, .handler = api_thermo_remove},
         {.uri = "/api/ota", .method = HTTP_GET, .handler = api_ota_status},
-        {.uri = "/api/ota/check", .method = HTTP_POST, .handler = api_ota_check},
-        {.uri = "/api/ota/upgrade", .method = HTTP_POST, .handler = api_ota_upgrade},
+        {.uri = "/api/ota/offer", .method = HTTP_POST, .handler = api_ota_offer},
+        {.uri = "/api/ota/upload", .method = HTTP_POST, .handler = api_ota_upload},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_ok},
         {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_ok},
         {.uri = "/library/test/success.html", .method = HTTP_GET, .handler = captive_ok},

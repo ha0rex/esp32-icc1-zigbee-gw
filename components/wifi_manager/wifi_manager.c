@@ -25,6 +25,8 @@
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "lwip/sockets.h"
+#include "lwip/dns.h"
+#include "lwip/ip_addr.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -211,6 +213,29 @@ static int probe_gateway_tx(void)
         }
     }
     return any_socket ? 0 : -1;
+}
+
+static void wifi_ensure_public_dns(void)
+{
+    if (!s_netif_sta) {
+        return;
+    }
+    esp_netif_dns_info_t dns = {0};
+    bool have_main = false;
+    if (esp_netif_get_dns_info(s_netif_sta, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
+        dns.ip.type == ESP_IPADDR_TYPE_V4 && dns.ip.u_addr.ip4.addr != 0) {
+        have_main = true;
+    }
+    if (!have_main) {
+        dns.ip.type = ESP_IPADDR_TYPE_V4;
+        dns.ip.u_addr.ip4.addr = ESP_IP4TOADDR(8, 8, 8, 8);
+        if (esp_netif_set_dns_info(s_netif_sta, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK) {
+            ESP_LOGI(TAG, "DNS main → 8.8.8.8");
+        }
+    }
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    dns.ip.u_addr.ip4.addr = ESP_IP4TOADDR(1, 1, 1, 1);
+    esp_netif_set_dns_info(s_netif_sta, ESP_NETIF_DNS_BACKUP, &dns);
 }
 
 static void wifi_apply_sta_radio_quirks(void)
@@ -719,6 +744,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         s_silent_strikes = 0;
         /* Re-apply after every join — stop/start and roam drop these. */
         wifi_apply_sta_radio_quirks();
+        wifi_ensure_public_dns();
         /* Do not seed s_last_traffic_us here — that blocked TX-dead recovery. */
         if (s_status.ap_active) {
             schedule_softap_stop();
