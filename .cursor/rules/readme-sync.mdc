@@ -1,0 +1,28 @@
+---
+description: Keep README.md accurate whenever firmware, portal, OTA, or workflows change
+alwaysApply: true
+---
+
+# README stays current
+
+Whenever you change user-visible or operator-facing behaviour in this repo, **update `README.md` in the same change** (same PR/commit when committing).
+
+## Always sync README when you touch
+
+- Features (Zigbee, HomeKit, remotes, groups, thermostat, sniffer, portal tabs/APIs)
+- Hardware pins, UART, flash/partition layout, power notes
+- Ports, setup codes, SoftAP names, OTA URLs/tags, branch roles (`main`/`dev`)
+- Build/flash/erase steps, `PROJECT_VER` / versioning, CI workflows
+- Limits (device/group counts), pairing/Touchlink flows, known caveats
+
+## How to update
+
+- Prefer editing the existing section over adding a duplicate “changelog” dump
+- Bump or mention `PROJECT_VER` when the release version in `CMakeLists.txt` changes
+- Remove claims that are no longer true; never leave “not implemented yet” for shipped features
+- Keep the tone concise and factual (tables + short procedures)
+
+## Do not
+
+- Ship firmware-facing changes with a stale README
+- Document internal-only refactors that users never see (unless they change build/flash steps)
