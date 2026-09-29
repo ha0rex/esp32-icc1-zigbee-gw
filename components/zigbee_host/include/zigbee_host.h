@@ -180,6 +180,13 @@ bool zigbee_host_btn_toggle(const uint8_t eui64[8], uint8_t button_index);
 typedef void (*zb_remote_button_cb_t)(const uint8_t eui64[8], uint8_t button_index, uint8_t event);
 void zigbee_host_set_remote_button_cb(zb_remote_button_cb_t cb);
 
+/**
+ * Optional callback when a sensor's temp/humidity/battery cache changes
+ * (attribute report or read response). Used to push live HomeKit EVENTs.
+ */
+typedef void (*zb_sensor_update_cb_t)(const uint8_t eui64[8]);
+void zigbee_host_set_sensor_update_cb(zb_sensor_update_cb_t cb);
+
 #define ZB_REMOTE_PRESS_LOG 12
 
 /** Recent remote button press (RAM only — for portal live test). */

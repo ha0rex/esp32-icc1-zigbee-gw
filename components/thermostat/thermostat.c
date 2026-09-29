@@ -316,6 +316,25 @@ static void apply_thermo_control(group_t *g)
     nvs_save_locked();
 }
 
+void group_on_sensor_updated(const uint8_t sensor_eui[8])
+{
+    if (!sensor_eui || !s_mutex) {
+        return;
+    }
+    lock();
+    for (uint16_t i = 0; i < GROUP_MAX; i++) {
+        group_t *g = &s_list[i];
+        if (!g->used || g->type != GROUP_TYPE_THERMOSTAT) {
+            continue;
+        }
+        if (memcmp(g->sensor_eui, sensor_eui, 8) != 0) {
+            continue;
+        }
+        apply_thermo_control(g);
+    }
+    unlock();
+}
+
 static void control_task(void *arg)
 {
     (void)arg;

@@ -110,6 +110,9 @@ esp_err_t thermostat_update(uint8_t id, const thermostat_update_t *upd);
 esp_err_t group_set_onoff(uint8_t id, bool on);
 esp_err_t group_set_brightness(uint8_t id, uint8_t brightness_pct);
 
+/** Re-read sensor into any thermostat using this EUI and re-evaluate heat. */
+void group_on_sensor_updated(const uint8_t sensor_eui[8]);
+
 #ifdef __cplusplus
 }
 #endif

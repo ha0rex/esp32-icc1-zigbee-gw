@@ -1,0 +1,79 @@
+name: OTA release (main)
+
+# Build firmware on every push to main and publish a rolling GitHub Release
+# tagged "ota" (manifest.json + .bin). The gateway checks:
+#   https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/manifest.json
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Version stamp
+        id: ver
+        run: |
+          BASE=$(grep -E 'set\(PROJECT_VER' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/')
+          SHA=$(git rev-parse --short=8 HEAD)
+          DAY=$(date -u +%Y%m%d)
+          VER="${BASE}-${DAY}.${SHA}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "OTA version: $VER"
+          # Embed CI version into the app descriptor for this build only
+          sed -i -E "s/set\(PROJECT_VER \"[^\"]+\"\)/set(PROJECT_VER \"$VER\")/" CMakeLists.txt
+
+      - name: Build (ESP-IDF)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: master
+          target: esp32c3
+          path: .
+          command: idf.py build
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          BIN=build/esp32_icc1_zigbee_gw.bin
+          test -f "$BIN"
+          cp "$BIN" "dist/esp32_icc1_zigbee_gw.bin"
+          SHA256=$(sha256sum "$BIN" | awk '{print $1}')
+          VER="${{ steps.ver.outputs.version }}"
+          cat > dist/manifest.json <<EOF
+          {
+            "version": "${VER}",
+            "url": "https://github.com/ha0rex/esp32-icc1-zigbee-gw/releases/download/ota/esp32_icc1_zigbee_gw.bin",
+            "sha256": "${SHA256}",
+            "built": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "$(git rev-parse HEAD)"
+          }
+          EOF
+          cat dist/manifest.json
+
+      - name: Publish rolling release "ota"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ota
+          name: OTA channel (main)
+          prerelease: false
+          generate_release_notes: false
+          body: |
+            Rolling firmware channel built from **main**.
+            Version: `${{ steps.ver.outputs.version }}`
+
+            The gateway System tab checks `manifest.json` on this release.
+          files: |
+            dist/esp32_icc1_zigbee_gw.bin
+            dist/manifest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1523,11 +1523,13 @@ static void hap_send_notification(void *arg)
         hap_mdns_announce(false);
         hap_priv.disconnected_event_sent = true;
     }
-    /* Undelivered EVENT is common (stale Home session). Do not call
-     * wifi_manager_note_tx_fail() here — that stacked silent_strikes and
-     * force_radio_cycle() until STA went silent and the portal died. */
-    if (ctrl_connected && !any_delivered) {
-        ESP_LOGW("hap", "EVENT undelivered (%d char)", num_notif_chars);
+    /* Undelivered EVENT is common (stale Home session / no EV socket while the
+     * phone UI is idle). Provoke reconnection — same effect as lock→unlock —
+     * so remotes/automations see the new state without waiting for the user. */
+    if (!any_delivered) {
+        ESP_LOGW("hap", "EVENT undelivered (%d char, ctrl=%d) — provoke refresh",
+                 num_notif_chars, (int)ctrl_connected);
+        hap_provoke_controller_refresh();
     }
 }
 

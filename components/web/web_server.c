@@ -24,6 +24,8 @@
 #include "homekit_bridge.h"
 #include "thermostat.h"
 #include "ezsp.h"
+#include "fw_ota.h"
+#include "esp_app_desc.h"
 
 static const char *TAG = "web";
 static httpd_handle_t s_server;
@@ -469,7 +471,11 @@ static esp_err_t api_status(httpd_req_t *req)
             first ? "" : ",", peui, (unsigned)presses[i].button, ev, (long long)age);
         first = false;
     }
-    snprintf(s_json + pos, sizeof(s_json) - pos, "]}");
+    {
+        const esp_app_desc_t *ad = esp_app_get_description();
+        const char *ver = (ad && ad->version[0]) ? ad->version : "unknown";
+        snprintf(s_json + pos, sizeof(s_json) - pos, "],\"fw_version\":\"%s\"}", ver);
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -478,6 +484,60 @@ static esp_err_t api_status(httpd_req_t *req)
         web_note_handler_ok();
     }
     return err;
+}
+
+static esp_err_t api_ota_status(httpd_req_t *req)
+{
+    fw_ota_status_t st;
+    fw_ota_get_status(&st);
+    char msg[128], run[48], av[48];
+    json_escape(st.message, msg, sizeof(msg));
+    json_escape(st.running_version, run, sizeof(run));
+    json_escape(st.available_version, av, sizeof(av));
+    char body[384];
+    snprintf(body, sizeof(body),
+             "{\"ok\":true,\"state\":\"%s\",\"running\":\"%s\",\"available\":\"%s\","
+             "\"update_available\":%s,\"progress\":%d,\"message\":\"%s\"}",
+             fw_ota_state_str(st.state), run, av, st.update_available ? "true" : "false",
+             st.progress_pct, msg);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t api_ota_check(httpd_req_t *req)
+{
+    esp_err_t err = fw_ota_check();
+    fw_ota_status_t st;
+    fw_ota_get_status(&st);
+    char msg[128], run[48], av[48];
+    json_escape(st.message, msg, sizeof(msg));
+    json_escape(st.running_version, run, sizeof(run));
+    json_escape(st.available_version, av, sizeof(av));
+    char body[400];
+    snprintf(body, sizeof(body),
+             "{\"ok\":%s,\"state\":\"%s\",\"running\":\"%s\",\"available\":\"%s\","
+             "\"update_available\":%s,\"message\":\"%s\"}",
+             err == ESP_OK ? "true" : "false", fw_ota_state_str(st.state), run, av,
+             st.update_available ? "true" : "false", msg);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t api_ota_upgrade(httpd_req_t *req)
+{
+    esp_err_t err = fw_ota_start_upgrade();
+    fw_ota_status_t st;
+    fw_ota_get_status(&st);
+    char msg[128];
+    json_escape(st.message, msg, sizeof(msg));
+    char body[256];
+    snprintf(body, sizeof(body), "{\"ok\":%s,\"state\":\"%s\",\"message\":\"%s\"}",
+             err == ESP_OK ? "true" : "false", fw_ota_state_str(st.state), msg);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, body);
 }
 
 static esp_err_t api_wifi_scan(httpd_req_t *req)
@@ -1331,7 +1391,7 @@ esp_err_t web_server_start(void)
     /* Above HAP httpd (idle+5) so a busy Home session cannot starve the portal. */
     config.task_priority = tskIDLE_PRIORITY + 6;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 32;
+    config.max_uri_handlers = 36;
     config.stack_size = 12288;
     config.recv_wait_timeout = 1;
     config.send_wait_timeout = 1;
@@ -1369,6 +1429,9 @@ esp_err_t web_server_start(void)
         {.uri = "/api/thermostats/create", .method = HTTP_POST, .handler = api_thermo_create},
         {.uri = "/api/thermostats/update", .method = HTTP_POST, .handler = api_thermo_update},
         {.uri = "/api/thermostats/remove", .method = HTTP_POST, .handler = api_thermo_remove},
+        {.uri = "/api/ota", .method = HTTP_GET, .handler = api_ota_status},
+        {.uri = "/api/ota/check", .method = HTTP_POST, .handler = api_ota_check},
+        {.uri = "/api/ota/upgrade", .method = HTTP_POST, .handler = api_ota_upgrade},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_ok},
         {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_ok},
         {.uri = "/library/test/success.html", .method = HTTP_GET, .handler = captive_ok},

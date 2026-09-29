@@ -57,6 +57,16 @@ static void inventory_mark_dirty(void)
     s_inv_sig_cached_valid = false;
 }
 
+/** After live add/remove, bump c# + mDNS immediately so Home discovers new tiles
+ * without waiting for the next sync cycle (which could miss if sig races). */
+static void inventory_notify_changed(void)
+{
+    inventory_mark_dirty();
+    if (s_started && s_allow_config_bump) {
+        hap_update_config_number();
+    }
+}
+
 typedef struct hk_bridged hk_bridged_t;
 
 /** Per-button write context — serv_priv for remote Switch services. */
@@ -191,6 +201,26 @@ static void update_char_float(hap_char_t *hc, float v, float lo, float hi)
     if (cur && fabsf(cur->f - v) < 0.05f) {
         return;
     }
+    hap_val_t val = {.f = v};
+    hap_char_update_val(hc, &val);
+}
+
+/** Live sensor/thermostat push — re-arm EV so Home tiles update without opening detail. */
+static void update_char_float_notify(hap_char_t *hc, float v, float lo, float hi)
+{
+    if (!hc) {
+        return;
+    }
+    if (v < lo) {
+        v = lo;
+    } else if (v > hi) {
+        v = hi;
+    }
+    const hap_val_t *cur = hap_char_get_val(hc);
+    if (cur && fabsf(cur->f - v) < 0.05f) {
+        return;
+    }
+    hap_char_enable_notif_all_sessions(hc);
     hap_val_t val = {.f = v};
     hap_char_update_val(hc, &val);
 }
@@ -566,9 +596,7 @@ static esp_err_t add_bridged_light(const zb_device_t *d)
 
     int aid = hap_get_unique_aid(serial);
     hap_add_bridged_accessory(acc, aid);
-    if (s_allow_config_bump) {
-        inventory_mark_dirty();
-    }
+    inventory_notify_changed();
 
     slot->used = true;
     slot->kind = ZB_DEVICE_KIND_LIGHT;
@@ -632,9 +660,7 @@ static esp_err_t add_bridged_switch(const zb_device_t *d)
 
     int aid = hap_get_unique_aid(serial);
     hap_add_bridged_accessory(acc, aid);
-    if (s_allow_config_bump) {
-        inventory_mark_dirty();
-    }
+    inventory_notify_changed();
 
     slot->used = true;
     slot->kind = ZB_DEVICE_KIND_SWITCH;
@@ -723,9 +749,7 @@ static esp_err_t add_bridged_sensor(const zb_device_t *d)
 
     int aid = hap_get_unique_aid(serial);
     hap_add_bridged_accessory(acc, aid);
-    if (s_allow_config_bump) {
-        inventory_mark_dirty();
-    }
+    inventory_notify_changed();
 
     slot->used = true;
     slot->kind = ZB_DEVICE_KIND_SENSOR;
@@ -981,9 +1005,7 @@ static esp_err_t add_bridged_remote(const zb_device_t *d)
 
     int aid = hap_get_unique_aid(serial);
     hap_add_bridged_accessory(acc, aid);
-    if (s_allow_config_bump) {
-        inventory_mark_dirty();
-    }
+    inventory_notify_changed();
 
     slot->used = true;
     slot->kind = ZB_DEVICE_KIND_REMOTE;
@@ -1049,6 +1071,9 @@ static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8
             return;
         }
         update_char_bool_notify(hc, on);
+        /* Bridged Switch EVENTs often never reach an idle iPhone; lock→unlock
+         * was the only refresh. Provoke the same reconnect after remote presses. */
+        hap_provoke_controller_refresh();
         ESP_LOGI(TAG, "HomeKit remote button %u stateful toggle -> %s", (unsigned)button_index,
                  on ? "ON" : "OFF");
         return;
@@ -1067,8 +1092,97 @@ static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8
     hap_char_enable_notif_all_sessions(ev);
     hap_val_t val = {.i = (int)event};
     hap_char_update_val(ev, &val);
+    hap_provoke_controller_refresh();
     ESP_LOGI(TAG, "HomeKit remote button %u event %u (single=0 double=1 long=2)",
              (unsigned)button_index, (unsigned)event);
+}
+
+/** Push live sensor readings (and thermostats that use this sensor) into HomeKit. */
+static void on_sensor_update(const uint8_t eui64[8])
+{
+    if (!eui64 || !s_started) {
+        return;
+    }
+
+    /* Thermostat heat decision first — updates group runtime from the sensor. */
+    group_on_sensor_updated(eui64);
+
+    zb_device_t d;
+    if (!zigbee_host_get_device(eui64, &d)) {
+        return;
+    }
+
+    hap_char_t *temp_hc = NULL;
+    hap_char_t *hum_hc = NULL;
+    hap_char_t *batt_hc = NULL;
+    hap_char_t *low_hc = NULL;
+    hap_char_t *thermo_temp[GROUP_MAX];
+    hap_char_t *thermo_heat[GROUP_MAX];
+    float thermo_t[GROUP_MAX];
+    uint8_t thermo_h[GROUP_MAX];
+    uint8_t nthermo = 0;
+
+    if (s_sync_mu) {
+        xSemaphoreTake(s_sync_mu, portMAX_DELAY);
+    }
+    for (int i = 0; i < HK_MAX_BRIDGED; i++) {
+        if (s_bridged[i].used && s_bridged[i].kind == ZB_DEVICE_KIND_SENSOR &&
+            memcmp(s_bridged[i].eui64, eui64, 8) == 0) {
+            temp_hc = s_bridged[i].temp_char;
+            hum_hc = s_bridged[i].hum_char;
+            batt_hc = s_bridged[i].batt_char;
+            low_hc = s_bridged[i].low_batt_char;
+            break;
+        }
+    }
+    for (uint16_t ti = 0; ti < GROUP_MAX && nthermo < GROUP_MAX; ti++) {
+        if (!s_groups[ti].used || s_groups[ti].group_type != GROUP_TYPE_THERMOSTAT) {
+            continue;
+        }
+        group_t t;
+        if (!group_get_by_id(s_groups[ti].group_id, &t)) {
+            continue;
+        }
+        if (memcmp(t.sensor_eui, eui64, 8) != 0) {
+            continue;
+        }
+        thermo_temp[nthermo] = t.has_current_temp ? s_groups[ti].curr_temp_char : NULL;
+        thermo_heat[nthermo] = s_groups[ti].curr_state_char;
+        thermo_t[nthermo] = t.current_temp_c;
+        thermo_h[nthermo] = t.heating ? 1 : 0;
+        if (thermo_temp[nthermo] || thermo_heat[nthermo]) {
+            nthermo++;
+        }
+    }
+    if (s_sync_mu) {
+        xSemaphoreGive(s_sync_mu);
+    }
+
+    if (d.has_temp) {
+        update_char_float_notify(temp_hc, d.temperature_c, 0.0f, 100.0f);
+    }
+    if (d.has_humidity) {
+        update_char_float_notify(hum_hc, d.humidity_pct, 0.0f, 100.0f);
+    }
+    if (d.has_battery) {
+        if (batt_hc) {
+            hap_char_enable_notif_all_sessions(batt_hc);
+            update_char_uint8(batt_hc, d.battery_pct, 0, 100);
+        }
+        if (low_hc) {
+            hap_char_enable_notif_all_sessions(low_hc);
+            update_char_uint8(low_hc, d.battery_pct < 20 ? 1 : 0, 0, 1);
+        }
+    }
+    for (uint8_t k = 0; k < nthermo; k++) {
+        if (thermo_temp[k]) {
+            update_char_float_notify(thermo_temp[k], thermo_t[k], 0.0f, 100.0f);
+        }
+        if (thermo_heat[k]) {
+            hap_char_enable_notif_all_sessions(thermo_heat[k]);
+            update_char_uint8(thermo_heat[k], thermo_h[k], 0, 2);
+        }
+    }
 }
 
 static esp_err_t add_bridged_device(const zb_device_t *d)
@@ -1218,9 +1332,7 @@ static void remove_group_acc(hk_group_bridged_t *slot, const char *reason)
     if (slot->acc) {
         hap_remove_bridged_accessory(slot->acc);
         slot->acc = NULL;
-        if (s_allow_config_bump) {
-            inventory_mark_dirty();
-        }
+        inventory_notify_changed();
     }
     memset(slot, 0, sizeof(*slot));
     if (s_st.accessory_count > 0) {
@@ -1292,9 +1404,7 @@ static esp_err_t add_bridged_thermostat(const group_t *t)
 
     int aid = hap_get_unique_aid(serial);
     hap_add_bridged_accessory(acc, aid);
-    if (s_allow_config_bump) {
-        inventory_mark_dirty();
-    }
+    inventory_notify_changed();
 
     slot->used = true;
     slot->group_id = t->id;
@@ -1373,9 +1483,7 @@ static esp_err_t add_bridged_general_group(const group_t *g)
 
     int aid = hap_get_unique_aid(serial);
     hap_add_bridged_accessory(acc, aid);
-    if (s_allow_config_bump) {
-        inventory_mark_dirty();
-    }
+    inventory_notify_changed();
 
     slot->used = true;
     slot->group_id = g->id;
@@ -1408,9 +1516,7 @@ static void remove_bridged(hk_bridged_t *slot, const char *reason)
     if (slot->acc) {
         hap_remove_bridged_accessory(slot->acc);
         slot->acc = NULL;
-        if (s_allow_config_bump) {
-            inventory_mark_dirty();
-        }
+        inventory_notify_changed();
     }
     memset(slot, 0, sizeof(*slot));
     if (s_st.accessory_count > 0) {
@@ -1736,7 +1842,7 @@ static void sync_task(void *arg)
             }
         }
         /* Wake early on new controller connect (see hk_hap_event). */
-        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000));
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(4000));
     }
 }
 
@@ -1885,6 +1991,7 @@ esp_err_t homekit_bridge_start(void)
         s_sync_mu = xSemaphoreCreateMutex();
     }
     zigbee_host_set_remote_button_cb(on_remote_button);
+    zigbee_host_set_sensor_update_cb(on_sensor_update);
     snprintf(s_st.setup_code, sizeof(s_st.setup_code), "%s", CONFIG_HK_SETUP_CODE);
     snprintf(s_st.setup_id, sizeof(s_st.setup_id), "%s", CONFIG_HK_SETUP_ID);
     snprintf(s_st.status, sizeof(s_st.status), "starting");

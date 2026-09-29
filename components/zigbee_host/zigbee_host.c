@@ -37,6 +37,7 @@ static int64_t s_permit_deadline_ms;
 static bool s_pending_permit;
 static uint8_t s_pending_permit_dur;
 static zb_remote_button_cb_t s_remote_btn_cb;
+static zb_sensor_update_cb_t s_sensor_upd_cb;
 /** HomeKit button cb must not run under s_op_mutex/status_lock (re-enters those locks). */
 #define ZB_HK_BTN_Q 8
 typedef struct {
@@ -46,6 +47,41 @@ typedef struct {
 } hk_btn_evt_t;
 static hk_btn_evt_t s_hk_btn_q[ZB_HK_BTN_Q];
 static uint8_t s_hk_btn_q_len;
+
+/** Defer sensor→HomeKit pushes out of status_lock / ZCL parse. */
+#define ZB_SENSOR_UPD_Q 6
+static uint8_t s_sensor_upd_q[ZB_SENSOR_UPD_Q][8];
+static uint8_t s_sensor_upd_q_len;
+
+static void sensor_upd_q_push(const uint8_t eui64[8])
+{
+    if (!eui64) {
+        return;
+    }
+    for (uint8_t i = 0; i < s_sensor_upd_q_len; i++) {
+        if (memcmp(s_sensor_upd_q[i], eui64, 8) == 0) {
+            return;
+        }
+    }
+    if (s_sensor_upd_q_len >= ZB_SENSOR_UPD_Q) {
+        memmove(&s_sensor_upd_q[0], &s_sensor_upd_q[1], (ZB_SENSOR_UPD_Q - 1) * 8);
+        s_sensor_upd_q_len = ZB_SENSOR_UPD_Q - 1;
+    }
+    memcpy(s_sensor_upd_q[s_sensor_upd_q_len++], eui64, 8);
+}
+
+static void flush_sensor_upd_callbacks(void)
+{
+    while (s_sensor_upd_q_len > 0) {
+        uint8_t eui[8];
+        memcpy(eui, s_sensor_upd_q[0], 8);
+        memmove(&s_sensor_upd_q[0], &s_sensor_upd_q[1], (s_sensor_upd_q_len - 1) * 8);
+        s_sensor_upd_q_len--;
+        if (s_sensor_upd_cb) {
+            s_sensor_upd_cb(eui);
+        }
+    }
+}
 
 static void hk_btn_q_push(const uint8_t eui64[8], uint8_t button_index, uint8_t event)
 {
@@ -559,6 +595,11 @@ bool zigbee_host_btn_toggle(const uint8_t eui64[8], uint8_t button_index)
 void zigbee_host_set_remote_button_cb(zb_remote_button_cb_t cb)
 {
     s_remote_btn_cb = cb;
+}
+
+void zigbee_host_set_sensor_update_cb(zb_sensor_update_cb_t cb)
+{
+    s_sensor_upd_cb = cb;
 }
 
 static void press_log_push(const uint8_t eui64[8], uint8_t button_1based, uint8_t event)
@@ -2043,6 +2084,7 @@ static bool apply_zcl_attr_locked(zb_device_t *d, uint16_t cluster, uint16_t att
                 d->temperature_c = t;
                 d->has_temp = true;
                 changed = true;
+                sensor_upd_q_push(d->eui64);
             }
             if (source_ep && d->sensor_ep != source_ep) {
                 d->sensor_ep = source_ep;
@@ -2058,6 +2100,7 @@ static bool apply_zcl_attr_locked(zb_device_t *d, uint16_t cluster, uint16_t att
                 d->humidity_pct = h;
                 d->has_humidity = true;
                 changed = true;
+                sensor_upd_q_push(d->eui64);
             }
             if (source_ep && d->sensor_ep != source_ep) {
                 d->sensor_ep = source_ep;
@@ -2075,6 +2118,7 @@ static bool apply_zcl_attr_locked(zb_device_t *d, uint16_t cluster, uint16_t att
             d->battery_pct = pct;
             d->has_battery = true;
             changed = true;
+            sensor_upd_q_push(d->eui64);
         }
     } else if (cluster == ZCL_CLUSTER_ON_OFF && attr == ZCL_ATTR_ON_OFF && vlen >= 1 &&
                (dtype == 0x10 || dtype == 0x20)) {
@@ -3664,6 +3708,7 @@ static void host_task(void *arg)
                 xSemaphoreGive(s_op_mutex);
                 bool had_btn = s_hk_btn_q_len > 0;
                 flush_hk_btn_callbacks();
+                flush_sensor_upd_callbacks();
                 /* Force flush only after a button latch; otherwise debounce (≤5s). */
                 nvs_flush_devices_if_dirty(had_btn);
                 /* Join Touchlink groups overheard while relaying remote→bulb groupcasts. */
@@ -3987,6 +4032,7 @@ static void host_task(void *arg)
                 xSemaphoreGive(s_op_mutex);
                 bool btn_pending = s_hk_btn_q_len > 0;
                 flush_hk_btn_callbacks();
+                flush_sensor_upd_callbacks();
                 nvs_flush_devices_if_dirty(btn_pending);
             }
         }
