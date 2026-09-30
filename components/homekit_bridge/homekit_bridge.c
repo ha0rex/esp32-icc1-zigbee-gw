@@ -86,6 +86,9 @@ struct hk_bridged {
     hap_char_t *low_batt_char;
     hap_char_t *on_char;
     hap_char_t *brightness_char;
+    hap_char_t *active_char; /**< Irrigation / Valve Active */
+    hap_char_t *in_use_char; /**< Irrigation / Valve In Use */
+    hap_char_t *binary_char; /**< Contact/Motion/Leak/Smoke state */
     /** Remote: button services under a single accessory. */
     hap_char_t *btn_event_char[ZB_REMOTE_MAX_BUTTONS];
     hap_char_t *btn_on_char[ZB_REMOTE_MAX_BUTTONS];
@@ -104,15 +107,86 @@ typedef struct {
     bool used;
     uint8_t group_id;
     uint8_t group_type; /**< GROUP_TYPE_* */
+    uint8_t thermo_kind; /**< group_thermo_kind_t for thermostat groups */
+    uint8_t thermo_caps; /**< bit0 heater, bit1 cooler, bit2 force-RH, bit3 curr RH */
     hap_acc_t *acc;
     hap_char_t *curr_temp_char;
     hap_char_t *targ_temp_char;
     hap_char_t *curr_state_char;
     hap_char_t *targ_state_char;
+    hap_char_t *curr_hum_char;
+    hap_char_t *targ_hum_char;
+    hap_char_t *curr_hd_state_char;
+    hap_char_t *targ_hd_state_char;
     hap_char_t *on_char;
     hap_char_t *brightness_char;
     uint8_t missing_ticks;
 } hk_group_bridged_t;
+
+static uint8_t hk_thermo_caps(const group_t *t)
+{
+    uint8_t c = 0;
+    if (!t) {
+        return 0;
+    }
+    if (group_thermo_has_heater(t)) {
+        c |= 1u;
+    }
+    if (group_thermo_has_cooler(t)) {
+        c |= 2u;
+    }
+    if (t->humidity_force_heat) {
+        c |= 4u;
+    }
+    return c;
+}
+
+static uint8_t hk_current_heat_cool_state(const group_t *t)
+{
+    if (!t) {
+        return 0;
+    }
+    if (t->cooling) {
+        return 2;
+    }
+    if (t->heating) {
+        return 1;
+    }
+    return 0;
+}
+
+static uint8_t hk_target_heat_cool_state(const group_t *t)
+{
+    if (!t || t->mode == THERMO_MODE_OFF) {
+        return 0;
+    }
+    if (t->mode == THERMO_MODE_COOL) {
+        return 2;
+    }
+    if (t->mode == THERMO_MODE_AUTO) {
+        return 3;
+    }
+    return 1; /* heat */
+}
+
+static void hk_constrain_target_mode(hap_char_t *targ_mode, const group_t *t)
+{
+    if (!targ_mode || !t) {
+        return;
+    }
+    bool heat = group_thermo_has_heater(t);
+    bool cool = group_thermo_has_cooler(t);
+    if (heat && cool) {
+        hap_char_int_set_constraints(targ_mode, 0, 3, 1);
+    } else if (cool) {
+        /* Off + Cool only — HomeKit still uses 0 and 2; allow 0..2 */
+        hap_char_int_set_constraints(targ_mode, 0, 2, 1);
+    } else {
+        hap_char_int_set_constraints(targ_mode, 0, 1, 1);
+    }
+}
+
+static uint8_t hk_current_hd_state(const group_t *t);
 
 #define HK_MAX_BRIDGED ZB_HOST_MAX_DEVICES
 static hk_bridged_t s_bridged[HK_MAX_BRIDGED];
@@ -236,11 +310,60 @@ static void update_char_uint8(hap_char_t *hc, uint8_t v, uint8_t lo, uint8_t hi)
         v = hi;
     }
     const hap_val_t *cur = hap_char_get_val(hc);
-    if (cur && (uint8_t)cur->i == v) {
+    if (cur && (uint8_t)cur->u == v) {
         return;
     }
     hap_val_t val = {.u = v};
     hap_char_update_val(hc, &val);
+}
+
+/** Live uint8 EVENT push (contact/leak/smoke/Active) — force an edge if value unchanged. */
+static void update_char_uint8_notify(hap_char_t *hc, uint8_t v, uint8_t lo, uint8_t hi)
+{
+    if (!hc) {
+        return;
+    }
+    if (v < lo) {
+        v = lo;
+    } else if (v > hi) {
+        v = hi;
+    }
+    hap_char_enable_notif_all_sessions(hc);
+    const hap_val_t *cur = hap_char_get_val(hc);
+    if (cur && (uint8_t)cur->u == v) {
+        hap_val_t opp = {.u = (uint8_t)(v ? 0 : 1)};
+        hap_char_update_val(hc, &opp);
+    }
+    hap_val_t val = {.u = v};
+    hap_char_update_val(hc, &val);
+}
+
+static const char *kind_log_str(zb_device_kind_t kind)
+{
+    switch (kind) {
+    case ZB_DEVICE_KIND_LIGHT:
+        return "light";
+    case ZB_DEVICE_KIND_SWITCH:
+        return "switch";
+    case ZB_DEVICE_KIND_OUTLET:
+        return "outlet";
+    case ZB_DEVICE_KIND_IRRIGATION:
+        return "irrigation";
+    case ZB_DEVICE_KIND_SENSOR:
+        return "sensor";
+    case ZB_DEVICE_KIND_REMOTE:
+        return "remote";
+    case ZB_DEVICE_KIND_CONTACT:
+        return "contact";
+    case ZB_DEVICE_KIND_MOTION:
+        return "motion";
+    case ZB_DEVICE_KIND_LEAK:
+        return "leak";
+    case ZB_DEVICE_KIND_SMOKE:
+        return "smoke";
+    default:
+        return "unknown";
+    }
 }
 
 static void update_char_bool(hap_char_t *hc, bool v)
@@ -378,6 +501,18 @@ static void format_serial(const uint8_t eui64[8], zb_device_kind_t kind, char *s
         pfx = "sw";
     } else if (kind == ZB_DEVICE_KIND_REMOTE) {
         pfx = "rd";
+    } else if (kind == ZB_DEVICE_KIND_OUTLET) {
+        pfx = "ol";
+    } else if (kind == ZB_DEVICE_KIND_IRRIGATION) {
+        pfx = "ir";
+    } else if (kind == ZB_DEVICE_KIND_CONTACT) {
+        pfx = "ct";
+    } else if (kind == ZB_DEVICE_KIND_MOTION) {
+        pfx = "mo";
+    } else if (kind == ZB_DEVICE_KIND_LEAK) {
+        pfx = "lk";
+    } else if (kind == ZB_DEVICE_KIND_SMOKE) {
+        pfx = "sm";
     }
     snprintf(serial, serial_len, "%s%02x%02x%02x%02x%02x%02x", pfx, eui64[0], eui64[1], eui64[2],
              eui64[3], eui64[4], eui64[5]);
@@ -403,8 +538,20 @@ static void fill_identity(const zb_device_t *d, zb_device_kind_t kind, char *nam
         snprintf(model, model_len, "%s", "Zigbee Light");
     } else if (kind == ZB_DEVICE_KIND_SWITCH) {
         snprintf(model, model_len, "%s", "Zigbee Switch");
+    } else if (kind == ZB_DEVICE_KIND_OUTLET) {
+        snprintf(model, model_len, "%s", "Zigbee Outlet");
+    } else if (kind == ZB_DEVICE_KIND_IRRIGATION) {
+        snprintf(model, model_len, "%s", "Zigbee Irrigation");
     } else if (kind == ZB_DEVICE_KIND_REMOTE) {
         snprintf(model, model_len, "%s", "Zigbee Remote");
+    } else if (kind == ZB_DEVICE_KIND_CONTACT) {
+        snprintf(model, model_len, "%s", "Zigbee Contact");
+    } else if (kind == ZB_DEVICE_KIND_MOTION) {
+        snprintf(model, model_len, "%s", "Zigbee Motion");
+    } else if (kind == ZB_DEVICE_KIND_LEAK) {
+        snprintf(model, model_len, "%s", "Zigbee Leak");
+    } else if (kind == ZB_DEVICE_KIND_SMOKE) {
+        snprintf(model, model_len, "%s", "Zigbee Smoke");
     } else {
         snprintf(model, model_len, "%s", "Zigbee Sensor");
     }
@@ -671,6 +818,355 @@ static esp_err_t add_bridged_switch(const zb_device_t *d)
     s_st.accessory_count++;
     ESP_LOGI(TAG, "HomeKit exposed switch: %s mfr=%s model=%s aid=%d serial=%s", name, manufacturer,
              model, aid, serial);
+    return ESP_OK;
+}
+
+static esp_err_t add_bridged_outlet(const zb_device_t *d)
+{
+    if (!d || !d->used || !d->homekit_expose) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (find_bridged(d->eui64)) {
+        return ESP_OK;
+    }
+    hk_bridged_t *slot = alloc_bridged();
+    if (!slot) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char name[40], serial[20], manufacturer[32], model[32];
+    fill_identity(d, ZB_DEVICE_KIND_OUTLET, name, sizeof(name), manufacturer, sizeof(manufacturer),
+                  model, sizeof(model), serial, sizeof(serial));
+    const char *fw_rev = "1.0.0";
+
+    hap_acc_cfg_t cfg = {
+        .name = name,
+        .manufacturer = manufacturer,
+        .model = model,
+        .serial_num = serial,
+        .fw_rev = (char *)fw_rev,
+        .hw_rev = "1.0",
+        .pv = "1.1.0",
+        .cid = HAP_CID_OUTLET,
+        .identify_routine = accessory_identify,
+    };
+
+    hap_acc_t *acc = hap_acc_create(&cfg);
+    if (!acc) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool on = d->has_onoff ? d->onoff_on : false;
+    hap_serv_t *ol = hap_serv_outlet_create(on, true /* in use */);
+    if (!ol) {
+        hap_acc_delete(acc);
+        return ESP_ERR_NO_MEM;
+    }
+    hap_serv_add_char(ol, hap_char_name_create("Outlet"));
+    hap_serv_set_write_cb(ol, switch_write);
+    hap_serv_set_bulk_read_cb(ol, switch_bulk_read);
+    hap_serv_set_priv(ol, slot);
+    hap_acc_add_serv(acc, ol);
+    slot->on_char = hap_serv_get_char_by_uuid(ol, HAP_CHAR_UUID_ON);
+
+    int aid = hap_get_unique_aid(serial);
+    hap_add_bridged_accessory(acc, aid);
+    inventory_notify_changed();
+
+    slot->used = true;
+    slot->kind = ZB_DEVICE_KIND_OUTLET;
+    slot->missing_ticks = 0;
+    memcpy(slot->eui64, d->eui64, 8);
+    slot->acc = acc;
+    snprintf(slot->acc_name, sizeof(slot->acc_name), "%s", name);
+    s_st.accessory_count++;
+    ESP_LOGI(TAG, "HomeKit exposed outlet: %s aid=%d serial=%s", name, aid, serial);
+    return ESP_OK;
+}
+
+/** Active characteristic write for irrigation / valve — maps to Zigbee On/Off. */
+static int irrigation_write(hap_write_data_t write_data[], int count, void *serv_priv,
+                            void *write_priv)
+{
+    (void)write_priv;
+    hk_bridged_t *slot = (hk_bridged_t *)serv_priv;
+    int ret = HAP_SUCCESS;
+    for (int i = 0; i < count; i++) {
+        hap_write_data_t *w = &write_data[i];
+        const char *uuid = hap_char_get_type_uuid(w->hc);
+        if (!strcmp(uuid, HAP_CHAR_UUID_ACTIVE)) {
+            bool on = w->val.u != 0;
+            if (!slot) {
+                *(w->status) = HAP_STATUS_OO_RES;
+                ret = HAP_FAIL;
+                continue;
+            }
+            esp_err_t err = zigbee_host_set_onoff(slot->eui64, on);
+            if (err != ESP_OK) {
+                *(w->status) = HAP_STATUS_OO_RES;
+                ret = HAP_FAIL;
+                continue;
+            }
+            hap_char_update_val(w->hc, &w->val);
+            if (slot->in_use_char) {
+                hap_val_t iu = {.u = on ? 1 : 0};
+                hap_char_update_val(slot->in_use_char, &iu);
+            }
+            *(w->status) = HAP_STATUS_SUCCESS;
+            ESP_LOGI(TAG, "HomeKit Irrigation Active -> %s (queued)", on ? "ON" : "OFF");
+        } else {
+            *(w->status) = HAP_STATUS_RES_ABSENT;
+            ret = HAP_FAIL;
+        }
+    }
+    return ret;
+}
+
+static int irrigation_bulk_read(hap_read_data_t read_data[], int count, void *serv_priv,
+                                void *read_priv)
+{
+    (void)read_priv;
+    hk_bridged_t *slot = (hk_bridged_t *)serv_priv;
+    zb_device_t d;
+    bool have = slot && zigbee_host_get_device(slot->eui64, &d);
+    bool on = have && d.has_onoff ? d.onoff_on : (have && d.binary_on);
+    for (int i = 0; i < count; i++) {
+        const char *uuid = hap_char_get_type_uuid(read_data[i].hc);
+        if (!strcmp(uuid, HAP_CHAR_UUID_ACTIVE) || !strcmp(uuid, HAP_CHAR_UUID_IN_USE)) {
+            hap_val_t v = {.u = on ? 1 : 0};
+            hap_char_update_val(read_data[i].hc, &v);
+        } else if (!strcmp(uuid, HAP_CHAR_UUID_PROGRAM_MODE)) {
+            hap_val_t v = {.u = 0};
+            hap_char_update_val(read_data[i].hc, &v);
+        }
+        if (read_data[i].status) {
+            *(read_data[i].status) = HAP_STATUS_SUCCESS;
+        }
+    }
+    return HAP_SUCCESS;
+}
+
+static esp_err_t add_bridged_irrigation(const zb_device_t *d)
+{
+    if (!d || !d->used || !d->homekit_expose) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (find_bridged(d->eui64)) {
+        return ESP_OK;
+    }
+    hk_bridged_t *slot = alloc_bridged();
+    if (!slot) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char name[40], serial[20], manufacturer[32], model[32];
+    fill_identity(d, ZB_DEVICE_KIND_IRRIGATION, name, sizeof(name), manufacturer,
+                  sizeof(manufacturer), model, sizeof(model), serial, sizeof(serial));
+    const char *fw_rev = "1.0.0";
+
+    hap_acc_cfg_t cfg = {
+        .name = name,
+        .manufacturer = manufacturer,
+        .model = model,
+        .serial_num = serial,
+        .fw_rev = (char *)fw_rev,
+        .hw_rev = "1.0",
+        .pv = "1.1.0",
+        .cid = HAP_CID_SPRINKLER,
+        .identify_routine = accessory_identify,
+    };
+
+    hap_acc_t *acc = hap_acc_create(&cfg);
+    if (!acc) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool on = d->has_onoff ? d->onoff_on : d->binary_on;
+    uint8_t active = on ? 1 : 0;
+    hap_serv_t *irr = hap_serv_irrigation_system_create(active, 0 /* no program */, active);
+    if (!irr) {
+        hap_acc_delete(acc);
+        return ESP_ERR_NO_MEM;
+    }
+    hap_serv_add_char(irr, hap_char_name_create("Irrigation"));
+    hap_serv_set_write_cb(irr, irrigation_write);
+    hap_serv_set_bulk_read_cb(irr, irrigation_bulk_read);
+    hap_serv_set_priv(irr, slot);
+    hap_serv_mark_primary(irr);
+    hap_acc_add_serv(acc, irr);
+    slot->active_char = hap_serv_get_char_by_uuid(irr, HAP_CHAR_UUID_ACTIVE);
+    slot->in_use_char = hap_serv_get_char_by_uuid(irr, HAP_CHAR_UUID_IN_USE);
+
+    /* Linked Valve (irrigation type=1) — Home shows a proper sprinkler tile. */
+    hap_serv_t *valve = hap_serv_valve_create(active, active, 1 /* irrigation */);
+    if (valve) {
+        hap_serv_add_char(valve, hap_char_name_create("Valve"));
+        hap_serv_set_write_cb(valve, irrigation_write);
+        hap_serv_set_bulk_read_cb(valve, irrigation_bulk_read);
+        hap_serv_set_priv(valve, slot);
+        hap_serv_link_serv(irr, valve);
+        hap_acc_add_serv(acc, valve);
+    }
+
+    if (d->has_battery) {
+        uint8_t batt = d->battery_pct;
+        uint8_t low = batt < 20 ? 1 : 0;
+        hap_serv_t *batt_serv = hap_serv_battery_service_create(batt, 0, low);
+        if (batt_serv) {
+            hap_acc_add_serv(acc, batt_serv);
+            slot->batt_char = hap_serv_get_char_by_uuid(batt_serv, HAP_CHAR_UUID_BATTERY_LEVEL);
+            slot->low_batt_char =
+                hap_serv_get_char_by_uuid(batt_serv, HAP_CHAR_UUID_STATUS_LOW_BATTERY);
+        }
+    }
+
+    int aid = hap_get_unique_aid(serial);
+    hap_add_bridged_accessory(acc, aid);
+    inventory_notify_changed();
+
+    slot->used = true;
+    slot->kind = ZB_DEVICE_KIND_IRRIGATION;
+    slot->missing_ticks = 0;
+    memcpy(slot->eui64, d->eui64, 8);
+    slot->acc = acc;
+    snprintf(slot->acc_name, sizeof(slot->acc_name), "%s", name);
+    s_st.accessory_count++;
+    ESP_LOGI(TAG, "HomeKit exposed irrigation: %s aid=%d serial=%s", name, aid, serial);
+    return ESP_OK;
+}
+
+static int binary_sensor_bulk_read(hap_read_data_t read_data[], int count, void *serv_priv,
+                                   void *read_priv)
+{
+    (void)read_priv;
+    hk_bridged_t *slot = (hk_bridged_t *)serv_priv;
+    zb_device_t d;
+    bool have = slot && zigbee_host_get_device(slot->eui64, &d);
+    bool on = have && d.binary_on;
+    for (int i = 0; i < count; i++) {
+        const char *uuid = hap_char_get_type_uuid(read_data[i].hc);
+        if (!strcmp(uuid, HAP_CHAR_UUID_CONTACT_SENSOR_STATE)) {
+            hap_val_t v = {.u = on ? 0 : 1}; /* 0=detected/open, 1=not */
+            hap_char_update_val(read_data[i].hc, &v);
+        } else if (!strcmp(uuid, HAP_CHAR_UUID_MOTION_DETECTED)) {
+            hap_val_t v = {.b = on};
+            hap_char_update_val(read_data[i].hc, &v);
+        } else if (!strcmp(uuid, HAP_CHAR_UUID_LEAK_DETECTED) ||
+                   !strcmp(uuid, HAP_CHAR_UUID_SMOKE_DETECTED)) {
+            hap_val_t v = {.u = on ? 1 : 0};
+            hap_char_update_val(read_data[i].hc, &v);
+        } else if (!strcmp(uuid, HAP_CHAR_UUID_BATTERY_LEVEL) && have && d.has_battery) {
+            hap_val_t v = {.u = d.battery_pct};
+            hap_char_update_val(read_data[i].hc, &v);
+        } else if (!strcmp(uuid, HAP_CHAR_UUID_STATUS_LOW_BATTERY) && have && d.has_battery) {
+            hap_val_t v = {.u = d.battery_pct < 20 ? 1 : 0};
+            hap_char_update_val(read_data[i].hc, &v);
+        }
+        if (read_data[i].status) {
+            *(read_data[i].status) = HAP_STATUS_SUCCESS;
+        }
+    }
+    return HAP_SUCCESS;
+}
+
+static esp_err_t add_bridged_binary_sensor(const zb_device_t *d, zb_device_kind_t kind)
+{
+    if (!d || !d->used || !d->homekit_expose) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (find_bridged(d->eui64)) {
+        return ESP_OK;
+    }
+    hk_bridged_t *slot = alloc_bridged();
+    if (!slot) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char name[40], serial[20], manufacturer[32], model[32];
+    fill_identity(d, kind, name, sizeof(name), manufacturer, sizeof(manufacturer), model,
+                  sizeof(model), serial, sizeof(serial));
+    const char *fw_rev = "1.0.0";
+
+    hap_acc_cfg_t cfg = {
+        .name = name,
+        .manufacturer = manufacturer,
+        .model = model,
+        .serial_num = serial,
+        .fw_rev = (char *)fw_rev,
+        .hw_rev = "1.0",
+        .pv = "1.1.0",
+        .cid = HAP_CID_SENSOR,
+        .identify_routine = accessory_identify,
+    };
+
+    hap_acc_t *acc = hap_acc_create(&cfg);
+    if (!acc) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool on = d->binary_on;
+    hap_serv_t *serv = NULL;
+    char svc_name[16] = "Sensor";
+    if (kind == ZB_DEVICE_KIND_CONTACT) {
+        /* Contact: 0 = contact detected (closed), 1 = not detected (open). We map
+         * Alarm1 as "open/detected event" → state 0 when alarm, 1 when clear. */
+        serv = hap_serv_contact_sensor_create(on ? 0 : 1);
+        snprintf(svc_name, sizeof(svc_name), "%s", "Contact");
+    } else if (kind == ZB_DEVICE_KIND_MOTION) {
+        serv = hap_serv_motion_sensor_create(on);
+        snprintf(svc_name, sizeof(svc_name), "%s", "Motion");
+    } else if (kind == ZB_DEVICE_KIND_LEAK) {
+        serv = hap_serv_leak_sensor_create(on ? 1 : 0);
+        snprintf(svc_name, sizeof(svc_name), "%s", "Leak");
+    } else if (kind == ZB_DEVICE_KIND_SMOKE) {
+        serv = hap_serv_smoke_sensor_create(on ? 1 : 0);
+        snprintf(svc_name, sizeof(svc_name), "%s", "Smoke");
+    }
+    if (!serv) {
+        hap_acc_delete(acc);
+        return ESP_ERR_NO_MEM;
+    }
+    hap_serv_add_char(serv, hap_char_name_create(svc_name));
+    hap_serv_set_bulk_read_cb(serv, binary_sensor_bulk_read);
+    hap_serv_set_priv(serv, slot);
+    hap_acc_add_serv(acc, serv);
+
+    if (kind == ZB_DEVICE_KIND_CONTACT) {
+        slot->binary_char = hap_serv_get_char_by_uuid(serv, HAP_CHAR_UUID_CONTACT_SENSOR_STATE);
+    } else if (kind == ZB_DEVICE_KIND_MOTION) {
+        slot->binary_char = hap_serv_get_char_by_uuid(serv, HAP_CHAR_UUID_MOTION_DETECTED);
+    } else if (kind == ZB_DEVICE_KIND_LEAK) {
+        slot->binary_char = hap_serv_get_char_by_uuid(serv, HAP_CHAR_UUID_LEAK_DETECTED);
+    } else {
+        slot->binary_char = hap_serv_get_char_by_uuid(serv, HAP_CHAR_UUID_SMOKE_DETECTED);
+    }
+
+    if (d->has_battery) {
+        uint8_t batt = d->battery_pct;
+        uint8_t low = batt < 20 ? 1 : 0;
+        hap_serv_t *batt_serv = hap_serv_battery_service_create(batt, 0, low);
+        if (batt_serv) {
+            hap_serv_set_bulk_read_cb(batt_serv, binary_sensor_bulk_read);
+            hap_serv_set_priv(batt_serv, slot);
+            hap_acc_add_serv(acc, batt_serv);
+            slot->batt_char = hap_serv_get_char_by_uuid(batt_serv, HAP_CHAR_UUID_BATTERY_LEVEL);
+            slot->low_batt_char =
+                hap_serv_get_char_by_uuid(batt_serv, HAP_CHAR_UUID_STATUS_LOW_BATTERY);
+        }
+    }
+
+    int aid = hap_get_unique_aid(serial);
+    hap_add_bridged_accessory(acc, aid);
+    inventory_notify_changed();
+
+    slot->used = true;
+    slot->kind = kind;
+    slot->missing_ticks = 0;
+    memcpy(slot->eui64, d->eui64, 8);
+    slot->acc = acc;
+    snprintf(slot->acc_name, sizeof(slot->acc_name), "%s", name);
+    s_st.accessory_count++;
+    ESP_LOGI(TAG, "HomeKit exposed %s: %s aid=%d serial=%s", svc_name, name, aid, serial);
     return ESP_OK;
 }
 
@@ -1071,9 +1567,10 @@ static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8
             return;
         }
         update_char_bool_notify(hc, on);
-        /* Bridged Switch EVENTs often never reach an idle iPhone; lock→unlock
-         * was the only refresh. Provoke the same reconnect after remote presses. */
-        hap_provoke_controller_refresh();
+        /* Do NOT provoke (close all HAP sessions + mDNS) here. EVENT/1.0 is enough
+         * when a controller is subscribed; provoke under a live portal Sniffer poll
+         * has repeatedly starved C3 STA TX (ping/UI die). Idle Home may still need
+         * lock→unlock once — better than wedging Wi‑Fi. */
         ESP_LOGI(TAG, "HomeKit remote button %u stateful toggle -> %s", (unsigned)button_index,
                  on ? "ON" : "OFF");
         return;
@@ -1092,7 +1589,6 @@ static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8
     hap_char_enable_notif_all_sessions(ev);
     hap_val_t val = {.i = (int)event};
     hap_char_update_val(ev, &val);
-    hap_provoke_controller_refresh();
     ESP_LOGI(TAG, "HomeKit remote button %u event %u (single=0 double=1 long=2)",
              (unsigned)button_index, (unsigned)event);
 }
@@ -1116,22 +1612,53 @@ static void on_sensor_update(const uint8_t eui64[8])
     hap_char_t *hum_hc = NULL;
     hap_char_t *batt_hc = NULL;
     hap_char_t *low_hc = NULL;
+    hap_char_t *binary_hc = NULL;
+    zb_device_kind_t slot_kind = ZB_DEVICE_KIND_UNKNOWN;
+    hap_char_t *on_hc = NULL;
+    hap_char_t *active_hc = NULL;
+    hap_char_t *in_use_hc = NULL;
     hap_char_t *thermo_temp[GROUP_MAX];
     hap_char_t *thermo_heat[GROUP_MAX];
+    hap_char_t *thermo_hum[GROUP_MAX];
+    hap_char_t *thermo_hd_char[GROUP_MAX];
     float thermo_t[GROUP_MAX];
+    float thermo_rh[GROUP_MAX];
     uint8_t thermo_h[GROUP_MAX];
+    uint8_t thermo_hd_val[GROUP_MAX];
     uint8_t nthermo = 0;
 
     if (s_sync_mu) {
         xSemaphoreTake(s_sync_mu, portMAX_DELAY);
     }
     for (int i = 0; i < HK_MAX_BRIDGED; i++) {
-        if (s_bridged[i].used && s_bridged[i].kind == ZB_DEVICE_KIND_SENSOR &&
-            memcmp(s_bridged[i].eui64, eui64, 8) == 0) {
+        if (!s_bridged[i].used || memcmp(s_bridged[i].eui64, eui64, 8) != 0) {
+            continue;
+        }
+        slot_kind = s_bridged[i].kind;
+        if (slot_kind == ZB_DEVICE_KIND_SENSOR) {
             temp_hc = s_bridged[i].temp_char;
             hum_hc = s_bridged[i].hum_char;
             batt_hc = s_bridged[i].batt_char;
             low_hc = s_bridged[i].low_batt_char;
+            break;
+        }
+        if (slot_kind == ZB_DEVICE_KIND_CONTACT || slot_kind == ZB_DEVICE_KIND_MOTION ||
+            slot_kind == ZB_DEVICE_KIND_LEAK || slot_kind == ZB_DEVICE_KIND_SMOKE) {
+            binary_hc = s_bridged[i].binary_char;
+            batt_hc = s_bridged[i].batt_char;
+            low_hc = s_bridged[i].low_batt_char;
+            break;
+        }
+        if (slot_kind == ZB_DEVICE_KIND_IRRIGATION) {
+            active_hc = s_bridged[i].active_char;
+            in_use_hc = s_bridged[i].in_use_char;
+            batt_hc = s_bridged[i].batt_char;
+            low_hc = s_bridged[i].low_batt_char;
+            break;
+        }
+        if (slot_kind == ZB_DEVICE_KIND_OUTLET || slot_kind == ZB_DEVICE_KIND_SWITCH ||
+            slot_kind == ZB_DEVICE_KIND_LIGHT) {
+            on_hc = s_bridged[i].on_char;
             break;
         }
     }
@@ -1144,14 +1671,35 @@ static void on_sensor_update(const uint8_t eui64[8])
             continue;
         }
         if (memcmp(t.sensor_eui, eui64, 8) != 0) {
-            continue;
+            bool hum_match = false;
+            for (int bi = 0; bi < 8; bi++) {
+                if (t.humidity_sensor_eui[bi] != 0) {
+                    hum_match = true;
+                    break;
+                }
+            }
+            if (!hum_match || memcmp(t.humidity_sensor_eui, eui64, 8) != 0) {
+                continue;
+            }
         }
-        thermo_temp[nthermo] = t.has_current_temp ? s_groups[ti].curr_temp_char : NULL;
-        thermo_heat[nthermo] = s_groups[ti].curr_state_char;
-        thermo_t[nthermo] = t.current_temp_c;
-        thermo_h[nthermo] = t.heating ? 1 : 0;
-        if (thermo_temp[nthermo] || thermo_heat[nthermo]) {
-            nthermo++;
+        if (t.thermo_kind == GROUP_THERMO_KIND_HUMIDITY) {
+            thermo_hum[nthermo] = t.has_current_humidity ? s_groups[ti].curr_hum_char : NULL;
+            thermo_hd_char[nthermo] = s_groups[ti].curr_hd_state_char;
+            thermo_rh[nthermo] = t.current_humidity_pct;
+            thermo_hd_val[nthermo] = hk_current_hd_state(&t);
+            if (thermo_hum[nthermo] || thermo_hd_char[nthermo]) {
+                nthermo++;
+            }
+        } else {
+            thermo_temp[nthermo] = t.has_current_temp ? s_groups[ti].curr_temp_char : NULL;
+            thermo_heat[nthermo] = s_groups[ti].curr_state_char;
+            thermo_hum[nthermo] = t.has_current_humidity ? s_groups[ti].curr_hum_char : NULL;
+            thermo_t[nthermo] = t.current_temp_c;
+            thermo_h[nthermo] = hk_current_heat_cool_state(&t);
+            thermo_rh[nthermo] = t.current_humidity_pct;
+            if (thermo_temp[nthermo] || thermo_heat[nthermo] || thermo_hum[nthermo]) {
+                nthermo++;
+            }
         }
     }
     if (s_sync_mu) {
@@ -1163,6 +1711,27 @@ static void on_sensor_update(const uint8_t eui64[8])
     }
     if (d.has_humidity) {
         update_char_float_notify(hum_hc, d.humidity_pct, 0.0f, 100.0f);
+    }
+    if (binary_hc) {
+        if (slot_kind == ZB_DEVICE_KIND_MOTION) {
+            update_char_bool_notify(binary_hc, d.binary_on);
+        } else if (slot_kind == ZB_DEVICE_KIND_CONTACT) {
+            update_char_uint8_notify(binary_hc, d.binary_on ? 0 : 1, 0, 1);
+        } else {
+            update_char_uint8_notify(binary_hc, d.binary_on ? 1 : 0, 0, 1);
+        }
+    }
+    if (active_hc || in_use_hc) {
+        bool on = d.has_onoff ? d.onoff_on : d.binary_on;
+        if (active_hc) {
+            update_char_uint8_notify(active_hc, on ? 1 : 0, 0, 1);
+        }
+        if (in_use_hc) {
+            update_char_uint8_notify(in_use_hc, on ? 1 : 0, 0, 1);
+        }
+    }
+    if (on_hc && d.has_onoff) {
+        update_char_bool_notify(on_hc, d.onoff_on);
     }
     if (d.has_battery) {
         if (batt_hc) {
@@ -1182,6 +1751,13 @@ static void on_sensor_update(const uint8_t eui64[8])
             hap_char_enable_notif_all_sessions(thermo_heat[k]);
             update_char_uint8(thermo_heat[k], thermo_h[k], 0, 2);
         }
+        if (thermo_hum[k]) {
+            update_char_float_notify(thermo_hum[k], thermo_rh[k], 0.0f, 100.0f);
+        }
+        if (thermo_hd_char[k]) {
+            hap_char_enable_notif_all_sessions(thermo_hd_char[k]);
+            update_char_uint8(thermo_hd_char[k], thermo_hd_val[k], 0, 3);
+        }
     }
 }
 
@@ -1194,8 +1770,18 @@ static esp_err_t add_bridged_device(const zb_device_t *d)
     if (k == ZB_DEVICE_KIND_SWITCH) {
         return add_bridged_switch(d);
     }
+    if (k == ZB_DEVICE_KIND_OUTLET) {
+        return add_bridged_outlet(d);
+    }
+    if (k == ZB_DEVICE_KIND_IRRIGATION) {
+        return add_bridged_irrigation(d);
+    }
     if (k == ZB_DEVICE_KIND_SENSOR) {
         return add_bridged_sensor(d);
+    }
+    if (k == ZB_DEVICE_KIND_CONTACT || k == ZB_DEVICE_KIND_MOTION || k == ZB_DEVICE_KIND_LEAK ||
+        k == ZB_DEVICE_KIND_SMOKE) {
+        return add_bridged_binary_sensor(d, k);
     }
     if (k == ZB_DEVICE_KIND_REMOTE) {
         return add_bridged_remote(d);
@@ -1224,6 +1810,81 @@ static hk_group_bridged_t *alloc_group(void)
     return NULL;
 }
 
+static uint8_t hk_target_hd_state_from_mode(uint8_t mode)
+{
+    if (mode == THERMO_MODE_HUMIDIFY) {
+        return 1;
+    }
+    if (mode == THERMO_MODE_DEHUMIDIFY) {
+        return 2;
+    }
+    return 0;
+}
+
+static uint8_t hk_current_hd_state(const group_t *t)
+{
+    if (!t || t->mode == THERMO_MODE_OFF) {
+        return 0;
+    }
+    if (!t->heating) {
+        return 1;
+    }
+    if (t->mode == THERMO_MODE_DEHUMIDIFY) {
+        return 3;
+    }
+    return 2;
+}
+
+static int humidity_regulator_write(hap_write_data_t write_data[], int count, void *serv_priv,
+                                    void *write_priv)
+{
+    (void)write_priv;
+    hk_group_bridged_t *slot = (hk_group_bridged_t *)serv_priv;
+    int ret = HAP_SUCCESS;
+    if (!slot) {
+        for (int i = 0; i < count; i++) {
+            *(write_data[i].status) = HAP_STATUS_OO_RES;
+        }
+        return HAP_FAIL;
+    }
+    for (int i = 0; i < count; i++) {
+        hap_write_data_t *w = &write_data[i];
+        const char *uuid = hap_char_get_type_uuid(w->hc);
+        if (!strcmp(uuid, HAP_CHAR_UUID_TARGET_RELATIVE_HUMIDITY)) {
+            esp_err_t err = thermostat_set_target_humidity(slot->group_id, w->val.f);
+            if (err != ESP_OK) {
+                *(w->status) = HAP_STATUS_OO_RES;
+                ret = HAP_FAIL;
+                continue;
+            }
+            hap_char_update_val(w->hc, &w->val);
+            *(w->status) = HAP_STATUS_SUCCESS;
+        } else if (!strcmp(uuid, HAP_CHAR_UUID_TARGET_HUMIDIFIER_DEHUMIDIFIER_STATE)) {
+            uint8_t mode = THERMO_MODE_OFF;
+            if (w->val.u == 1) {
+                mode = THERMO_MODE_HUMIDIFY;
+            } else if (w->val.u == 2) {
+                mode = THERMO_MODE_DEHUMIDIFY;
+            }
+            esp_err_t err = thermostat_set_mode(slot->group_id, mode);
+            if (err != ESP_OK) {
+                *(w->status) = HAP_STATUS_OO_RES;
+                ret = HAP_FAIL;
+                continue;
+            }
+            hap_char_update_val(w->hc, &w->val);
+            *(w->status) = HAP_STATUS_SUCCESS;
+        } else if (!strcmp(uuid, HAP_CHAR_UUID_ACTIVE)) {
+            hap_char_update_val(w->hc, &w->val);
+            *(w->status) = HAP_STATUS_SUCCESS;
+        } else {
+            *(w->status) = HAP_STATUS_RES_ABSENT;
+            ret = HAP_FAIL;
+        }
+    }
+    return ret;
+}
+
 static int thermo_write(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv)
 {
     (void)write_priv;
@@ -1248,8 +1909,24 @@ static int thermo_write(hap_write_data_t write_data[], int count, void *serv_pri
             hap_char_update_val(w->hc, &w->val);
             *(w->status) = HAP_STATUS_SUCCESS;
         } else if (!strcmp(uuid, HAP_CHAR_UUID_TARGET_HEATING_COOLING_STATE)) {
-            uint8_t mode = (w->val.u == 1) ? THERMO_MODE_HEAT : THERMO_MODE_OFF;
+            uint8_t mode = THERMO_MODE_OFF;
+            if (w->val.u == 1) {
+                mode = THERMO_MODE_HEAT;
+            } else if (w->val.u == 2) {
+                mode = THERMO_MODE_COOL;
+            } else if (w->val.u == 3) {
+                mode = THERMO_MODE_AUTO;
+            }
             esp_err_t err = thermostat_set_mode(slot->group_id, mode);
+            if (err != ESP_OK) {
+                *(w->status) = HAP_STATUS_OO_RES;
+                ret = HAP_FAIL;
+                continue;
+            }
+            hap_char_update_val(w->hc, &w->val);
+            *(w->status) = HAP_STATUS_SUCCESS;
+        } else if (!strcmp(uuid, HAP_CHAR_UUID_TARGET_RELATIVE_HUMIDITY)) {
+            esp_err_t err = thermostat_set_target_humidity(slot->group_id, w->val.f);
             if (err != ESP_OK) {
                 *(w->status) = HAP_STATUS_OO_RES;
                 ret = HAP_FAIL;
@@ -1340,10 +2017,93 @@ static void remove_group_acc(hk_group_bridged_t *slot, const char *reason)
     }
 }
 
+static esp_err_t add_bridged_humidity_regulator(const group_t *t)
+{
+    if (!t || !t->used || !t->homekit_expose || t->type != GROUP_TYPE_THERMOSTAT ||
+        t->thermo_kind != GROUP_THERMO_KIND_HUMIDITY) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (find_group(t->id)) {
+        return ESP_OK;
+    }
+    hk_group_bridged_t *slot = alloc_group();
+    if (!slot) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char name[40];
+    snprintf(name, sizeof(name), "%s", t->name[0] ? t->name : "Humidity");
+    char serial[16];
+    snprintf(serial, sizeof(serial), "hm%02x%02x%02x%02x", t->id, t->sensor_eui[0], t->sensor_eui[1],
+             t->sensor_eui[2]);
+    const char *fw_rev = "1.0.0";
+    bool dehumid = (t->mode == THERMO_MODE_DEHUMIDIFY);
+
+    hap_acc_cfg_t cfg = {
+        .name = name,
+        .manufacturer = "ICC",
+        .model = dehumid ? "Virtual Dehumidifier" : "Virtual Humidifier",
+        .serial_num = serial,
+        .fw_rev = (char *)fw_rev,
+        .hw_rev = "1.0",
+        .pv = "1.1.0",
+        .cid = dehumid ? HAP_CID_DEHUMIDIFIER : HAP_CID_HUMIDIFIER,
+        .identify_routine = accessory_identify,
+    };
+
+    hap_acc_t *acc = hap_acc_create(&cfg);
+    if (!acc) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    float cur = t->has_current_humidity ? t->current_humidity_pct : 45.0f;
+    float tgt = t->target_humidity_pct > 0 ? t->target_humidity_pct : 45.0f;
+    uint8_t curr_hd = hk_current_hd_state(t);
+    uint8_t targ_hd = hk_target_hd_state_from_mode(t->mode);
+
+    hap_serv_t *hs = hap_serv_humidifier_dehumidifier_create(1, cur, curr_hd, targ_hd);
+    if (!hs) {
+        hap_acc_delete(acc);
+        return ESP_ERR_NO_MEM;
+    }
+    hap_char_t *targ_hum = hap_char_target_relative_humidity_create(tgt);
+    if (targ_hum) {
+        hap_char_float_set_constraints(targ_hum, 20.0f, 80.0f, 1.0f);
+        hap_serv_add_char(hs, targ_hum);
+    }
+    hap_serv_set_write_cb(hs, humidity_regulator_write);
+    hap_serv_set_priv(hs, slot);
+    hap_acc_add_serv(acc, hs);
+
+    slot->curr_hum_char = hap_serv_get_char_by_uuid(hs, HAP_CHAR_UUID_CURRENT_RELATIVE_HUMIDITY);
+    slot->targ_hum_char = hap_serv_get_char_by_uuid(hs, HAP_CHAR_UUID_TARGET_RELATIVE_HUMIDITY);
+    slot->curr_hd_state_char =
+        hap_serv_get_char_by_uuid(hs, HAP_CHAR_UUID_CURRENT_HUMIDIFIER_DEHUMIDIFIER_STATE);
+    slot->targ_hd_state_char =
+        hap_serv_get_char_by_uuid(hs, HAP_CHAR_UUID_TARGET_HUMIDIFIER_DEHUMIDIFIER_STATE);
+
+    int aid = hap_get_unique_aid(serial);
+    hap_add_bridged_accessory(acc, aid);
+    inventory_notify_changed();
+
+    slot->used = true;
+    slot->group_id = t->id;
+    slot->group_type = GROUP_TYPE_THERMOSTAT;
+    slot->thermo_kind = GROUP_THERMO_KIND_HUMIDITY;
+    slot->missing_ticks = 0;
+    slot->acc = acc;
+    s_st.accessory_count++;
+    ESP_LOGI(TAG, "HomeKit humidity regulator: %s id=%u aid=%d", name, (unsigned)t->id, aid);
+    return ESP_OK;
+}
+
 static esp_err_t add_bridged_thermostat(const group_t *t)
 {
     if (!t || !t->used || !t->homekit_expose || t->type != GROUP_TYPE_THERMOSTAT) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (t->thermo_kind == GROUP_THERMO_KIND_HUMIDITY) {
+        return add_bridged_humidity_regulator(t);
     }
     if (find_group(t->id)) {
         return ESP_OK;
@@ -1379,8 +2139,8 @@ static esp_err_t add_bridged_thermostat(const group_t *t)
 
     float cur = t->has_current_temp ? t->current_temp_c : 20.0f;
     float tgt = t->target_c > 0 ? t->target_c : 21.0f;
-    uint8_t curr_state = t->heating ? 1 : 0;
-    uint8_t targ_state = (t->mode == THERMO_MODE_HEAT) ? 1 : 0;
+    uint8_t curr_state = hk_current_heat_cool_state(t);
+    uint8_t targ_state = hk_target_heat_cool_state(t);
 
     hap_serv_t *ts = hap_serv_thermostat_create(curr_state, targ_state, cur, tgt, 0);
     if (!ts) {
@@ -1389,9 +2149,25 @@ static esp_err_t add_bridged_thermostat(const group_t *t)
     }
     hap_char_t *targ_mode =
         hap_serv_get_char_by_uuid(ts, HAP_CHAR_UUID_TARGET_HEATING_COOLING_STATE);
-    if (targ_mode) {
-        hap_char_int_set_constraints(targ_mode, 0, 1, 1);
+    hk_constrain_target_mode(targ_mode, t);
+
+    /* Current RH on the thermostat tile (from humidity sensor or temp sensor). */
+    {
+        float rh = t->has_current_humidity ? t->current_humidity_pct : 50.0f;
+        hap_char_t *curr_hum = hap_char_current_relative_humidity_create(rh);
+        if (curr_hum) {
+            hap_serv_add_char(ts, curr_hum);
+        }
     }
+    if (t->humidity_force_heat) {
+        float tgt_rh = t->target_humidity_pct > 0 ? t->target_humidity_pct : 45.0f;
+        hap_char_t *targ_hum = hap_char_target_relative_humidity_create(tgt_rh);
+        if (targ_hum) {
+            hap_char_float_set_constraints(targ_hum, 20.0f, 80.0f, 1.0f);
+            hap_serv_add_char(ts, targ_hum);
+        }
+    }
+
     hap_serv_set_write_cb(ts, thermo_write);
     hap_serv_set_priv(ts, slot);
     hap_acc_add_serv(acc, ts);
@@ -1401,6 +2177,8 @@ static esp_err_t add_bridged_thermostat(const group_t *t)
     slot->curr_state_char =
         hap_serv_get_char_by_uuid(ts, HAP_CHAR_UUID_CURRENT_HEATING_COOLING_STATE);
     slot->targ_state_char = targ_mode;
+    slot->curr_hum_char = hap_serv_get_char_by_uuid(ts, HAP_CHAR_UUID_CURRENT_RELATIVE_HUMIDITY);
+    slot->targ_hum_char = hap_serv_get_char_by_uuid(ts, HAP_CHAR_UUID_TARGET_RELATIVE_HUMIDITY);
 
     int aid = hap_get_unique_aid(serial);
     hap_add_bridged_accessory(acc, aid);
@@ -1409,6 +2187,8 @@ static esp_err_t add_bridged_thermostat(const group_t *t)
     slot->used = true;
     slot->group_id = t->id;
     slot->group_type = GROUP_TYPE_THERMOSTAT;
+    slot->thermo_kind = GROUP_THERMO_KIND_TEMP;
+    slot->thermo_caps = hk_thermo_caps(t);
     slot->missing_ticks = 0;
     slot->acc = acc;
     s_st.accessory_count++;
@@ -1571,12 +2351,48 @@ static void sync_from_zigbee(void)
                 update_char_int(s_bridged[i].brightness_char,
                                 (int)zigbee_host_level_to_brightness(d.level), 0, 100);
             }
-        } else if (s_bridged[i].kind == ZB_DEVICE_KIND_SWITCH) {
+        } else if (s_bridged[i].kind == ZB_DEVICE_KIND_SWITCH ||
+                   s_bridged[i].kind == ZB_DEVICE_KIND_OUTLET) {
             if (d.name[0]) {
                 update_accessory_name(&s_bridged[i], d.name);
             }
             if (d.has_onoff) {
                 update_char_bool(s_bridged[i].on_char, d.onoff_on);
+            }
+        } else if (s_bridged[i].kind == ZB_DEVICE_KIND_IRRIGATION) {
+            if (d.name[0]) {
+                update_accessory_name(&s_bridged[i], d.name);
+            }
+            bool on = d.has_onoff ? d.onoff_on : d.binary_on;
+            if (s_bridged[i].active_char) {
+                update_char_uint8(s_bridged[i].active_char, on ? 1 : 0, 0, 1);
+            }
+            if (s_bridged[i].in_use_char) {
+                update_char_uint8(s_bridged[i].in_use_char, on ? 1 : 0, 0, 1);
+            }
+            if (d.has_battery && s_bridged[i].batt_char) {
+                update_char_uint8(s_bridged[i].batt_char, d.battery_pct, 0, 100);
+                update_char_uint8(s_bridged[i].low_batt_char, d.battery_pct < 20 ? 1 : 0, 0, 1);
+            }
+        } else if (s_bridged[i].kind == ZB_DEVICE_KIND_CONTACT ||
+                   s_bridged[i].kind == ZB_DEVICE_KIND_MOTION ||
+                   s_bridged[i].kind == ZB_DEVICE_KIND_LEAK ||
+                   s_bridged[i].kind == ZB_DEVICE_KIND_SMOKE) {
+            if (d.name[0]) {
+                update_accessory_name(&s_bridged[i], d.name);
+            }
+            if (s_bridged[i].binary_char) {
+                if (s_bridged[i].kind == ZB_DEVICE_KIND_MOTION) {
+                    update_char_bool(s_bridged[i].binary_char, d.binary_on);
+                } else if (s_bridged[i].kind == ZB_DEVICE_KIND_CONTACT) {
+                    update_char_uint8(s_bridged[i].binary_char, d.binary_on ? 0 : 1, 0, 1);
+                } else {
+                    update_char_uint8(s_bridged[i].binary_char, d.binary_on ? 1 : 0, 0, 1);
+                }
+            }
+            if (d.has_battery && s_bridged[i].batt_char) {
+                update_char_uint8(s_bridged[i].batt_char, d.battery_pct, 0, 100);
+                update_char_uint8(s_bridged[i].low_batt_char, d.battery_pct < 20 ? 1 : 0, 0, 1);
             }
         } else if (s_bridged[i].kind == ZB_DEVICE_KIND_REMOTE) {
             uint8_t nbtn = zigbee_host_remote_button_count(&d);
@@ -1660,18 +2476,46 @@ static void sync_from_zigbee(void)
             remove_group_acc(&s_groups[ti], "homekit_expose off");
             continue;
         }
-        if (t.type != s_groups[ti].group_type) {
+        if (t.type != s_groups[ti].group_type ||
+            (t.type == GROUP_TYPE_THERMOSTAT &&
+             (t.thermo_kind != s_groups[ti].thermo_kind ||
+              (t.thermo_kind == GROUP_THERMO_KIND_TEMP &&
+               hk_thermo_caps(&t) != s_groups[ti].thermo_caps)))) {
             remove_group_acc(&s_groups[ti], "group type changed");
             continue;
         }
         if (t.type == GROUP_TYPE_THERMOSTAT) {
-            if (t.has_current_temp) {
-                update_char_float(s_groups[ti].curr_temp_char, t.current_temp_c, 0.0f, 100.0f);
+            if (t.thermo_kind == GROUP_THERMO_KIND_HUMIDITY) {
+                if (t.has_current_humidity) {
+                    update_char_float(s_groups[ti].curr_hum_char, t.current_humidity_pct, 0.0f,
+                                      100.0f);
+                }
+                if (s_groups[ti].targ_hum_char) {
+                    update_char_float(s_groups[ti].targ_hum_char, t.target_humidity_pct, 20.0f,
+                                      80.0f);
+                }
+                update_char_uint8(s_groups[ti].curr_hd_state_char, hk_current_hd_state(&t), 0, 3);
+                update_char_uint8(s_groups[ti].targ_hd_state_char,
+                                  hk_target_hd_state_from_mode(t.mode), 0, 2);
+            } else {
+                if (t.has_current_temp) {
+                    update_char_float(s_groups[ti].curr_temp_char, t.current_temp_c, 0.0f, 100.0f);
+                }
+                update_char_float(s_groups[ti].targ_temp_char, t.target_c, 10.0f, 38.0f);
+                update_char_uint8(s_groups[ti].curr_state_char, hk_current_heat_cool_state(&t), 0,
+                                  2);
+                hk_constrain_target_mode(s_groups[ti].targ_state_char, &t);
+                update_char_uint8(s_groups[ti].targ_state_char, hk_target_heat_cool_state(&t), 0,
+                                  3);
+                if (t.has_current_humidity && s_groups[ti].curr_hum_char) {
+                    update_char_float(s_groups[ti].curr_hum_char, t.current_humidity_pct, 0.0f,
+                                      100.0f);
+                }
+                if (s_groups[ti].targ_hum_char) {
+                    update_char_float(s_groups[ti].targ_hum_char, t.target_humidity_pct, 20.0f,
+                                      80.0f);
+                }
             }
-            update_char_float(s_groups[ti].targ_temp_char, t.target_c, 10.0f, 38.0f);
-            update_char_uint8(s_groups[ti].curr_state_char, t.heating ? 1 : 0, 0, 2);
-            update_char_uint8(s_groups[ti].targ_state_char,
-                              t.mode == THERMO_MODE_HEAT ? 1 : 0, 0, 1);
         } else {
             update_char_bool(s_groups[ti].on_char, t.on);
             if (s_groups[ti].brightness_char) {
@@ -1765,12 +2609,7 @@ static void announce_inventory_if_changed(void)
             zb_device_t d;
             if (zigbee_host_get_device(s_bridged[i].eui64, &d)) {
                 ESP_LOGI(TAG, "  bridged device: '%s' kind=%s", d.name[0] ? d.name : d.model,
-                         s_bridged[i].kind == ZB_DEVICE_KIND_LIGHT
-                             ? "light"
-                             : (s_bridged[i].kind == ZB_DEVICE_KIND_SWITCH
-                                    ? "switch"
-                                    : (s_bridged[i].kind == ZB_DEVICE_KIND_REMOTE ? "remote"
-                                                                                   : "sensor")));
+                         kind_log_str(s_bridged[i].kind));
             }
         }
         for (uint16_t i = 0; i < GROUP_MAX; i++) {
@@ -1794,14 +2633,8 @@ static void attach_exposed_before_advertise(void)
 {
     /* Wait until Zigbee host has restored NVS devices (or NCP is up). */
     for (int i = 0; i < 50; i++) {
-        zigbee_host_status_t *snap = calloc(1, sizeof(*snap));
-        if (snap) {
-            zigbee_host_get_status(snap);
-            bool ready = (snap->icc_status == ICC_STATUS_CONNECTED) || (snap->device_count > 0);
-            free(snap);
-            if (ready) {
-                break;
-            }
+        if (zigbee_host_is_ready()) {
+            break;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }

@@ -1,18 +1,11 @@
-menu "Firmware OTA (GitHub main)"
+menu "Firmware OTA"
 
     config FW_OTA_ENABLED
-        bool "Enable firmware OTA from GitHub Releases"
+        bool "Enable firmware OTA (browser-fed)"
         default y
         help
-            Portal System tab can check/install updates published from the
-            main branch (rolling GitHub release tag "ota").
-
-    config FW_OTA_MANIFEST_URL
-        string "OTA manifest URL"
-        depends on FW_OTA_ENABLED
-        default "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/manifest.json"
-        help
-            HTTPS JSON with version + firmware URL. Prefer raw.githubusercontent.com
-            (ota branch) — GitHub Releases redirect through hosts that fail on C3.
+            Portal System tab can check/install Stable (main) or Nightly (dev)
+            builds. The browser fetches the GitHub manifest; the gateway receives
+            the image over local HTTP.
 
 endmenu

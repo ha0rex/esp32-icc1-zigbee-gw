@@ -1698,6 +1698,34 @@ esp_err_t ezsp_zcl_on_off_command(uint16_t node_id, uint8_t dest_ep, uint8_t cmd
     return err;
 }
 
+esp_err_t ezsp_zcl_ias_zone_enroll_response(uint16_t node_id, uint8_t dest_ep, uint8_t src_ep,
+                                            uint8_t zcl_seq, uint8_t enroll_code, uint8_t zone_id)
+{
+    uint8_t zcl[5];
+    zcl[0] = 0x01; /* client→server, cluster-specific */
+    zcl[1] = zcl_seq;
+    zcl[2] = ZCL_CMD_IAS_ZONE_ENROLL_RSP;
+    zcl[3] = enroll_code; /* 0 = success */
+    zcl[4] = zone_id;
+
+    ezsp_aps_frame_t aps;
+    memset(&aps, 0, sizeof(aps));
+    aps.profile_id = ZCL_PROFILE_HA;
+    aps.cluster_id = ZCL_CLUSTER_IAS_ZONE;
+    aps.source_endpoint = src_ep ? src_ep : 1;
+    aps.destination_endpoint = dest_ep ? dest_ep : 1;
+    aps.options = (uint16_t)(EMBER_APS_OPTION_RETRY | EMBER_APS_OPTION_ENABLE_ROUTE_DISCOVERY);
+    aps.group_id = 0;
+    aps.sequence = zcl_seq;
+
+    uint8_t st = 0;
+    esp_err_t err = ezsp_send_unicast(node_id, &aps, zcl, sizeof(zcl), &st);
+    ESP_LOGI(TAG, "IAS ZoneEnrollRsp node=0x%04X ep=%u code=%u zone=%u -> %s", node_id,
+             (unsigned)aps.destination_endpoint, (unsigned)enroll_code, (unsigned)zone_id,
+             ezsp_ember_status_str(st));
+    return err;
+}
+
 esp_err_t ezsp_zcl_identify(uint16_t node_id, uint8_t dest_ep, uint16_t time_s)
 {
     uint8_t zcl[5];

@@ -172,6 +172,8 @@ extern "C" {
 #define ZCL_CLUSTER_MULTISTATE_INPUT           0x0012
 #define ZCL_CLUSTER_TEMP_MEASUREMENT           0x0402
 #define ZCL_CLUSTER_REL_HUMIDITY               0x0405
+#define ZCL_CLUSTER_OCCUPANCY                  0x0406
+#define ZCL_CLUSTER_IAS_ZONE                   0x0500
 #define ZCL_CLUSTER_IKEA_BUTTON                0xFC7F /**< IKEA manufacturer-specific */
 
 #define ZCL_ATTR_MANUFACTURER_NAME             0x0004
@@ -184,6 +186,24 @@ extern "C" {
 #define ZCL_ATTR_ON_OFF                        0x0000
 #define ZCL_ATTR_CURRENT_LEVEL                 0x0000
 #define ZCL_ATTR_PRESENT_VALUE                 0x0055 /**< Multistate Input */
+#define ZCL_ATTR_OCCUPANCY                     0x0000
+#define ZCL_ATTR_IAS_ZONE_TYPE                 0x0001
+#define ZCL_ATTR_IAS_ZONE_STATUS               0x0002
+#define ZCL_ATTR_IAS_CIE_ADDRESS               0x0010
+#define ZCL_ATTR_IAS_ZONE_ID                   0x0011
+
+/** IAS ZoneType (enum16) — subset used for HomeKit mapping. */
+#define ZCL_IAS_ZONE_MOTION                    0x000D
+#define ZCL_IAS_ZONE_CONTACT                   0x0015
+#define ZCL_IAS_ZONE_FIRE                      0x0028
+#define ZCL_IAS_ZONE_WATER                     0x002A
+#define ZCL_IAS_ZONE_CO                        0x002B
+#define ZCL_IAS_ZONE_PERSONAL                  0x002C
+#define ZCL_IAS_ZONE_VIBRATION                 0x002D
+#define ZCL_IAS_ZONE_REMOTE_CONTROL            0x010F
+#define ZCL_IAS_ZONE_KEY_FOB                   0x0115
+#define ZCL_IAS_ZONE_KEYPAD                    0x021D
+#define ZCL_IAS_ZONE_STANDARD_CIE              0x0000
 
 #define ZCL_CMD_OFF                            0x00
 #define ZCL_CMD_ON                             0x01
@@ -201,6 +221,11 @@ extern "C" {
 #define ZCL_CMD_STEP_WITH_ON_OFF               0x06
 #define ZCL_CMD_STOP_WITH_ON_OFF               0x07
 #define ZCL_CMD_RECALL_SCENE                   0x05
+/** IAS Zone server→client */
+#define ZCL_CMD_IAS_ZONE_STATUS_CHANGE         0x00
+#define ZCL_CMD_IAS_ZONE_ENROLL_REQ            0x01
+/** IAS Zone client→server */
+#define ZCL_CMD_IAS_ZONE_ENROLL_RSP            0x00
 #define ZCL_LEVEL_DIR_UP                       0x00
 #define ZCL_LEVEL_DIR_DOWN                     0x01
 
@@ -385,6 +410,12 @@ esp_err_t ezsp_zcl_configure_reporting(uint16_t node_id, uint8_t dest_ep, uint16
                                        size_t change_len);
 /** Send an On/Off cluster command (ZCL_CMD_OFF / ON / TOGGLE). */
 esp_err_t ezsp_zcl_on_off_command(uint16_t node_id, uint8_t dest_ep, uint8_t cmd);
+/**
+ * IAS Zone Enroll Response (client→server). zcl_seq should echo the enroll request.
+ * zone_id is assigned by the CIE (gateway); 0 is fine for a single zone.
+ */
+esp_err_t ezsp_zcl_ias_zone_enroll_response(uint16_t node_id, uint8_t dest_ep, uint8_t src_ep,
+                                            uint8_t zcl_seq, uint8_t enroll_code, uint8_t zone_id);
 /** ZCL Identify command (client→server) — lights the remote LED for time_s seconds. */
 esp_err_t ezsp_zcl_identify(uint16_t node_id, uint8_t dest_ep, uint16_t time_s);
 /**

@@ -28,10 +28,16 @@ typedef enum {
 
 typedef enum {
     ZB_DEVICE_KIND_UNKNOWN = 0,
-    ZB_DEVICE_KIND_SENSOR,
+    ZB_DEVICE_KIND_SENSOR,     /**< Climate: temperature / humidity */
     ZB_DEVICE_KIND_SWITCH,
     ZB_DEVICE_KIND_LIGHT,
     ZB_DEVICE_KIND_REMOTE,
+    ZB_DEVICE_KIND_OUTLET,
+    ZB_DEVICE_KIND_IRRIGATION, /**< Water valve / sprinkler (e.g. Sonoff SWV) */
+    ZB_DEVICE_KIND_CONTACT,
+    ZB_DEVICE_KIND_MOTION,
+    ZB_DEVICE_KIND_LEAK,
+    ZB_DEVICE_KIND_SMOKE,
 } zb_device_kind_t;
 
 /** Real NCP-reported device with optional ZCL interview / sensor values. */
@@ -101,6 +107,15 @@ typedef struct {
      * Portal + Home app renames persist here.
      */
     char btn_name[ZB_REMOTE_MAX_BUTTONS][24];
+    /* Binary / IAS / occupancy (appended — older NVS zero-fills). */
+    bool has_ias_zone;
+    uint16_t ias_zone_type;   /**< ZCL ZoneType */
+    uint16_t ias_zone_status; /**< ZCL ZoneStatus bitmap */
+    uint8_t ias_zone_ep;
+    bool has_occupancy;
+    bool occupancy; /**< true = occupied / motion */
+    uint8_t occupancy_ep;
+    bool binary_on; /**< Open/detected/active derived state for portal + HK sync */
 } zb_device_t;
 
 typedef struct {
@@ -147,6 +162,8 @@ typedef struct {
 
 esp_err_t zigbee_host_start(void);
 void zigbee_host_get_status(zigbee_host_status_t *out);
+/** True once ICC is up or NVS devices are present (no large status copy). */
+bool zigbee_host_is_ready(void);
 
 esp_err_t zigbee_host_form_network(const zigbee_form_options_t *opt);
 esp_err_t zigbee_host_leave_network(void);
@@ -156,8 +173,12 @@ esp_err_t zigbee_host_refresh_network(void);
 
 /** Trigger ZCL attribute reads for a device (by EUI64). */
 esp_err_t zigbee_host_interview_device(const uint8_t eui64[8]);
-/** Classify device as sensor / switch / light / remote from model + clusters. */
+/** Classify device kind from model + clusters (light/switch/outlet/irrigation/…). */
 zb_device_kind_t zigbee_host_device_kind(const zb_device_t *d);
+/** True when device is an On/Off actuator HomeKit/groups can control (excl. remotes). */
+bool zigbee_host_is_onoff_actuator(const zb_device_t *d);
+/** True when kind is a binary HomeKit sensor (contact/motion/leak/smoke). */
+bool zigbee_host_is_binary_sensor(const zb_device_t *d);
 /** Button count for remotes (1–5). Returns 0 if not a remote. */
 uint8_t zigbee_host_remote_button_count(const zb_device_t *d);
 /** Default label for button index (Power/Left/…). */

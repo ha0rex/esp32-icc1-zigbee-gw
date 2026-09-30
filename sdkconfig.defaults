@@ -42,6 +42,8 @@ CONFIG_HTTPD_MAX_URI_LEN=512
 
 # Compiler
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# Catch stack smashes that otherwise show up as opaque "panic" resets.
+CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
 
 # ICC UART defaults (overridable in menuconfig)
 CONFIG_ICC_UART_PORT_NUM=1
@@ -79,6 +81,10 @@ CONFIG_LWIP_MAX_LISTENING_TCP=16
 CONFIG_LWIP_MAX_UDP_PCBS=16
 
 # Larger app partition for HomeKit + portal (see PARTITION_TABLE above)
+
+# Allow LOCK_TCPIP_CORE from Wi‑Fi health (GARP / gateway ARP). Without this,
+# etharp_* from a non-tcpip task races lwIP and can panic-reboot the C3.
+CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 
 # ASH / EZSP debug hex dumps
 CONFIG_ASH_LOG_HEX_FRAMES=n

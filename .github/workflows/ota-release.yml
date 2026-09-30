@@ -1,15 +1,16 @@
-name: OTA release (main)
+name: OTA publish
 
-# Build firmware on every push to main and publish:
-#   1) GitHub Release tag "ota" (human downloads)
-#   2) orphan branch "ota" with raw files (ESP32 HTTPS — no release redirects)
+# Build firmware and publish raw artifacts for the portal:
+#   main  → branch ota          (Stable)
+#   dev   → branch ota-nightly  (Nightly)
 #
-# Device manifest:
+# Manifests:
 #   https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/manifest.json
+#   https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota-nightly/manifest.json
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     paths-ignore:
       - "README.md"
       - ".cursor/**"
@@ -29,6 +30,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Channel
+        id: ch
+        run: |
+          REF="${GITHUB_REF_NAME}"
+          if [ "$REF" = "main" ]; then
+            echo "branch=ota" >> "$GITHUB_OUTPUT"
+            echo "label=Stable" >> "$GITHUB_OUTPUT"
+            echo "tag=ota" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "branch=ota-nightly" >> "$GITHUB_OUTPUT"
+            echo "label=Nightly" >> "$GITHUB_OUTPUT"
+            echo "tag=ota-nightly" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Source=$REF → publish branch from outputs"
+
       - name: Version stamp
         id: ver
         run: |
@@ -37,7 +55,7 @@ jobs:
           DAY=$(date -u +%Y%m%d)
           VER="${BASE}-${DAY}.${SHA}"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "OTA version: $VER"
+          echo "OTA version: $VER (${{ steps.ch.outputs.label }})"
           sed -i -E "s/set\(PROJECT_VER \"[^\"]+\"\)/set(PROJECT_VER \"$VER\")/" CMakeLists.txt
 
       - name: Build (ESP-IDF)
@@ -56,7 +74,8 @@ jobs:
           cp "$BIN" dist/esp32_icc1_zigbee_gw.bin
           SHA256=$(sha256sum "$BIN" | awk '{print $1}')
           VER="${{ steps.ver.outputs.version }}"
-          RAW_BIN="https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/esp32_icc1_zigbee_gw.bin"
+          OTA_BRANCH="${{ steps.ch.outputs.branch }}"
+          RAW_BIN="https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/${OTA_BRANCH}/esp32_icc1_zigbee_gw.bin"
           python3 - <<PY
           import json, subprocess, datetime
           ver = "${VER}"
@@ -66,6 +85,7 @@ jobs:
               "version": ver,
               "url": "${RAW_BIN}",
               "sha256": sha,
+              "channel": "${{ steps.ch.outputs.branch }}",
               "built": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "commit": commit,
           }
@@ -73,37 +93,38 @@ jobs:
           print(json.dumps(manifest, indent=2))
           PY
 
-      - name: Publish ota branch (raw URLs for the gateway)
+      - name: Publish OTA branch (raw URLs)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
+          OTA_BRANCH="${{ steps.ch.outputs.branch }}"
           WORK=$(mktemp -d)
           cp dist/esp32_icc1_zigbee_gw.bin dist/manifest.json "$WORK/"
           cd "$WORK"
           git init
-          git checkout -b ota
+          git checkout -b "$OTA_BRANCH"
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
           git add esp32_icc1_zigbee_gw.bin manifest.json
-          git commit -m "OTA ${{ steps.ver.outputs.version }}"
+          git commit -m "OTA ${{ steps.ver.outputs.version }} (${{ steps.ch.outputs.label }})"
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/ha0rex/esp32-icc1-zigbee-gw.git"
-          git push -f origin ota
+          git push -f origin "$OTA_BRANCH"
 
-      - name: Publish rolling release "ota"
+      - name: Publish rolling release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ota
-          name: OTA channel (main)
-          prerelease: false
-          make_latest: true
+          tag_name: ${{ steps.ch.outputs.tag }}
+          name: ${{ steps.ch.outputs.label }} firmware
+          prerelease: ${{ steps.ch.outputs.prerelease }}
+          make_latest: ${{ steps.ch.outputs.tag == 'ota' }}
           generate_release_notes: false
           body: |
-            Rolling firmware channel built from **main**.
+            Rolling **${{ steps.ch.outputs.label }}** channel from `${{ github.ref_name }}`.
             Version: `${{ steps.ver.outputs.version }}`
 
-            Gateway checks the **ota** branch raw URL (not this release redirect):
-            `https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/manifest.json`
+            Manifest:
+            `https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/${{ steps.ch.outputs.branch }}/manifest.json`
           files: |
             dist/esp32_icc1_zigbee_gw.bin
             dist/manifest.json

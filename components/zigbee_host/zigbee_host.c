@@ -25,8 +25,8 @@ static const char *TAG = "zigbee_host";
 #define NVS_NS "zb_net"
 
 static zigbee_host_status_t s_status;
-/** Shared scratch for NVS pack/migrate — only one NVS path runs at a time. */
-static zb_device_t s_nvs_scratch[ZB_HOST_MAX_DEVICES];
+/** Heap scratch for NVS pack/migrate — allocated only while saving (frees ~15 KiB BSS). */
+static zb_device_t *s_nvs_scratch;
 /** Button latch/name changes mark dirty; flush off the hot path (NVS flash freezes status_lock). */
 static volatile bool s_devices_nvs_dirty;
 static int64_t s_devices_nvs_last_flush_ms;
@@ -347,15 +347,102 @@ static bool str_contains_ci(const char *hay, const char *needle)
     return false;
 }
 
+/** Whole-token match so "DOOR" does not hit friendly names like "Outdoors". */
+static bool str_has_token_ci(const char *hay, const char *token)
+{
+    if (!hay || !token || !token[0]) {
+        return false;
+    }
+    size_t nlen = strlen(token);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nlen && p[i] &&
+               (char)tolower((unsigned char)p[i]) == (char)tolower((unsigned char)token[i])) {
+            i++;
+        }
+        if (i == nlen) {
+            bool left_ok = (p == hay) || !isalnum((unsigned char)p[-1]);
+            bool right_ok = !isalnum((unsigned char)p[nlen]);
+            if (left_ok && right_ok) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool model_looks_like_outlet(const char *model)
+{
+    if (!model || !model[0]) {
+        return false;
+    }
+    return str_contains_ci(model, "PLUG") || str_contains_ci(model, "OUTLET") ||
+           str_contains_ci(model, "S31") || str_contains_ci(model, "BASICZBR3") ||
+           str_contains_ci(model, "SOCKET") || str_contains_ci(model, "SA-003") ||
+           str_contains_ci(model, "TS011F") || str_contains_ci(model, "Smart Plug");
+}
+
 static bool model_looks_like_switch(const char *model)
 {
     if (!model || !model[0]) {
         return false;
     }
+    if (model_looks_like_outlet(model)) {
+        return false;
+    }
     return str_contains_ci(model, "SWP") || str_contains_ci(model, "SWITCH") ||
-           str_contains_ci(model, "PLUG") || str_contains_ci(model, "RELAY") ||
-           str_contains_ci(model, "OUTLET") || str_contains_ci(model, "ZBMINI") ||
-           str_contains_ci(model, "S31") || str_contains_ci(model, "BASICZBR3");
+           str_contains_ci(model, "RELAY") || str_contains_ci(model, "ZBMINI") ||
+           str_contains_ci(model, "ZBMINIL2") || str_contains_ci(model, "MINI");
+}
+
+static bool model_looks_like_irrigation(const char *model)
+{
+    if (!model || !model[0]) {
+        return false;
+    }
+    return str_contains_ci(model, "SWV") || str_contains_ci(model, "WATER VALVE") ||
+           str_contains_ci(model, "IRRIG") || str_contains_ci(model, "SPRINKLER") ||
+           str_contains_ci(model, "VALVE");
+}
+
+static bool model_looks_like_contact(const char *model)
+{
+    if (!model || !model[0]) {
+        return false;
+    }
+    /* "DOOR" is token-only — substring would mis-hit names like "Outdoors". */
+    return str_contains_ci(model, "SNZB-04") || str_has_token_ci(model, "DOOR") ||
+           str_contains_ci(model, "CONTACT") || str_contains_ci(model, "WINDOW SENSOR") ||
+           str_contains_ci(model, "DS01") || str_contains_ci(model, "MCCGQ");
+}
+
+static bool model_looks_like_motion(const char *model)
+{
+    if (!model || !model[0]) {
+        return false;
+    }
+    return str_contains_ci(model, "SNZB-03") || str_contains_ci(model, "MOTION") ||
+           str_contains_ci(model, "PIR") || str_contains_ci(model, "OCCUPANCY") ||
+           str_contains_ci(model, "MS01") || str_contains_ci(model, "RTCGQ");
+}
+
+static bool model_looks_like_leak(const char *model)
+{
+    if (!model || !model[0]) {
+        return false;
+    }
+    return str_contains_ci(model, "SNZB-05") || str_contains_ci(model, "LEAK") ||
+           str_contains_ci(model, "WATER LEAK") || str_contains_ci(model, "FLOOD") ||
+           str_contains_ci(model, "SJCGQ") || str_contains_ci(model, "WL01");
+}
+
+static bool model_looks_like_smoke(const char *model)
+{
+    if (!model || !model[0]) {
+        return false;
+    }
+    return str_contains_ci(model, "SMOKE") || str_contains_ci(model, "FIRE") ||
+           str_contains_ci(model, "GS358") || str_contains_ci(model, "JTYJ");
 }
 
 static bool model_looks_like_remote(const char *model)
@@ -382,6 +469,15 @@ static bool eui_looks_like_ikea_remote(const uint8_t eui64[8])
     return eui64[7] == 0xd0 && eui64[6] == 0xcf && eui64[5] == 0x5e;
 }
 
+/** Classic Sonoff battery sensors (SNZB-02 / TH01) use TI OUI 00:12:4b. */
+static bool eui_looks_like_sonoff_sensor(const uint8_t eui64[8])
+{
+    if (!eui64) {
+        return false;
+    }
+    return eui64[7] == 0x00 && eui64[6] == 0x12 && eui64[5] == 0x4b;
+}
+
 static bool model_looks_like_light(const char *model)
 {
     if (!model || !model[0]) {
@@ -401,17 +497,52 @@ static bool model_looks_like_light(const char *model)
            str_contains_ci(model, "L1527") || str_contains_ci(model, "L1529");
 }
 
-static bool model_looks_like_sensor(const char *model)
+/** Climate / air-quality style sensors (not binary IAS). */
+static bool model_looks_like_climate(const char *model)
 {
     if (!model || !model[0]) {
         return false;
     }
-    return str_contains_ci(model, "SNZB-02") || str_contains_ci(model, "SNZB-03") ||
-           str_contains_ci(model, "SNZB-04") || str_contains_ci(model, "TEMP") ||
-           str_contains_ci(model, "HUMID") || str_contains_ci(model, "TH ") ||
-           str_contains_ci(model, "MOTION") || str_contains_ci(model, "PIR") ||
-           str_contains_ci(model, "VINDSTYRKA") || str_contains_ci(model, "air quality") ||
-           str_contains_ci(model, "weather") || str_contains_ci(model, "moisture");
+    if (model_looks_like_contact(model) || model_looks_like_motion(model) ||
+        model_looks_like_leak(model) || model_looks_like_smoke(model)) {
+        return false;
+    }
+    return str_contains_ci(model, "SNZB-02") || str_contains_ci(model, "SNZB-02D") ||
+           str_contains_ci(model, "TH01") || str_contains_ci(model, "TH02") ||
+           str_contains_ci(model, "TEMP") || str_contains_ci(model, "HUMID") ||
+           str_contains_ci(model, "TH ") || str_contains_ci(model, "VINDSTYRKA") ||
+           str_contains_ci(model, "air quality") || str_contains_ci(model, "weather") ||
+           str_contains_ci(model, "WSDCGQ");
+}
+
+static zb_device_kind_t kind_from_ias_zone_type(uint16_t zt)
+{
+    switch (zt) {
+    case ZCL_IAS_ZONE_MOTION:
+        return ZB_DEVICE_KIND_MOTION;
+    case ZCL_IAS_ZONE_CONTACT:
+        return ZB_DEVICE_KIND_CONTACT;
+    case ZCL_IAS_ZONE_FIRE:
+        return ZB_DEVICE_KIND_SMOKE;
+    case ZCL_IAS_ZONE_WATER:
+        return ZB_DEVICE_KIND_LEAK;
+    default:
+        return ZB_DEVICE_KIND_UNKNOWN;
+    }
+}
+
+static void refresh_binary_on_locked(zb_device_t *d)
+{
+    if (!d) {
+        return;
+    }
+    if (d->has_ias_zone) {
+        d->binary_on = (d->ias_zone_status & 0x0001) != 0; /* Alarm1 */
+    } else if (d->has_occupancy) {
+        d->binary_on = d->occupancy;
+    } else if (d->has_onoff) {
+        d->binary_on = d->onoff_on;
+    }
 }
 
 zb_device_kind_t zigbee_host_device_kind(const zb_device_t *d)
@@ -419,34 +550,84 @@ zb_device_kind_t zigbee_host_device_kind(const zb_device_t *d)
     if (!d || !d->used) {
         return ZB_DEVICE_KIND_UNKNOWN;
     }
-    /* Remotes first — they advertise On/Off + Level as *client* clusters and must not
-     * become lights/switches. */
+    /* Remotes first — they advertise On/Off + Level as *client* clusters. */
     if (model_looks_like_remote(d->model) || model_looks_like_remote(d->name) ||
         model_looks_like_remote(d->label)) {
         return ZB_DEVICE_KIND_REMOTE;
     }
-    /* Sleepy IKEA OUI before interview — treat as remote so F&B / buttons work. */
     if ((d->node_type == EMBER_SLEEPY_END_DEVICE || d->node_type == EMBER_END_DEVICE) &&
-        eui_looks_like_ikea_remote(d->eui64) && !d->has_onoff && !d->has_level && !d->has_temp) {
+        eui_looks_like_ikea_remote(d->eui64) && !d->has_onoff && !d->has_level && !d->has_temp &&
+        !d->has_ias_zone) {
         return ZB_DEVICE_KIND_REMOTE;
     }
+
+    /* IAS ZoneType / occupancy before On/Off (valves still win via model below). */
+    if (d->has_ias_zone) {
+        zb_device_kind_t ik = kind_from_ias_zone_type(d->ias_zone_type);
+        if (ik != ZB_DEVICE_KIND_UNKNOWN) {
+            return ik;
+        }
+    }
+    if (d->has_occupancy) {
+        return ZB_DEVICE_KIND_MOTION;
+    }
+
+    /* Climate before name/model binary fingerprints — "Outdoors" contains "door". */
+    if (d->has_temp || d->has_humidity || model_looks_like_climate(d->model) ||
+        model_looks_like_climate(d->name) || model_looks_like_climate(d->label) ||
+        ((d->node_type == EMBER_SLEEPY_END_DEVICE || d->node_type == EMBER_END_DEVICE) &&
+         eui_looks_like_sonoff_sensor(d->eui64) && !d->has_onoff && !d->has_level &&
+         !d->has_ias_zone)) {
+        return ZB_DEVICE_KIND_SENSOR;
+    }
+
+    if (model_looks_like_motion(d->model) || model_looks_like_motion(d->name)) {
+        return ZB_DEVICE_KIND_MOTION;
+    }
+    if (model_looks_like_contact(d->model) || model_looks_like_contact(d->name)) {
+        return ZB_DEVICE_KIND_CONTACT;
+    }
+    if (model_looks_like_leak(d->model) || model_looks_like_leak(d->name)) {
+        return ZB_DEVICE_KIND_LEAK;
+    }
+    if (model_looks_like_smoke(d->model) || model_looks_like_smoke(d->name)) {
+        return ZB_DEVICE_KIND_SMOKE;
+    }
+
+    if (model_looks_like_irrigation(d->model) || model_looks_like_irrigation(d->name) ||
+        model_looks_like_irrigation(d->label)) {
+        return ZB_DEVICE_KIND_IRRIGATION;
+    }
+
     if (d->has_level || model_looks_like_light(d->model) || model_looks_like_light(d->name) ||
         model_looks_like_light(d->label)) {
         return ZB_DEVICE_KIND_LIGHT;
     }
-    /* IKEA mains drivers often report cryptic model IDs but support Level Control.
-     * Skip battery remotes (already classified above). */
-    if (d->has_onoff && !model_looks_like_switch(d->model) &&
+    if (d->has_onoff && !model_looks_like_switch(d->model) && !model_looks_like_outlet(d->model) &&
         (str_contains_ci(d->manufacturer, "IKEA") || str_contains_ci(d->manufacturer, "ikea"))) {
         return ZB_DEVICE_KIND_LIGHT;
+    }
+    if (model_looks_like_outlet(d->model) || model_looks_like_outlet(d->name)) {
+        return ZB_DEVICE_KIND_OUTLET;
     }
     if (d->has_onoff || model_looks_like_switch(d->model)) {
         return ZB_DEVICE_KIND_SWITCH;
     }
-    if (d->has_temp || d->has_humidity || model_looks_like_sensor(d->model)) {
-        return ZB_DEVICE_KIND_SENSOR;
-    }
     return ZB_DEVICE_KIND_UNKNOWN;
+}
+
+bool zigbee_host_is_onoff_actuator(const zb_device_t *d)
+{
+    zb_device_kind_t k = zigbee_host_device_kind(d);
+    return k == ZB_DEVICE_KIND_LIGHT || k == ZB_DEVICE_KIND_SWITCH || k == ZB_DEVICE_KIND_OUTLET ||
+           k == ZB_DEVICE_KIND_IRRIGATION;
+}
+
+bool zigbee_host_is_binary_sensor(const zb_device_t *d)
+{
+    zb_device_kind_t k = zigbee_host_device_kind(d);
+    return k == ZB_DEVICE_KIND_CONTACT || k == ZB_DEVICE_KIND_MOTION || k == ZB_DEVICE_KIND_LEAK ||
+           k == ZB_DEVICE_KIND_SMOKE;
 }
 
 uint8_t zigbee_host_remote_button_count(const zb_device_t *d)
@@ -1007,7 +1188,8 @@ static uint8_t control_collect_targets_locked(const zb_device_t *remote, zb_devi
             continue;
         }
         zb_device_kind_t tk = zigbee_host_device_kind(t);
-        if (tk != ZB_DEVICE_KIND_LIGHT && tk != ZB_DEVICE_KIND_SWITCH) {
+        if (tk != ZB_DEVICE_KIND_LIGHT && tk != ZB_DEVICE_KIND_SWITCH &&
+            tk != ZB_DEVICE_KIND_OUTLET && tk != ZB_DEVICE_KIND_IRRIGATION) {
             continue;
         }
         out[n++] = t;
@@ -1201,7 +1383,8 @@ static void mark_remote_bound_locked(zb_device_t *d)
 static bool device_looks_like_temp_sensor(const zb_device_t *d)
 {
     return d && (zigbee_host_device_kind(d) == ZB_DEVICE_KIND_SENSOR || d->has_temp ||
-                 d->has_humidity || model_looks_like_sensor(d->model));
+                 d->has_humidity || model_looks_like_climate(d->model) ||
+                 eui_looks_like_sonoff_sensor(d->eui64));
 }
 
 /**
@@ -1219,6 +1402,14 @@ static bool sensor_cfg_one_step_unlocked(zb_device_t *d)
         return false;
     }
     uint8_t ep = d->sensor_ep ? d->sensor_ep : 1;
+    /* Identity first — without model we cannot confirm clusters; one Basic read. */
+    if (!d->model[0]) {
+        uint16_t basic_attrs[] = {ZCL_ATTR_MANUFACTURER_NAME, ZCL_ATTR_MODEL_IDENTIFIER,
+                                  ZCL_ATTR_APPLICATION_VERSION, ZCL_ATTR_SW_BUILD_ID};
+        ESP_LOGI(TAG, "Sensor 0x%04X: Read Basic (no model yet)", d->node_id);
+        return ezsp_zcl_read_attributes(d->node_id, ep, ZCL_CLUSTER_BASIC, basic_attrs, 4) ==
+               ESP_OK;
+    }
     uint8_t step = d->sensor_cfg_step;
     /* After bind+cfg+first reads, rotate reads only (reporting should push updates). */
     if (d->sensor_reporting && step < SENSOR_STEP_READ_TEMP) {
@@ -1308,19 +1499,24 @@ static void process_sensor_sent_events_unlocked(void)
         zb_device_t *d = device_find_by_node_locked(node);
         if (d && d->used && device_looks_like_temp_sensor(d)) {
             if (st == EMBER_SUCCESS) {
-                if (d->sensor_cfg_step < SENSOR_STEP_COUNT - 1) {
+                if (!d->model[0]) {
+                    /* Identity Basic read — do not advance bind/cfg steps. */
+                    ESP_LOGI(TAG, "Sensor 0x%04X Basic delivery ok — await model", node);
+                } else if (d->sensor_cfg_step < SENSOR_STEP_COUNT - 1) {
                     d->sensor_cfg_step++;
+                    ESP_LOGI(TAG, "Sensor 0x%04X delivery ok → step%u", node,
+                             (unsigned)d->sensor_cfg_step);
+                    /* Queue next setup frame immediately while the sleepy window is warm.
+                     * After reporting is confirmed, stop the burst (reports will push). */
+                    if (!d->sensor_reporting && d->sensor_cfg_step < SENSOR_STEP_READ_TEMP) {
+                        next_copy = *d;
+                        send_next = true;
+                    }
                 } else {
                     /* Rotate reads: temp → hum → batt → temp … */
                     d->sensor_cfg_step = SENSOR_STEP_READ_TEMP;
-                }
-                ESP_LOGI(TAG, "Sensor 0x%04X delivery ok → step%u", node,
-                         (unsigned)d->sensor_cfg_step);
-                /* Queue next setup frame immediately while the sleepy window is warm.
-                 * After reporting is confirmed, stop the burst (reports will push). */
-                if (!d->sensor_reporting && d->sensor_cfg_step < SENSOR_STEP_READ_TEMP) {
-                    next_copy = *d;
-                    send_next = true;
+                    ESP_LOGI(TAG, "Sensor 0x%04X delivery ok → step%u", node,
+                             (unsigned)d->sensor_cfg_step);
                 }
             } else {
                 ESP_LOGW(TAG, "Sensor 0x%04X delivery 0x%02X — keep step%u (retry next poll)",
@@ -1392,6 +1588,10 @@ static void arm_fake_bulb_unlocked(zb_device_t *d)
 static bool remote_bind_one_step_unlocked(zb_device_t *d)
 {
     if (!d || !d->used || d->remote_bound) {
+        return false;
+    }
+    if (device_looks_like_temp_sensor(d) ||
+        zigbee_host_device_kind(d) == ZB_DEVICE_KIND_SENSOR) {
         return false;
     }
     if (s_remote_bind_step >= REMOTE_BIND_STEP_DONE) {
@@ -1748,6 +1948,9 @@ static void device_remove_locked(const uint8_t eui64[8])
 /** Pack used devices into scratch (caller holds status_lock). */
 static uint16_t nvs_pack_devices_locked(void)
 {
+    if (!s_nvs_scratch) {
+        return 0;
+    }
     uint16_t n = 0;
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
         if (s_status.devices[i].used) {
@@ -1757,15 +1960,53 @@ static uint16_t nvs_pack_devices_locked(void)
     return n;
 }
 
+static zb_device_t *nvs_scratch_acquire(void)
+{
+    if (!s_nvs_scratch) {
+        s_nvs_scratch = calloc(ZB_HOST_MAX_DEVICES, sizeof(zb_device_t));
+        if (!s_nvs_scratch) {
+            ESP_LOGE(TAG, "NVS scratch alloc failed (%u bytes)",
+                     (unsigned)(ZB_HOST_MAX_DEVICES * sizeof(zb_device_t)));
+        }
+    }
+    return s_nvs_scratch;
+}
+
+static void nvs_scratch_release(void)
+{
+    free(s_nvs_scratch);
+    s_nvs_scratch = NULL;
+}
+
+/** Drop legacy device blobs that fragment the 24 KiB NVS partition. */
+static void nvs_erase_legacy_device_keys(nvs_handle_t h)
+{
+    nvs_erase_key(h, "devs4");
+    nvs_erase_key(h, "devs3");
+    nvs_erase_key(h, "devs2");
+    nvs_erase_key(h, "devs");
+}
+
 /** Flash write from scratch — must NOT hold status_lock (blocks web/HAP). */
 static void nvs_commit_scratch(uint16_t n)
 {
+    if (!s_nvs_scratch) {
+        ESP_LOGE(TAG, "NVS commit without scratch");
+        s_devices_nvs_dirty = true;
+        return;
+    }
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
         ESP_LOGE(TAG, "NVS open failed — device table not saved");
         s_devices_nvs_dirty = true;
         return;
     }
+
+    /* Always drop prior dens5 first — 24 KiB NVS cannot hold two 4 KiB copies, and the
+     * erase+retry path was hammering flash (unicore silent STA). */
+    nvs_erase_key(h, "devs5");
+    nvs_erase_legacy_device_keys(h);
+    (void)nvs_commit(h);
 
     esp_err_t err = nvs_set_blob(h, "devs5", s_nvs_scratch, n * sizeof(zb_device_t));
     if (err != ESP_OK) {
@@ -1783,12 +2024,6 @@ static void nvs_commit_scratch(uint16_t n)
         s_devices_nvs_dirty = true;
         return;
     }
-    /* Drop legacy full-table blobs that wasted space. */
-    nvs_erase_key(h, "devs4");
-    nvs_erase_key(h, "devs3");
-    nvs_erase_key(h, "devs2");
-    nvs_erase_key(h, "devs");
-    nvs_commit(h);
     nvs_close(h);
     ESP_LOGI(TAG, "Saved %u device(s) to NVS (name0='%s' hk0=%d)", (unsigned)n,
              n ? s_nvs_scratch[0].name : "", n ? (int)s_nvs_scratch[0].homekit_expose : 0);
@@ -1797,14 +2032,20 @@ static void nvs_commit_scratch(uint16_t n)
 static void nvs_save_devices_locked(void)
 {
     /* Rare paths (device edit / join). Button latch uses dirty + unlocked flush. */
+    if (!nvs_scratch_acquire()) {
+        s_devices_nvs_dirty = true;
+        return;
+    }
     uint16_t n = nvs_pack_devices_locked();
     if (n == 0) {
         /* Never wipe a populated table with an empty pack (e.g. save-before-load race). */
         ESP_LOGW(TAG, "Skip NVS device save — inventory empty");
+        nvs_scratch_release();
         return;
     }
     s_devices_nvs_dirty = false;
     nvs_commit_scratch(n);
+    nvs_scratch_release();
 }
 
 /** Deferred flush — must not spam flash on unicore (NVS erase starves Wi‑Fi/httpd). */
@@ -1815,10 +2056,11 @@ static void nvs_flush_devices_if_dirty(bool force)
     }
     int64_t now = now_ms();
     /* Skip during bring-up — EZSP + NVS together kill STA. */
-    if (now < 15000) {
+    if (now < 30000) {
         return;
     }
-    if (!force && (now - s_devices_nvs_last_flush_ms) < 5000) {
+    /* Erase+rewrite dens5 stalls Wi‑Fi on C3 unicore — coalesce aggressively. */
+    if (!force && (now - s_devices_nvs_last_flush_ms) < 60000) {
         return;
     }
     /* Serialize with device-update / host EZSP paths that also touch scratch. */
@@ -1830,9 +2072,15 @@ static void nvs_flush_devices_if_dirty(bool force)
         return;
     }
     status_lock();
+    if (!nvs_scratch_acquire()) {
+        status_unlock();
+        xSemaphoreGive(s_op_mutex);
+        return;
+    }
     uint16_t n = nvs_pack_devices_locked();
     if (n == 0) {
         status_unlock();
+        nvs_scratch_release();
         xSemaphoreGive(s_op_mutex);
         ESP_LOGW(TAG, "Skip deferred NVS device flush — inventory empty");
         return;
@@ -1840,10 +2088,11 @@ static void nvs_flush_devices_if_dirty(bool force)
     s_devices_nvs_dirty = false;
     status_unlock();
     nvs_commit_scratch(n);
+    nvs_scratch_release();
     s_devices_nvs_last_flush_ms = now_ms();
     xSemaphoreGive(s_op_mutex);
     /* Let Wi-Fi/lwIP run after flash cache was disabled. */
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 static void nvs_load_devices_locked(void)
@@ -1880,8 +2129,11 @@ static void nvs_load_devices_locked(void)
     if (!loaded) {
         /* Recover a single known device from older full-table blobs if present. */
         size_t full = sizeof(s_status.devices);
-        /* Reuse NVS pack scratch — never both in use. */
-        zb_device_t *s_full = s_nvs_scratch;
+        zb_device_t *s_full = nvs_scratch_acquire();
+        if (!s_full) {
+            nvs_close(h);
+            return;
+        }
         const char *keys[] = {"devs4", "devs3", "devs2"};
         for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]) && !loaded; k++) {
             size_t sz = full;
@@ -1902,6 +2154,7 @@ static void nvs_load_devices_locked(void)
                 ESP_LOGI(TAG, "Migrated %u device(s) from %s", (unsigned)count, keys[k]);
             }
         }
+        nvs_scratch_release();
     }
 
     uint16_t count = 0;
@@ -2074,6 +2327,8 @@ static bool apply_zcl_attr_locked(zb_device_t *d, uint16_t cluster, uint16_t att
         }
         if (changed) {
             device_refresh_label(d);
+            /* Identity must survive reboot — temp reports are RAM-only. */
+            s_devices_nvs_dirty = true;
         }
     } else if (cluster == ZCL_CLUSTER_TEMP_MEASUREMENT && attr == ZCL_ATTR_MEASURED_VALUE &&
                vlen >= 2 && (dtype == 0x29 || dtype == 0x21)) {
@@ -2092,10 +2347,13 @@ static bool apply_zcl_attr_locked(zb_device_t *d, uint16_t cluster, uint16_t att
             }
         }
     } else if (cluster == ZCL_CLUSTER_REL_HUMIDITY && attr == ZCL_ATTR_MEASURED_VALUE &&
-               vlen >= 2 && dtype == 0x21) {
+               vlen >= 2 && (dtype == 0x21 || dtype == 0x29)) {
         uint16_t raw = (uint16_t)val[0] | ((uint16_t)val[1] << 8);
-        if (raw != 0xFFFF) {
+        if (raw != 0xFFFF && raw != 0x8000) {
             float h = (float)raw / 100.0f;
+            if (h > 100.0f) {
+                h = 100.0f;
+            }
             if (!d->has_humidity || d->humidity_pct != h) {
                 d->humidity_pct = h;
                 d->has_humidity = true;
@@ -2127,6 +2385,8 @@ static bool apply_zcl_attr_locked(zb_device_t *d, uint16_t cluster, uint16_t att
             d->onoff_on = on;
             d->has_onoff = true;
             changed = true;
+            refresh_binary_on_locked(d);
+            sensor_upd_q_push(d->eui64);
         }
         if (source_ep && d->onoff_ep != source_ep) {
             d->onoff_ep = source_ep;
@@ -2146,6 +2406,47 @@ static bool apply_zcl_attr_locked(zb_device_t *d, uint16_t cluster, uint16_t att
         }
         if (!d->onoff_ep && source_ep) {
             d->onoff_ep = source_ep;
+        }
+    } else if (cluster == ZCL_CLUSTER_IAS_ZONE && attr == ZCL_ATTR_IAS_ZONE_TYPE && vlen >= 2 &&
+               (dtype == 0x31 || dtype == 0x21)) {
+        uint16_t zt = (uint16_t)val[0] | ((uint16_t)val[1] << 8);
+        if (!d->has_ias_zone || d->ias_zone_type != zt) {
+            d->ias_zone_type = zt;
+            d->has_ias_zone = true;
+            changed = true;
+            s_devices_nvs_dirty = true;
+        }
+        if (source_ep && d->ias_zone_ep != source_ep) {
+            d->ias_zone_ep = source_ep;
+            changed = true;
+        }
+    } else if (cluster == ZCL_CLUSTER_IAS_ZONE && attr == ZCL_ATTR_IAS_ZONE_STATUS && vlen >= 2 &&
+               (dtype == 0x19 || dtype == 0x21)) {
+        uint16_t zs = (uint16_t)val[0] | ((uint16_t)val[1] << 8);
+        if (!d->has_ias_zone || d->ias_zone_status != zs) {
+            d->ias_zone_status = zs;
+            d->has_ias_zone = true;
+            refresh_binary_on_locked(d);
+            changed = true;
+            sensor_upd_q_push(d->eui64);
+        }
+        if (source_ep && d->ias_zone_ep != source_ep) {
+            d->ias_zone_ep = source_ep;
+            changed = true;
+        }
+    } else if (cluster == ZCL_CLUSTER_OCCUPANCY && attr == ZCL_ATTR_OCCUPANCY && vlen >= 1 &&
+               (dtype == 0x18 || dtype == 0x20)) {
+        bool occ = (val[0] & 0x01) != 0;
+        if (!d->has_occupancy || d->occupancy != occ) {
+            d->occupancy = occ;
+            d->has_occupancy = true;
+            refresh_binary_on_locked(d);
+            changed = true;
+            sensor_upd_q_push(d->eui64);
+        }
+        if (source_ep && d->occupancy_ep != source_ep) {
+            d->occupancy_ep = source_ep;
+            changed = true;
         }
     }
     return changed;
@@ -2172,11 +2473,44 @@ static bool parse_zcl_payload_locked(zb_device_t *d, uint16_t cluster, const uin
     if (off + 1 >= len) {
         return false;
     }
-    off += 1; /* seq */
+    uint8_t zcl_seq = zcl[off++];
     uint8_t cmd = zcl[off++];
 
     /* Cluster-specific commands from remotes (On/Off, Level, Scenes/IKEA arrows). */
     if (cluster_specific) {
+        if (cluster == ZCL_CLUSTER_IAS_ZONE) {
+            if (cmd == ZCL_CMD_IAS_ZONE_STATUS_CHANGE && off + 2 <= len) {
+                uint16_t zs = (uint16_t)zcl[off] | ((uint16_t)zcl[off + 1] << 8);
+                if (!d->has_ias_zone || d->ias_zone_status != zs) {
+                    d->ias_zone_status = zs;
+                    d->has_ias_zone = true;
+                    if (source_ep) {
+                        d->ias_zone_ep = source_ep;
+                    }
+                    refresh_binary_on_locked(d);
+                    sensor_upd_q_push(d->eui64);
+                    ESP_LOGI(TAG, "IAS ZoneStatus 0x%04X node=0x%04X alarm=%d", zs, d->node_id,
+                             (int)d->binary_on);
+                    return true;
+                }
+                return false;
+            }
+            if (cmd == ZCL_CMD_IAS_ZONE_ENROLL_REQ && off + 2 <= len) {
+                uint16_t zt = (uint16_t)zcl[off] | ((uint16_t)zcl[off + 1] << 8);
+                d->ias_zone_type = zt;
+                d->has_ias_zone = true;
+                if (source_ep) {
+                    d->ias_zone_ep = source_ep;
+                }
+                s_devices_nvs_dirty = true;
+                ESP_LOGI(TAG, "IAS ZoneEnrollReq node=0x%04X type=0x%04X — accepting", d->node_id,
+                         zt);
+                (void)ezsp_zcl_ias_zone_enroll_response(d->node_id, source_ep ? source_ep : 1, 1,
+                                                        zcl_seq, 0 /* success */, 1);
+                return true;
+            }
+            return false;
+        }
         if (cluster == ZCL_CLUSTER_ON_OFF || cluster == ZCL_CLUSTER_LEVEL_CONTROL ||
             cluster == ZCL_CLUSTER_SCENES || cluster == ZCL_CLUSTER_IKEA_BUTTON) {
             bool known_remote = zigbee_host_device_kind(d) == ZB_DEVICE_KIND_REMOTE ||
@@ -2536,9 +2870,10 @@ static void process_zcl_messages_locked(void)
                 }
             }
         }
-        /* Sensor just replied (awake window) — queue one setup/read frame immediately. */
+        /* Sensor just replied (awake window) — queue one setup/read if still configuring.
+         * Do not re-bind every report once reporting is confirmed (starves Wi‑Fi on C3). */
         if (device_looks_like_temp_sensor(d) &&
-            (!d->sensor_reporting || (now_ms() - d->last_interview_ms) > 60000)) {
+            (!d->sensor_reporting || (now_ms() - d->last_interview_ms) > 300000)) {
             int64_t now = now_ms();
             if ((now - s_last_sensor_cfg_ms) > 400) {
                 memcpy(s_pending_sensor_cfg_eui, d->eui64, 8);
@@ -2597,7 +2932,7 @@ static void process_pending_sensor_cfg_unlocked(void)
     zb_device_t copy = {0};
     bool do_it = false;
     if (d && d->used && device_looks_like_temp_sensor(d) &&
-        (!d->sensor_reporting || (now_ms() - d->last_interview_ms) > 60000)) {
+        (!d->sensor_reporting || (now_ms() - d->last_interview_ms) > 300000)) {
         copy = *d;
         do_it = true;
     }
@@ -2684,6 +3019,8 @@ static esp_err_t interview_device_unlocked(zb_device_t *d)
     uint16_t batt[] = {ZCL_ATTR_BATTERY_PCT_REMAINING};
     uint16_t onoff[] = {ZCL_ATTR_ON_OFF};
     uint16_t level[] = {ZCL_ATTR_CURRENT_LEVEL};
+    uint16_t ias_attrs[] = {ZCL_ATTR_IAS_ZONE_TYPE, ZCL_ATTR_IAS_ZONE_STATUS};
+    uint16_t occ_attrs[] = {ZCL_ATTR_OCCUPANCY};
 
     bool is_remote = zigbee_host_device_kind(d) == ZB_DEVICE_KIND_REMOTE ||
                      model_looks_like_remote(d->model) || eui_looks_like_ikea_remote(d->eui64);
@@ -2702,35 +3039,23 @@ static esp_err_t interview_device_unlocked(zb_device_t *d)
                  d->node_id);
         return ESP_OK;
     }
-    if (sleepy && !d->model[0]) {
-        /* Phase 1: Basic only so we can classify before doing more. */
-        ezsp_zcl_read_attributes(d->node_id, 1, ZCL_CLUSTER_BASIC, basic_attrs, 4);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        ezsp_zcl_read_attributes(d->node_id, 1, ZCL_CLUSTER_POWER_CONFIG, batt, 1);
-        d->last_interview_ms = now_ms();
-        return ESP_OK;
-    }
-
     bool is_sensor = device_looks_like_temp_sensor(d);
+    bool is_binary = zigbee_host_is_binary_sensor(d) || model_looks_like_contact(d->model) ||
+                     model_looks_like_motion(d->model) || model_looks_like_leak(d->model) ||
+                     model_looks_like_smoke(d->model);
 
-    /* Sensors: one APS frame only. Flooding bind+cfg+reads while sleepy ⇒ all 0x66.
-     * Further steps advance on poll / messageSent success. */
-    if (is_sensor) {
-        uint8_t ep = d->sensor_ep ? d->sensor_ep : 1;
-        if (!d->model[0]) {
-            ezsp_zcl_read_attributes(d->node_id, ep, ZCL_CLUSTER_BASIC, basic_attrs, 4);
-            s_sensor_tx_pending = true;
-            s_sensor_tx_node = d->node_id;
-            s_sensor_tx_ms = now_ms();
-        } else {
-            (void)sensor_cfg_one_step_unlocked(d);
-            s_sensor_tx_pending = true;
-            s_sensor_tx_node = d->node_id;
-            s_sensor_tx_ms = now_ms();
-        }
+    /* Sensors / Sonoff TI OUI / unknown sleepy: one APS frame only.
+     * Ember keeps it until the next child poll (button or periodic). */
+    if ((is_sensor || is_binary || (sleepy && !d->model[0])) && !d->has_onoff) {
+        (void)sensor_cfg_one_step_unlocked(d);
+        s_sensor_tx_pending = true;
+        s_sensor_tx_node = d->node_id;
+        s_sensor_tx_ms = now_ms();
         d->last_interview_ms = now_ms();
         (void)measured;
         (void)batt;
+        (void)basic_attrs;
+        (void)sleepy;
         return ESP_OK;
     }
 
@@ -2747,6 +3072,10 @@ static esp_err_t interview_device_unlocked(zb_device_t *d)
         ezsp_zcl_read_attributes(d->node_id, ep, ZCL_CLUSTER_REL_HUMIDITY, measured, 1);
         vTaskDelay(pdMS_TO_TICKS(80));
         ezsp_zcl_read_attributes(d->node_id, ep, ZCL_CLUSTER_POWER_CONFIG, batt, 1);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        ezsp_zcl_read_attributes(d->node_id, ep, ZCL_CLUSTER_IAS_ZONE, ias_attrs, 2);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        ezsp_zcl_read_attributes(d->node_id, ep, ZCL_CLUSTER_OCCUPANCY, occ_attrs, 1);
         vTaskDelay(pdMS_TO_TICKS(80));
     }
     d->last_interview_ms = now_ms();
@@ -3850,9 +4179,12 @@ static void host_task(void *arg)
                                 s_remote_fb_quiet_until_ms = now_ms() + 120000;
                             }
                         } else if (!pd->model[0]) {
+                            /* Unknown sleepy — re-queue Basic on poll (Sonoff TI more often). */
+                            int64_t gap =
+                                eui_looks_like_sonoff_sensor(pd->eui64) ? 15000 : 120000;
                             if ((now_ms() - s_last_poll_interview_ms) > 3000 &&
                                 (pd->last_interview_ms == 0 ||
-                                 (now_ms() - pd->last_interview_ms) > 120000)) {
+                                 (now_ms() - pd->last_interview_ms) > gap)) {
                                 memcpy(s_pending_interview_eui, pd->eui64, 8);
                                 s_pending_interview = true;
                                 need_interview = true;
@@ -3862,7 +4194,9 @@ static void host_task(void *arg)
                         }
                     }
                     status_unlock();
-                    if (is_sensor) {
+                    if (is_sensor &&
+                        (!pcopy.sensor_reporting ||
+                         (now_ms() - pcopy.last_interview_ms) > 300000)) {
                         xSemaphoreTake(s_op_mutex, portMAX_DELAY);
                         sensor_try_send_one_unlocked(&pcopy);
                         xSemaphoreGive(s_op_mutex);
@@ -3907,13 +4241,21 @@ static void host_task(void *arg)
                  * N×3s on timeouts — fetch network state with the lock released. */
                 xSemaphoreGive(s_op_mutex);
                 {
+                    /* Network params are slow EZSP round-trips — every loop starved Wi‑Fi. */
+                    static int64_t s_last_net_poll_ms;
+                    bool poll_net = (now_ms() - s_last_net_poll_ms) > 5000;
                     ezsp_network_status_t st = 0;
                     uint8_t node_type = 0;
                     ezsp_network_params_t params;
                     memset(&params, 0, sizeof(params));
-                    bool got_st = (ezsp_get_network_state(&st) == ESP_OK);
-                    bool got_params =
-                        (ezsp_get_network_parameters(&node_type, &params) == ESP_OK);
+                    bool got_st = false;
+                    bool got_params = false;
+                    if (poll_net) {
+                        s_last_net_poll_ms = now_ms();
+                        got_st = (ezsp_get_network_state(&st) == ESP_OK);
+                        got_params =
+                            (ezsp_get_network_parameters(&node_type, &params) == ESP_OK);
+                    }
                     status_lock();
                     if (got_st) {
                         s_status.ncp.network_state = st;
@@ -4110,6 +4452,17 @@ void zigbee_host_get_status(zigbee_host_status_t *out)
     }
     memcpy(out->last_error, s_status.last_error, sizeof(out->last_error));
     xSemaphoreGive(s_status_mutex);
+}
+
+bool zigbee_host_is_ready(void)
+{
+    if (!s_status_mutex ||
+        xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return false;
+    }
+    bool ok = (s_status.icc_status == ICC_STATUS_CONNECTED) || (s_status.device_count > 0);
+    xSemaphoreGive(s_status_mutex);
+    return ok;
 }
 
 /** Flush deferred device NVS now (portal/HomeKit names, modes, expose flags). */

@@ -41,8 +41,10 @@ static void delayed_hk_task(void *arg)
 
 void app_main(void)
 {
+    esp_reset_reason_t rr = esp_reset_reason();
     ESP_LOGI(TAG, "================================================");
     ESP_LOGI(TAG, "ESP32-C3 + ICC-1 Zigbee NCP gateway");
+    ESP_LOGI(TAG, "Reset reason: %d", (int)rr);
     ESP_LOGI(TAG, "================================================");
 
     esp_err_t err = nvs_flash_init();

@@ -18,7 +18,7 @@ Phone / Home app / browser
      Zigbee mesh
 ```
 
-**Current firmware version:** `0.3.1` (see `PROJECT_VER` in `CMakeLists.txt`)
+**Current firmware version:** `0.3.32` (see `PROJECT_VER` in `CMakeLists.txt`)
 
 **Repo:** [ha0rex/esp32-icc1-zigbee-gw](https://github.com/ha0rex/esp32-icc1-zigbee-gw)
 
@@ -29,13 +29,13 @@ Phone / Home app / browser
 | Area | What it does |
 | --- | --- |
 | **Zigbee coordinator** | Form / leave network, permit join, persistent device inventory (NVS), ZCL interview |
-| **Device types** | Temperature/humidity sensors, lights (On/Off + brightness), plugs/switches, IKEA remotes |
+| **Device types** | Climate sensors, lights, outlets, switches, irrigation valves, contact/motion/leak/smoke (IAS), IKEA remotes |
 | **HomeKit bridge** | Opt-in exposure of devices and groups; setup code `111-22-333` |
 | **Remotes** | HomeKit buttons (stateless/stateful) **or** direct control of lights/switches/groups |
-| **Grouped devices** | Combine members into one HomeKit accessory; thermostat mode (sensor + heater, ±0.5 °C) |
-| **Portal** | SoftAP Wi‑Fi setup + full management UI on home Wi‑Fi |
+| **Grouped devices** | General groups + **temperature** thermostats (optional heater/cooler, gap & hysteresis, humidity-forced heat) or **humidity** regulators (humidifier/dehumidifier); **After power failure** on general groups (mains power-on/brownout only — not flash/USB reboot) |
+| **Portal** | SoftAP + home Wi‑Fi management (scan APs by BSSID for mesh, primary + secondary fallback) |
 | **Sniffer** | Live Zigbee RX/TX/EVT log with friendly device names |
-| **OTA** | Dual-slot update: browser fetches GitHub `ota` branch, uploads over local HTTP |
+| **OTA** | Dual-slot update with **Stable** / **Nightly** channels (choice remembered on the device) |
 
 ---
 
@@ -90,9 +90,11 @@ Later app-only flashes: `idf.py -p PORT flash`. Exit monitor with `Ctrl+]`.
 
 1. On first boot (no STA credentials), join SoftAP **`ICC1-Gateway-XXXX`**
 2. Open **http://192.168.4.1/**
-3. Scan / enter home SSID + password → **Save & connect**
-4. SoftAP turns off after a successful join (APSTA starves ESP32-C3 TX)
-5. Portal then lives at **http://\<home-ip\>/** — use **System → Forget home Wi‑Fi** to return to setup mode
+3. **Scan** access points (mesh nodes appear as the same SSID with different BSSIDs) → pick the **strongest** (highest / least-negative dBm) → password → **Save & connect**. Prefer ≥ about **-70 dBm**; **-85 dBm** is already marginal.
+4. SoftAP turns off after a successful join. SoftAP recovery uses a **compact setup page** (full portal is too large for SoftAP TX) and keeps APSTA so Scan does not flip radio modes. On a healthy RSSI link the firmware does not soft-reconnect for idle/TCP probe timeouts; it recovers associated-but-silent STA via **gateway ARP** misses after portal/HAP have been quiet, and roams when RSSI stays below about **−80 dBm**.
+5. On home Wi‑Fi: **System → Wi‑Fi** — **Scan**, then **Set primary** / **Set secondary** on an AP row, enter passwords, **Save & connect** once. Leave secondary SSID blank to clear it on save.
+
+Secondary is tried only after primary exhausts reconnect retries.
 
 ### HomeKit
 
@@ -111,20 +113,32 @@ Expose devices from the **Devices** tab (`Expose to HomeKit`). Remotes in “Con
 | --- | --- |
 | **Overview** | ICC/ASH/EZSP health, network, Wi‑Fi, HomeKit code |
 | **Zigbee** | Form / leave network, channel & TX power, permit join |
-| **Devices** | Inventory, rename, interview, remove, HomeKit, remote config, button test |
-| **Grouped devices** | General groups (one light/switch) or thermostats (sensor + heater) |
+| **Devices** | Inventory (live value chips without redrawing rows), rename, interview, remove, HomeKit, remote config, button test — tap a row for details |
+| **Grouped devices** | General groups; temperature thermostats (heater and/or cooler, gap/hysteresis, optional humidity-forced heat); humidity regulators (±3 % RH) — tap a row to edit |
 | **Sniffer** | Live frames with `[device name]` labels; filter RX/TX/EVT |
-| **System** | Firmware OTA, diagnostics, forget Wi‑Fi |
-
-Useful APIs: `/api/status`, `/api/ping`, `/api/ota`, `/api/zigbee/sniff`.
+| **System** | Wi‑Fi (AP list → set primary/secondary, one Save), firmware OTA (Stable / Nightly), diagnostics, forget Wi‑Fi |
 
 ---
 
 ## Devices & remotes
 
-**Sensors** (e.g. Sonoff SNZB-02D): temperature, humidity, battery → HomeKit. After join, use **Read values** and press the sensor button a few times while awake so reporting can be configured.
+Supported kinds (portal chip + HomeKit when exposed):
 
-**Lights / switches:** On/Off; lights also map brightness (Level Control).
+| Kind | Zigbee signal | HomeKit |
+| --- | --- | --- |
+| **Light** | Level Control / light models | Lightbulb (On/Off + brightness) |
+| **Outlet** | Plug models (`S31`, `BASICZBR3`, …) | Outlet |
+| **Switch** | Generic On/Off | Switch |
+| **Irrigation** | Valve / Sonoff **SWV** / irrigation models | Irrigation System + Valve (open/close = On/Off; no native schedules) |
+| **Sensor** | Temp / humidity | Temperature + Humidity (+ battery) |
+| **Contact / Motion / Leak / Smoke** | IAS Zone (or Occupancy for PIR) | Matching HomeKit sensor |
+| **Remote** | IKEA buttons | Programmable switches or control mode |
+
+**Sensors** (Sonoff SNZB-02 / SNZB-02D / TH01, etc.): temperature, humidity, battery → HomeKit. Classic SNZB-02 (TI `00:12:4b`) is a sleepy end device — **Read values** queues one ZCL frame until the next poll; press the sensor button shortly after so it can check in. Kind detection prefers temp/humidity (and climate model IDs) over contact name fingerprints, so names like **Outdoors** are not mistaken for door/contact sensors.
+
+**Sonoff SWV:** pairs as Irrigation; Active in Home opens/closes the valve. Flow metering and eWeLink schedules are not bridged.
+
+**Lights / outlets / switches:** On/Off; lights also map brightness (Level Control).
 
 **IKEA remotes** (Tradfri 5-button, STYRBAR, shortcut, etc.):
 
@@ -139,54 +153,28 @@ Limits: up to **32** devices, **8** groups × **8** members, **5** buttons per r
 
 ---
 
-## OTA updates (`main` channel)
+## Firmware updates
 
-Pushes to **`main`** (firmware changes) build with the `espressif/idf:latest` image and publish:
+On **System**, pick an update channel, then **Check for update → Install update**. The choice is stored on the gateway and used for later checks.
 
-- GitHub Release tag **`ota`** (browser downloads)
-- Branch **`ota`** with raw files for the gateway (ESP32 HTTPS)
-
-Device manifest:
-
-https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/manifest.json
-
-On the device (home Wi‑Fi): **System → Check for update → Install update**.
-
-The browser fetches the manifest/firmware from GitHub (CORS), then uploads the image to the gateway over local HTTP — the ESP32-C3 does **not** run HTTPS itself (not enough RAM with HomeKit). Keep power applied during install; the gateway reboots when done.
-
-**Branches**
-
-| Branch | Role |
+| Channel | What you get |
 | --- | --- |
-| **`main`** | Production + OTA CI |
-| **`dev`** | Day-to-day development (merge to `main` when ready to ship OTA) |
+| **Stable** | Production builds |
+| **Nightly** | Newer experimental builds |
+
+The browser fetches the manifest/firmware from GitHub, then uploads the image to the gateway over local HTTP (the ESP32-C3 does not run HTTPS itself). Keep power applied during install; the gateway reboots when done.
+
+Check compares **semantic** version numbers: downgrades are never offered. If you are already newer than the selected channel, the portal shows up to date.
 
 ---
 
-## Architecture
+## Configuration
 
-| Component | Role |
-| --- | --- |
-| `icc_uart` | UART transport |
-| `ash` | Silicon Labs ASH framing |
-| `ezsp` | EZSP v8 + sniff ring + Touchlink/multicast helpers |
-| `zigbee_host` | Network lifecycle, device DB, remotes, sensor path |
-| `thermostat` | Grouped devices + local thermostat loop |
-| `homekit_bridge` | HAP bridge + bridged accessories / EVENTs |
-| `wifi_manager` | SoftAP provisioning + STA (C3-safe AMPDU/HT off) |
-| `web` | Embedded portal + JSON APIs |
-| `fw_ota` | Browser-fed OTA (offer + HTTP upload; no on-device TLS) |
-
----
-
-## Configuration highlights
-
-See `sdkconfig.defaults`:
+See `sdkconfig.defaults` for defaults such as:
 
 - Portal `:80`, HomeKit `:8118`, setup code / setup ID
-- Dual OTA `partitions.csv` (`ota_0` / `ota_1`, ~1.6 MiB each)
+- Dual OTA partitions (`ota_0` / `ota_1`, ~1.6 MiB each)
 - Wi‑Fi AMPDU disabled (avoids silent STA on some APs)
-- ASH/EZSP hex dumps off by default (enable in menuconfig for ICC bring-up)
 
 ---
 
@@ -196,11 +184,11 @@ See `sdkconfig.defaults`:
 | --- | --- |
 | RX bytes = 0 / no RSTACK | TX↔RX crossed? Common GND? ICC on **3.3V**? NCP image flashed? |
 | CRC / garbage | Baud **115200**; correct 115k2 NCP build |
-| Portal dies, ping fails, USB still up | ESP32-C3 “silent STA”. Firmware auto-recovers (~1 min quiet): soft reconnect, then Wi‑Fi stop/start — no SoftAP. If it stays down, USB reset once. |
+| Portal dies, ping fails, USB still up | ESP32-C3 “silent STA” or mesh **client isolation**. Firmware recovers via gateway ARP silence (after quiet) and weak-RSSI roam (&lt; about −80 dBm). Overview shows **Last reset** (`panic` / `brownout` / `task_wdt` / …) when uptime restarts. Prefer pinning ≥ about −70 dBm. Disable AP client isolation, or join SoftAP `ICC1-Gateway-…` / `192.168.4.1` to reconfigure. |
 | HomeKit “No Response” | Wait for deferred start; confirm `:8118`; try lock→unlock once after large inventory changes |
 | Remote does nothing in Home | Mode = HomeKit buttons? Exposed? For control mode, complete Touchlink to a **bulb** |
-| Sensor stuck / empty readings | **Read values** + wake the sleepy end device with its button |
-| OTA check fails | Browser can reach GitHub raw? Portal on home Wi‑Fi (not SoftAP-only)? `ota` branch published? |
+| Sensor stuck / empty readings | **Read values**, then press the sensor button within a few seconds (sleepy devices only receive while polling). If identity keeps vanishing after reboot, NVS may be full — flash this build (reclaims legacy blobs) |
+| OTA check fails | Browser can reach GitHub? Portal on home Wi‑Fi? Correct Stable/Nightly channel published? |
 
 ### Serial success snapshot
 
@@ -215,12 +203,6 @@ ICC status: CONNECTED
 ```
 
 ---
-
-## Development notes
-
-- Prefer feature work on **`dev`**; promote to **`main`** for OTA.
-- Keep **`README.md` in sync** with firmware behaviour when you change features, APIs, partitions, ports, or workflows (see `.cursor/rules/readme-sync.mdc`).
-- ASH/EZSP behaviour follows Silicon Labs public protocol docs — do not paste GPL host stacks into this tree.
 
 ## License note
 

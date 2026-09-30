@@ -5,11 +5,13 @@
 
 #include "web_server.h"
 #include "web_app.h"
+#include "web_setup.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>
 
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -32,14 +34,44 @@ static const char *TAG = "web";
 static httpd_handle_t s_server;
 static SemaphoreHandle_t s_scan_mutex;
 static SemaphoreHandle_t s_root_mu; /**< At most one full portal HTML send */
-static char s_scan_json[2048];
-static char s_scan_ssids[16][33];
-static char s_json[16384];
+static char s_scan_json[4096];
+static wifi_scan_ap_t s_scan_aps[24];
+static char s_json[12288];
 /* Heap buffer for status snapshot — avoids multi-KB stack copies. */
 static zigbee_host_status_t s_zb_snap;
 static int64_t s_last_handler_us; /**< Last successful URI handler completion */
 static int64_t s_root_held_us;    /**< When root HTML mutex was taken (0 = free) */
 static TaskHandle_t s_watch_task;
+
+static const char *thermo_mode_json(const group_t *g);
+
+static const char *device_kind_json(const zb_device_t *d)
+{
+    switch (zigbee_host_device_kind(d)) {
+    case ZB_DEVICE_KIND_LIGHT:
+        return "light";
+    case ZB_DEVICE_KIND_SWITCH:
+        return "switch";
+    case ZB_DEVICE_KIND_OUTLET:
+        return "outlet";
+    case ZB_DEVICE_KIND_IRRIGATION:
+        return "irrigation";
+    case ZB_DEVICE_KIND_SENSOR:
+        return "sensor";
+    case ZB_DEVICE_KIND_REMOTE:
+        return "remote";
+    case ZB_DEVICE_KIND_CONTACT:
+        return "contact";
+    case ZB_DEVICE_KIND_MOTION:
+        return "motion";
+    case ZB_DEVICE_KIND_LEAK:
+        return "leak";
+    case ZB_DEVICE_KIND_SMOKE:
+        return "smoke";
+    default:
+        return "unknown";
+    }
+}
 
 static void web_note_handler_ok(void)
 {
@@ -49,6 +81,7 @@ static void web_note_handler_ok(void)
 
 static void web_watchdog_task(void *arg);
 static esp_err_t web_server_restart(void);
+static bool json_get_string(const char *body, const char *key, char *out, size_t out_len);
 
 /** snprintf into buffer with truncation-safe position advance. */
 static size_t json_append(char *buf, size_t bufsz, size_t pos, const char *fmt, ...)
@@ -158,22 +191,37 @@ static void json_escape(const char *in, char *out, size_t out_len)
 
 static esp_err_t root_get(httpd_req_t *req)
 {
+    /* SoftAP setup: serve the compact page — full portal (~85 KiB) never finishes on C3 SoftAP. */
+    if (wifi_manager_is_setup_portal()) {
+        web_note_handler_ok();
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        httpd_resp_set_hdr(req, "Connection", "close");
+        return httpd_resp_sendstr(req, WEB_SETUP_HTML);
+    }
+
     /* Only one full HTML transfer at a time — concurrent tab/captive downloads
      * used to occupy every httpd socket until send timeouts, hanging the portal. */
     if (!s_root_mu || xSemaphoreTake(s_root_mu, 0) != pdTRUE) {
+        web_note_handler_ok();
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_hdr(req, "Connection", "close");
         httpd_resp_set_hdr(req, "Retry-After", "1");
         return httpd_resp_sendstr(req, "busy");
     }
+    /* Count the request as inbound immediately so Wi‑Fi health does not soft-
+     * reconnect mid-transfer when the GW TCP probe times out under load. */
+    web_note_handler_ok();
+    wifi_manager_set_busy(true);
     s_root_held_us = esp_timer_get_time();
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_hdr(req, "Connection", "close");
     const char *html = WEB_APP_HTML;
     size_t len = strlen(html);
-    const size_t chunk = 2048;
+    const size_t chunk = 1024; /* smaller chunks — less stall risk on C3 TX */
     esp_err_t err = ESP_OK;
+    unsigned chunk_i = 0;
     for (size_t off = 0; off < len; off += chunk) {
         size_t n = len - off;
         if (n > chunk) {
@@ -181,20 +229,24 @@ static esp_err_t root_get(httpd_req_t *req)
         }
         err = httpd_resp_send_chunk(req, html + off, n);
         if (err != ESP_OK) {
+            ESP_LOGW(TAG, "root HTML chunk @%u failed: %s", (unsigned)off, esp_err_to_name(err));
             httpd_resp_send_chunk(req, NULL, 0);
             break;
         }
-        if ((off & 0xFFF) == 0) {
+        chunk_i++;
+        if ((chunk_i & 7u) == 0u) {
+            web_note_handler_ok();
+            vTaskDelay(pdMS_TO_TICKS(2));
+        } else {
             vTaskDelay(1);
         }
     }
     if (err == ESP_OK) {
         err = httpd_resp_send_chunk(req, NULL, 0);
-        if (err == ESP_OK) {
-            web_note_handler_ok();
-        }
     }
+    web_note_handler_ok();
     s_root_held_us = 0;
+    wifi_manager_set_busy(false);
     xSemaphoreGive(s_root_mu);
     return err;
 }
@@ -216,6 +268,44 @@ static esp_err_t api_ping(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     web_note_handler_ok();
     return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static const char *reset_reason_json(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:
+        return "power_on";
+    case ESP_RST_EXT:
+        return "external";
+    case ESP_RST_SW:
+        return "software";
+    case ESP_RST_PANIC:
+        return "panic";
+    case ESP_RST_INT_WDT:
+        return "int_wdt";
+    case ESP_RST_TASK_WDT:
+        return "task_wdt";
+    case ESP_RST_WDT:
+        return "wdt";
+    case ESP_RST_DEEPSLEEP:
+        return "deepsleep";
+    case ESP_RST_BROWNOUT:
+        return "brownout";
+    case ESP_RST_SDIO:
+        return "sdio";
+    case ESP_RST_USB:
+        return "usb";
+    case ESP_RST_JTAG:
+        return "jtag";
+    case ESP_RST_EFUSE:
+        return "efuse";
+    case ESP_RST_PWR_GLITCH:
+        return "pwr_glitch";
+    case ESP_RST_CPU_LOCKUP:
+        return "cpu_lockup";
+    default:
+        return "unknown";
+    }
 }
 
 static esp_err_t api_status(httpd_req_t *req)
@@ -242,10 +332,16 @@ static esp_err_t api_status(httpd_req_t *req)
     snprintf(uptime, sizeof(uptime), "%lluh %llum %llus", uptime_s / 3600ULL,
              (uptime_s / 60ULL) % 60ULL, uptime_s % 60ULL);
 
-    char err_esc[128], ssid_esc[64], ap_esc[64];
+    char err_esc[128], ssid_esc[64], ap_esc[64], bssid_esc[40];
+    char pssid_esc[64], pbssid_esc[40], sssid_esc[64], sbssid_esc[40];
     json_escape(zb->last_error, err_esc, sizeof(err_esc));
     json_escape(wifi.ssid, ssid_esc, sizeof(ssid_esc));
     json_escape(wifi.ap_ssid, ap_esc, sizeof(ap_esc));
+    json_escape(wifi.bssid, bssid_esc, sizeof(bssid_esc));
+    json_escape(wifi.primary_ssid, pssid_esc, sizeof(pssid_esc));
+    json_escape(wifi.primary_bssid, pbssid_esc, sizeof(pbssid_esc));
+    json_escape(wifi.secondary_ssid, sssid_esc, sizeof(sssid_esc));
+    json_escape(wifi.secondary_bssid, sbssid_esc, sizeof(sbssid_esc));
 
     homekit_bridge_status_t hk;
     homekit_bridge_get_status(&hk);
@@ -260,8 +356,12 @@ static esp_err_t api_status(httpd_req_t *req)
         "{\"icc\":\"%s\",\"ash\":\"%s\",\"ezsp\":%u,\"ember\":\"%s\",\"eui64\":\"%s\","
         "\"network\":\"%s\",\"node_type\":\"%s\",\"net_valid\":%s,\"channel\":%u,\"pan_id\":%u,"
         "\"epid\":\"%s\",\"tx_power\":%d,\"permit_join\":%u,\"device_count\":%u,"
-        "\"wifi\":\"%s\",\"has_sta\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"ap_ssid\":\"%s\","
-        "\"ap_ip\":\"%s\",\"ap_active\":%s,\"rssi\":%d,\"uptime\":\"%s\","
+        "\"wifi\":\"%s\",\"has_sta\":%s,\"ssid\":\"%s\",\"bssid\":\"%s\",\"ip\":\"%s\","
+        "\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\",\"ap_active\":%s,\"rssi\":%d,"
+        "\"primary_ssid\":\"%s\",\"primary_bssid\":\"%s\",\"primary_bssid_set\":%s,"
+        "\"secondary_ssid\":\"%s\",\"secondary_bssid\":\"%s\",\"secondary_bssid_set\":%s,"
+        "\"has_secondary\":%s,\"active_slot\":%u,\"uptime\":\"%s\","
+        "\"reset_reason\":\"%s\",\"free_heap\":%u,\"min_free_heap\":%u,"
         "\"tx\":%lu,\"rx\":%lu,\"ash_ok\":%lu,\"ash_bad\":%lu,\"crc_err\":%lu,\"timeouts\":%lu,"
         "\"ezsp_cmd\":%lu,\"ezsp_rsp\":%lu,\"last_error\":\"%s\","
         "\"homekit\":{\"started\":%s,\"paired\":%s,\"setup_code\":\"%s\",\"setup_id\":\"%s\","
@@ -274,8 +374,13 @@ static esp_err_t api_status(httpd_req_t *req)
         zb->ncp.net_params_valid ? zb->ncp.net.pan_id : 0, epid,
         zb->ncp.net_params_valid ? zb->ncp.net.radio_tx_power : 0, zb->permit_join_remaining,
         zb->device_count, wifi_manager_state_str(wifi.state),
-        wifi.has_sta_credentials ? "true" : "false", ssid_esc, wifi.ip, ap_esc, wifi.ap_ip,
-        wifi.ap_active ? "true" : "false", wifi.rssi, uptime, (unsigned long)zb->ash_stats.tx_bytes,
+        wifi.has_sta_credentials ? "true" : "false", ssid_esc, bssid_esc, wifi.ip, ap_esc, wifi.ap_ip,
+        wifi.ap_active ? "true" : "false", wifi.rssi, pssid_esc, pbssid_esc,
+        wifi.primary_bssid_set ? "true" : "false", sssid_esc, sbssid_esc,
+        wifi.secondary_bssid_set ? "true" : "false", wifi.has_secondary ? "true" : "false",
+        (unsigned)wifi.active_slot, uptime, reset_reason_json(), (unsigned)esp_get_free_heap_size(),
+        (unsigned)esp_get_minimum_free_heap_size(),
+        (unsigned long)zb->ash_stats.tx_bytes,
         (unsigned long)zb->ash_stats.rx_bytes, (unsigned long)zb->ash_stats.valid_frames,
         (unsigned long)zb->ash_stats.invalid_frames, (unsigned long)zb->ash_stats.crc_errors,
         (unsigned long)zb->ash_stats.timeouts, (unsigned long)zb->ezsp_stats.commands_sent,
@@ -301,21 +406,14 @@ static esp_err_t api_status(httpd_req_t *req)
             "\"name\":\"%s\",\"manufacturer\":\"%s\",\"model\":\"%s\",\"firmware\":\"%s\","
             "\"kind\":\"%s\",\"has_temp\":%s,\"temperature_c\":%.2f,\"has_humidity\":%s,\"humidity_pct\":%.2f,"
             "\"has_battery\":%s,\"battery_pct\":%u,\"has_onoff\":%s,\"onoff_on\":%s,"
-            "\"has_level\":%s,\"brightness\":%u,\"buttons\":%u,\"button_modes\":[",
+            "\"binary_on\":%s,\"has_level\":%s,\"brightness\":%u,\"buttons\":%u,\"button_modes\":[",
             first ? "" : ",", deui, d->node_id, ezsp_node_type_str(d->node_type), dlab, dname, dman,
-            dmodel, dfw,
-            zigbee_host_device_kind(d) == ZB_DEVICE_KIND_LIGHT
-                ? "light"
-                : (zigbee_host_device_kind(d) == ZB_DEVICE_KIND_SWITCH
-                       ? "switch"
-                       : (zigbee_host_device_kind(d) == ZB_DEVICE_KIND_SENSOR
-                              ? "sensor"
-                              : (zigbee_host_device_kind(d) == ZB_DEVICE_KIND_REMOTE ? "remote"
-                                                                                     : "unknown"))),
+            dmodel, dfw, device_kind_json(d),
             d->has_temp ? "true" : "false", (double)d->temperature_c,
             d->has_humidity ? "true" : "false", (double)d->humidity_pct,
             d->has_battery ? "true" : "false", (unsigned)d->battery_pct,
             d->has_onoff ? "true" : "false", d->onoff_on ? "true" : "false",
+            d->binary_on ? "true" : "false",
             d->has_level ? "true" : "false",
             (unsigned)(d->has_level ? zigbee_host_level_to_brightness(d->level)
                                     : (d->onoff_on ? 100 : 0)),
@@ -400,22 +498,53 @@ static esp_err_t api_status(httpd_req_t *req)
         pos += (size_t)snprintf(
             s_json + pos, sizeof(s_json) - pos,
             "%s{\"id\":%u,\"name\":\"%s\",\"type\":\"%s\",\"homekit_expose\":%s,"
-            "\"on\":%s,\"brightness\":%u,\"is_light\":%s,",
+            "\"on\":%s,\"brightness\":%u,\"is_light\":%s,\"power_fail\":\"%s\",",
             first ? "" : ",", (unsigned)g.id, gname,
             g.type == GROUP_TYPE_THERMOSTAT ? "thermostat" : "general",
             g.homekit_expose ? "true" : "false", g.on ? "true" : "false",
-            (unsigned)g.brightness_pct, g.is_light_group ? "true" : "false");
+            (unsigned)g.brightness_pct, g.is_light_group ? "true" : "false",
+            g.power_fail_mode == GROUP_POWER_FAIL_ON
+                ? "on"
+                : (g.power_fail_mode == GROUP_POWER_FAIL_OFF ? "off" : "previous"));
         if (g.type == GROUP_TYPE_THERMOSTAT) {
-            char seui[40], sweui[40];
+            char seui[40], sweui[40], ceui[40], heui[40];
             ezsp_format_eui64(g.sensor_eui, seui, sizeof(seui));
-            ezsp_format_eui64(g.switch_eui, sweui, sizeof(sweui));
+            if (group_thermo_has_heater(&g)) {
+                ezsp_format_eui64(g.switch_eui, sweui, sizeof(sweui));
+            } else {
+                sweui[0] = '\0';
+            }
+            if (group_thermo_has_cooler(&g)) {
+                ezsp_format_eui64(g.cooler_eui, ceui, sizeof(ceui));
+            } else {
+                ceui[0] = '\0';
+            }
+            bool has_hum_sensor = false;
+            for (int bi = 0; bi < 8; bi++) {
+                if (g.humidity_sensor_eui[bi] != 0) {
+                    has_hum_sensor = true;
+                    break;
+                }
+            }
+            if (has_hum_sensor) {
+                ezsp_format_eui64(g.humidity_sensor_eui, heui, sizeof(heui));
+            } else {
+                heui[0] = '\0';
+            }
             pos += (size_t)snprintf(
                 s_json + pos, sizeof(s_json) - pos,
-                "\"sensor_eui\":\"%s\",\"switch_eui\":\"%s\",\"target_c\":%.1f,\"mode\":\"%s\","
-                "\"heating\":%s,\"has_current_temp\":%s,\"current_temp_c\":%.2f,\"members\":[]}",
-                seui, sweui, (double)g.target_c, g.mode == THERMO_MODE_HEAT ? "heat" : "off",
-                g.heating ? "true" : "false", g.has_current_temp ? "true" : "false",
-                (double)g.current_temp_c);
+                "\"regulation\":\"%s\",\"sensor_eui\":\"%s\",\"humidity_sensor_eui\":\"%s\","
+                "\"switch_eui\":\"%s\",\"cooler_eui\":\"%s\","
+                "\"target_c\":%.1f,\"target_humidity\":%.0f,\"gap_c\":%.1f,\"hysteresis_c\":%.1f,"
+                "\"humidity_force_heat\":%s,\"mode\":\"%s\","
+                "\"heating\":%s,\"cooling\":%s,\"has_current_temp\":%s,\"current_temp_c\":%.2f,"
+                "\"has_current_humidity\":%s,\"current_humidity_pct\":%.1f,\"members\":[]}",
+                g.thermo_kind == GROUP_THERMO_KIND_HUMIDITY ? "humidity" : "temperature", seui,
+                heui, sweui, ceui, (double)g.target_c, (double)g.target_humidity_pct,
+                (double)g.gap_c, (double)g.hysteresis_c, g.humidity_force_heat ? "true" : "false",
+                thermo_mode_json(&g), g.heating ? "true" : "false", g.cooling ? "true" : "false",
+                g.has_current_temp ? "true" : "false", (double)g.current_temp_c,
+                g.has_current_humidity ? "true" : "false", (double)g.current_humidity_pct);
         } else {
             pos += (size_t)snprintf(s_json + pos, sizeof(s_json) - pos, "\"members\":[");
             for (uint8_t m = 0; m < g.member_count; m++) {
@@ -488,26 +617,64 @@ static esp_err_t api_status(httpd_req_t *req)
 }
 
 static esp_err_t read_body(httpd_req_t *req, char *buf, size_t buflen);
-static bool json_get_string(const char *body, const char *key, char *out, size_t out_len);
 
 static esp_err_t api_ota_status(httpd_req_t *req)
 {
     fw_ota_status_t st;
     fw_ota_get_status(&st);
-    char msg[128], run[64], av[64], url[280];
+    char msg[128], run[64], av[64], url[280], man[280];
     json_escape(st.message, msg, sizeof(msg));
     json_escape(st.running_version, run, sizeof(run));
     json_escape(st.available_version, av, sizeof(av));
     json_escape(st.firmware_url, url, sizeof(url));
-    char body[768];
+    json_escape(st.manifest_url, man, sizeof(man));
+    char body[1200];
     snprintf(body, sizeof(body),
-             "{\"ok\":true,\"state\":\"%s\",\"running\":\"%s\",\"available\":\"%s\","
-             "\"url\":\"%s\",\"update_available\":%s,\"progress\":%d,\"message\":\"%s\"}",
-             fw_ota_state_str(st.state), run, av, url, st.update_available ? "true" : "false",
-             st.progress_pct, msg);
+             "{\"ok\":true,\"state\":\"%s\",\"channel\":\"%s\",\"channel_label\":\"%s\","
+             "\"running\":\"%s\",\"available\":\"%s\",\"url\":\"%s\",\"manifest_url\":\"%s\","
+             "\"update_available\":%s,\"progress\":%d,\"message\":\"%s\"}",
+             fw_ota_state_str(st.state), fw_ota_channel_str(st.channel),
+             fw_ota_channel_label(st.channel), run, av, url, man,
+             st.update_available ? "true" : "false", st.progress_pct, msg);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t api_ota_channel(httpd_req_t *req)
+{
+    char body[160] = {0};
+    if (read_body(req, body, sizeof(body)) != ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"bad body\"}");
+    }
+    char ch_s[24] = {0};
+    json_get_string(body, "channel", ch_s, sizeof(ch_s));
+    fw_ota_channel_t ch = FW_OTA_CHANNEL_STABLE;
+    if (strcmp(ch_s, "nightly") == 0) {
+        ch = FW_OTA_CHANNEL_NIGHTLY;
+    } else if (strcmp(ch_s, "stable") != 0 && ch_s[0]) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"channel must be stable or nightly\"}");
+    }
+    esp_err_t err = fw_ota_set_channel(ch);
+    fw_ota_status_t st;
+    fw_ota_get_status(&st);
+    char msg[128], man[280];
+    json_escape(st.message, msg, sizeof(msg));
+    json_escape(st.manifest_url, man, sizeof(man));
+    char resp[640];
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":%s,\"channel\":\"%s\",\"channel_label\":\"%s\",\"manifest_url\":\"%s\","
+             "\"message\":\"%s\"}",
+             err == ESP_OK ? "true" : "false", fw_ota_channel_str(st.channel),
+             fw_ota_channel_label(st.channel), man, msg);
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+    }
+    return httpd_resp_sendstr(req, resp);
 }
 
 static esp_err_t api_ota_offer(httpd_req_t *req)
@@ -595,17 +762,20 @@ static esp_err_t api_wifi_scan(httpd_req_t *req)
 {
     if (!s_scan_mutex || xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
         httpd_resp_set_type(req, "application/json");
-        return httpd_resp_sendstr(req, "{\"ssids\":[],\"busy\":true}");
+        return httpd_resp_sendstr(req, "{\"aps\":[],\"busy\":true}");
     }
-    memset(s_scan_ssids, 0, sizeof(s_scan_ssids));
-    int n = wifi_manager_scan(s_scan_ssids, 16);
+    memset(s_scan_aps, 0, sizeof(s_scan_aps));
+    int n = wifi_manager_scan_aps(s_scan_aps, 24);
     size_t pos = 0;
-    pos += (size_t)snprintf(s_scan_json + pos, sizeof(s_scan_json) - pos, "{\"ssids\":[");
-    for (int i = 0; i < n && pos + 48 < sizeof(s_scan_json); i++) {
-        char esc[80];
-        json_escape(s_scan_ssids[i], esc, sizeof(esc));
-        pos += (size_t)snprintf(s_scan_json + pos, sizeof(s_scan_json) - pos, "%s\"%s\"", i ? "," : "",
-                                esc);
+    pos += (size_t)snprintf(s_scan_json + pos, sizeof(s_scan_json) - pos, "{\"aps\":[");
+    for (int i = 0; i < n && pos + 120 < sizeof(s_scan_json); i++) {
+        char sessid[80], sebssid[48];
+        json_escape(s_scan_aps[i].ssid, sessid, sizeof(sessid));
+        json_escape(s_scan_aps[i].bssid, sebssid, sizeof(sebssid));
+        pos += (size_t)snprintf(
+            s_scan_json + pos, sizeof(s_scan_json) - pos,
+            "%s{\"ssid\":\"%s\",\"bssid\":\"%s\",\"rssi\":%d,\"channel\":%u}", i ? "," : "", sessid,
+            sebssid, (int)s_scan_aps[i].rssi, (unsigned)s_scan_aps[i].channel);
     }
     snprintf(s_scan_json + pos, sizeof(s_scan_json) - pos, "],\"count\":%d}", n);
     httpd_resp_set_type(req, "application/json");
@@ -616,7 +786,7 @@ static esp_err_t api_wifi_scan(httpd_req_t *req)
 
 static esp_err_t wifi_save(httpd_req_t *req)
 {
-    char body[192];
+    char body[384];
     int total = req->content_len;
     if (total <= 0 || total >= (int)sizeof(body)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
@@ -627,17 +797,29 @@ static esp_err_t wifi_save(httpd_req_t *req)
         return ESP_FAIL;
     }
     body[r] = '\0';
-    char ssid[33] = {0}, pass[65] = {0};
-    form_get(body, "ssid", ssid, sizeof(ssid));
-    form_get(body, "password", pass, sizeof(pass));
+    char ssid[33] = {0}, pass[65] = {0}, bssid[24] = {0}, slot[16] = {0};
+    /* Prefer JSON (portal); fall back to form-urlencoded (SoftAP setup). */
+    if (body[0] == '{') {
+        json_get_string(body, "ssid", ssid, sizeof(ssid));
+        json_get_string(body, "password", pass, sizeof(pass));
+        json_get_string(body, "bssid", bssid, sizeof(bssid));
+        json_get_string(body, "slot", slot, sizeof(slot));
+    } else {
+        form_get(body, "ssid", ssid, sizeof(ssid));
+        form_get(body, "password", pass, sizeof(pass));
+        form_get(body, "bssid", bssid, sizeof(bssid));
+        form_get(body, "slot", slot, sizeof(slot));
+    }
     if (!ssid[0]) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ssid required");
         return ESP_FAIL;
     }
-    esp_err_t err = wifi_manager_apply_sta(ssid, pass);
+    bool secondary = (slot[0] && strcasecmp(slot, "secondary") == 0);
+    esp_err_t err = wifi_manager_apply_sta(ssid, pass, bssid[0] ? bssid : NULL, secondary);
     httpd_resp_set_type(req, "application/json");
-    char msg[128];
-    snprintf(msg, sizeof(msg), "{\"ok\":%s}", err == ESP_OK ? "true" : "false");
+    char msg[160];
+    snprintf(msg, sizeof(msg), "{\"ok\":%s,\"slot\":\"%s\"}", err == ESP_OK ? "true" : "false",
+             secondary ? "secondary" : "primary");
     return httpd_resp_sendstr(req, msg);
 }
 
@@ -649,6 +831,18 @@ static esp_err_t wifi_clear(httpd_req_t *req)
     wifi_manager_clear_sta();
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t wifi_clear_secondary(httpd_req_t *req)
+{
+    char tmp[64];
+    while (httpd_req_recv(req, tmp, sizeof(tmp)) > 0) {
+    }
+    esp_err_t err = wifi_manager_clear_secondary();
+    httpd_resp_set_type(req, "application/json");
+    char msg[64];
+    snprintf(msg, sizeof(msg), "{\"ok\":%s}", err == ESP_OK ? "true" : "false");
+    return httpd_resp_sendstr(req, msg);
 }
 
 static int json_get_int(const char *body, const char *key, int def)
@@ -1164,12 +1358,12 @@ static esp_err_t api_zigbee_sniff(httpd_req_t *req)
 {
     /* Must be static: EZSP_SNIFF_LOG entries are too large for the httpd task stack
      * (stack overflow → random reboot whenever the Sniffer tab polls). */
-    static char sniff_json[4096];
+    static char sniff_json[3072];
     static ezsp_sniff_entry_t s_entries[EZSP_SNIFF_LOG];
     static SemaphoreHandle_t s_sniff_api_mu;
     const uint32_t seq = ezsp_sniff_seq();
 
-    /* ?since=<seq> → tiny ack when nothing new (UI used to pull ~12KB every 400ms
+    /* ?since=<seq> → tiny ack when nothing new (UI used to pull large JSON often
      * and wedge C3 STA TX the moment the Sniffer tab opened). */
     char qbuf[48];
     if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
@@ -1182,6 +1376,7 @@ static esp_err_t api_zigbee_sniff(httpd_req_t *req)
                          (unsigned long)seq);
                 httpd_resp_set_type(req, "application/json");
                 httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+                web_note_handler_ok();
                 return httpd_resp_sendstr(req, tiny);
             }
         }
@@ -1190,26 +1385,28 @@ static esp_err_t api_zigbee_sniff(httpd_req_t *req)
     if (!s_sniff_api_mu) {
         s_sniff_api_mu = xSemaphoreCreateMutex();
     }
-    if (s_sniff_api_mu) {
-        xSemaphoreTake(s_sniff_api_mu, portMAX_DELAY);
+    if (s_sniff_api_mu && xSemaphoreTake(s_sniff_api_mu, pdMS_TO_TICKS(30)) != pdTRUE) {
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":true,\"busy\":true,\"seq\":0,\"entries\":[]}");
     }
 
     uint8_t n = ezsp_copy_sniff_log(s_entries, EZSP_SNIFF_LOG);
-    /* Cap payload — newest 24 frames is enough for the live log. */
+    /* Newest 12 frames, short hex — keep SoftAP/STA TX light under remote presses. */
     uint8_t start = 0;
-    if (n > 24) {
-        start = (uint8_t)(n - 24);
-        n = 24;
+    if (n > 12) {
+        start = (uint8_t)(n - 12);
+        n = 12;
     }
     size_t pos = 0;
     pos += (size_t)snprintf(sniff_json + pos, sizeof(sniff_json) - pos,
                             "{\"ok\":true,\"seq\":%lu,\"count\":%u,\"entries\":[",
                             (unsigned long)seq, (unsigned)n);
-    for (uint8_t i = 0; i < n && pos + 220 < sizeof(sniff_json); i++) {
+    for (uint8_t i = 0; i < n && pos + 160 < sizeof(sniff_json); i++) {
         const ezsp_sniff_entry_t *e = &s_entries[start + i];
-        char hex[EZSP_SNIFF_DATA * 3 + 1];
+        char hex[16 * 3 + 1];
         size_t h = 0;
-        for (uint8_t b = 0; b < e->len && h + 3 < sizeof(hex); b++) {
+        uint8_t show = e->len > 16 ? 16 : e->len;
+        for (uint8_t b = 0; b < show && h + 3 < sizeof(hex); b++) {
             h += (size_t)snprintf(hex + h, sizeof(hex) - h, "%s%02X", b ? " " : "", e->data[b]);
         }
         hex[h] = '\0';
@@ -1223,13 +1420,13 @@ static esp_err_t api_zigbee_sniff(httpd_req_t *req)
             (unsigned)e->dst_ep, (int)e->rssi, (unsigned)e->status, hex);
     }
     snprintf(sniff_json + pos, sizeof(sniff_json) - pos, "]}");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    esp_err_t err = httpd_resp_sendstr(req, sniff_json);
     if (s_sniff_api_mu) {
         xSemaphoreGive(s_sniff_api_mu);
     }
-    return err;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    web_note_handler_ok();
+    return httpd_resp_sendstr(req, sniff_json);
 }
 
 static esp_err_t api_zigbee_sniff_clear(httpd_req_t *req)
@@ -1257,6 +1454,76 @@ static esp_err_t api_device_remove(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+static uint8_t parse_thermo_kind_str(const char *s)
+{
+    if (s && strcmp(s, "humidity") == 0) {
+        return GROUP_THERMO_KIND_HUMIDITY;
+    }
+    return GROUP_THERMO_KIND_TEMP;
+}
+
+static uint8_t parse_thermo_mode_str(const char *s, uint8_t thermo_kind)
+{
+    if (!s || !s[0]) {
+        return THERMO_MODE_OFF;
+    }
+    if (thermo_kind == GROUP_THERMO_KIND_HUMIDITY) {
+        if (strcmp(s, "humidify") == 0) {
+            return THERMO_MODE_HUMIDIFY;
+        }
+        if (strcmp(s, "dehumidify") == 0) {
+            return THERMO_MODE_DEHUMIDIFY;
+        }
+        return THERMO_MODE_OFF;
+    }
+    if (strcmp(s, "off") == 0) {
+        return THERMO_MODE_OFF;
+    }
+    if (strcmp(s, "cool") == 0) {
+        return THERMO_MODE_COOL;
+    }
+    if (strcmp(s, "auto") == 0) {
+        return THERMO_MODE_AUTO;
+    }
+    return THERMO_MODE_HEAT;
+}
+
+static const char *thermo_mode_json(const group_t *g)
+{
+    if (!g) {
+        return "off";
+    }
+    if (g->thermo_kind == GROUP_THERMO_KIND_HUMIDITY) {
+        if (g->mode == THERMO_MODE_HUMIDIFY) {
+            return "humidify";
+        }
+        if (g->mode == THERMO_MODE_DEHUMIDIFY) {
+            return "dehumidify";
+        }
+        return "off";
+    }
+    if (g->mode == THERMO_MODE_COOL) {
+        return "cool";
+    }
+    if (g->mode == THERMO_MODE_AUTO) {
+        return "auto";
+    }
+    if (g->mode == THERMO_MODE_HEAT) {
+        return "heat";
+    }
+    return "off";
+}
+
+/** Parse optional EUI: empty / "none" → zero EUI (ok). Invalid non-empty → false. */
+static bool parse_optional_eui64(const char *s, uint8_t out[8])
+{
+    memset(out, 0, 8);
+    if (!s || !s[0] || strcmp(s, "none") == 0) {
+        return true;
+    }
+    return parse_eui64(s, out);
+}
+
 static esp_err_t api_group_create(httpd_req_t *req)
 {
     char body[768] = {0};
@@ -1273,20 +1540,39 @@ static esp_err_t api_group_create(httpd_req_t *req)
     uint8_t id = 0;
     esp_err_t err = ESP_ERR_INVALID_ARG;
     if (strcmp(type_s, "thermostat") == 0) {
-        char seui_s[40] = {0}, sweui_s[40] = {0}, mode_s[16] = {0};
-        uint8_t seui[8], sweui[8];
+        char seui_s[40] = {0}, sweui_s[40] = {0}, ceui_s[40] = {0}, heui_s[40] = {0};
+        char mode_s[16] = {0}, reg_s[16] = {0};
+        uint8_t seui[8], sweui[8], ceui[8], heui[8];
         json_get_string(body, "sensor_eui", seui_s, sizeof(seui_s));
         json_get_string(body, "switch_eui", sweui_s, sizeof(sweui_s));
+        json_get_string(body, "cooler_eui", ceui_s, sizeof(ceui_s));
+        json_get_string(body, "humidity_sensor_eui", heui_s, sizeof(heui_s));
         json_get_string(body, "mode", mode_s, sizeof(mode_s));
+        json_get_string(body, "regulation", reg_s, sizeof(reg_s));
         float target = json_get_float(body, "target_c", 21.0f);
-        if (!parse_eui64(seui_s, seui) || !parse_eui64(sweui_s, sweui)) {
+        float target_rh = json_get_float(body, "target_humidity", 45.0f);
+        float gap = json_get_float(body, "gap_c", THERMOSTAT_DEFAULT_GAP_C);
+        float hyst = json_get_float(body, "hysteresis_c", THERMOSTAT_DEFAULT_HYSTERESIS_C);
+        bool force_rh = json_get_bool(body, "humidity_force_heat", false);
+        if (!parse_eui64(seui_s, seui) || !parse_optional_eui64(sweui_s, sweui) ||
+            !parse_optional_eui64(ceui_s, ceui) || !parse_optional_eui64(heui_s, heui)) {
             httpd_resp_set_status(req, "400 Bad Request");
             httpd_resp_set_type(req, "application/json");
-            return httpd_resp_sendstr(req,
-                                      "{\"ok\":false,\"error\":\"sensor_eui and switch_eui required\"}");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid sensor/actuator eui\"}");
         }
-        uint8_t mode = (strcmp(mode_s, "off") == 0) ? THERMO_MODE_OFF : THERMO_MODE_HEAT;
-        err = group_create_thermostat(name, seui, sweui, target, mode, hk, &id);
+        uint8_t kind = parse_thermo_kind_str(reg_s[0] ? reg_s : "temperature");
+        if (kind == GROUP_THERMO_KIND_HUMIDITY) {
+            /* Humidity regulator still needs a single actuator in switch_eui. */
+            if (sweui[0] == 0 && sweui[1] == 0 && sweui[2] == 0 && sweui[3] == 0 &&
+                sweui[4] == 0 && sweui[5] == 0 && sweui[6] == 0 && sweui[7] == 0) {
+                httpd_resp_set_status(req, "400 Bad Request");
+                httpd_resp_set_type(req, "application/json");
+                return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"switch_eui required\"}");
+            }
+        }
+        uint8_t mode = parse_thermo_mode_str(mode_s, kind);
+        err = group_create_thermostat(name, kind, seui, heui, sweui, ceui, target, target_rh, gap,
+                                      hyst, force_rh, mode, hk, &id);
     } else {
         /* Default: general grouped device */
         uint8_t members[GROUP_MAX_MEMBERS][8];
@@ -1296,7 +1582,16 @@ static esp_err_t api_group_create(httpd_req_t *req)
             httpd_resp_set_type(req, "application/json");
             return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"members required\"}");
         }
-        err = group_create_general(name, members, (uint8_t)n, hk, &id);
+        char pf_s[16] = {0};
+        uint8_t power_fail = GROUP_POWER_FAIL_PREVIOUS;
+        if (json_get_string(body, "power_fail", pf_s, sizeof(pf_s))) {
+            if (strcmp(pf_s, "on") == 0) {
+                power_fail = GROUP_POWER_FAIL_ON;
+            } else if (strcmp(pf_s, "off") == 0) {
+                power_fail = GROUP_POWER_FAIL_OFF;
+            }
+        }
+        err = group_create_general(name, members, (uint8_t)n, hk, power_fail, &id);
     }
     httpd_resp_set_type(req, "application/json");
     if (err != ESP_OK) {
@@ -1328,9 +1623,13 @@ static esp_err_t api_thermo_create(httpd_req_t *req)
         return httpd_resp_sendstr(req,
                                   "{\"ok\":false,\"error\":\"name, sensor_eui, switch_eui required\"}");
     }
-    uint8_t mode = (strcmp(mode_s, "off") == 0) ? THERMO_MODE_OFF : THERMO_MODE_HEAT;
+    uint8_t kind = GROUP_THERMO_KIND_TEMP;
+    uint8_t mode = parse_thermo_mode_str(mode_s, kind);
     uint8_t id = 0;
-    esp_err_t err = group_create_thermostat(name, seui, sweui, target, mode, hk, &id);
+    uint8_t zero[8] = {0};
+    esp_err_t err = group_create_thermostat(name, kind, seui, zero, sweui, zero, target, 45.0f,
+                                            THERMOSTAT_DEFAULT_GAP_C, THERMOSTAT_DEFAULT_HYSTERESIS_C,
+                                            false, mode, hk, &id);
     httpd_resp_set_type(req, "application/json");
     if (err != ESP_OK) {
         httpd_resp_set_status(req, "400 Bad Request");
@@ -1353,7 +1652,8 @@ static esp_err_t api_group_update(httpd_req_t *req)
         return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid id\"}");
     }
     group_update_t upd = {0};
-    char name[32] = {0}, seui_s[40] = {0}, sweui_s[40] = {0}, mode_s[16] = {0};
+    char name[32] = {0}, seui_s[40] = {0}, sweui_s[40] = {0}, ceui_s[40] = {0}, heui_s[40] = {0};
+    char mode_s[16] = {0}, reg_s[16] = {0};
     if (json_get_string(body, "name", name, sizeof(name)) && name[0]) {
         upd.set_name = true;
         snprintf(upd.name, sizeof(upd.name), "%s", name);
@@ -1362,17 +1662,53 @@ static esp_err_t api_group_update(httpd_req_t *req)
         parse_eui64(seui_s, upd.sensor_eui)) {
         upd.set_sensor = true;
     }
+    if (json_get_string(body, "humidity_sensor_eui", heui_s, sizeof(heui_s)) &&
+        parse_optional_eui64(heui_s, upd.humidity_sensor_eui)) {
+        upd.set_humidity_sensor = true;
+    }
     if (json_get_string(body, "switch_eui", sweui_s, sizeof(sweui_s)) &&
-        parse_eui64(sweui_s, upd.switch_eui)) {
+        parse_optional_eui64(sweui_s, upd.switch_eui)) {
         upd.set_switch = true;
+    }
+    if (json_get_string(body, "cooler_eui", ceui_s, sizeof(ceui_s)) &&
+        parse_optional_eui64(ceui_s, upd.cooler_eui)) {
+        upd.set_cooler = true;
+    }
+    if (json_get_string(body, "regulation", reg_s, sizeof(reg_s)) && reg_s[0]) {
+        upd.set_thermo_kind = true;
+        upd.thermo_kind = parse_thermo_kind_str(reg_s);
     }
     if (strstr(body, "\"target_c\"")) {
         upd.set_target = true;
         upd.target_c = json_get_float(body, "target_c", 21.0f);
     }
+    if (strstr(body, "\"target_humidity\"")) {
+        upd.set_target_humidity = true;
+        upd.target_humidity_pct = json_get_float(body, "target_humidity", 45.0f);
+    }
+    if (strstr(body, "\"gap_c\"")) {
+        upd.set_gap = true;
+        upd.gap_c = json_get_float(body, "gap_c", THERMOSTAT_DEFAULT_GAP_C);
+    }
+    if (strstr(body, "\"hysteresis_c\"")) {
+        upd.set_hysteresis = true;
+        upd.hysteresis_c = json_get_float(body, "hysteresis_c", THERMOSTAT_DEFAULT_HYSTERESIS_C);
+    }
+    if (strstr(body, "\"humidity_force_heat\"")) {
+        upd.set_humidity_force_heat = true;
+        upd.humidity_force_heat = json_get_bool(body, "humidity_force_heat", false);
+    }
     if (json_get_string(body, "mode", mode_s, sizeof(mode_s)) && mode_s[0]) {
+        uint8_t kind = GROUP_THERMO_KIND_TEMP;
+        group_t existing;
+        if (group_get_by_id((uint8_t)id, &existing)) {
+            kind = existing.thermo_kind;
+        }
+        if (upd.set_thermo_kind) {
+            kind = upd.thermo_kind;
+        }
         upd.set_mode = true;
-        upd.mode = (strcmp(mode_s, "off") == 0) ? THERMO_MODE_OFF : THERMO_MODE_HEAT;
+        upd.mode = parse_thermo_mode_str(mode_s, kind);
     }
     if (strstr(body, "\"homekit_expose\"")) {
         upd.set_homekit = true;
@@ -1382,6 +1718,17 @@ static esp_err_t api_group_update(httpd_req_t *req)
     if (n > 0) {
         upd.set_members = true;
         upd.member_count = (uint8_t)n;
+    }
+    char pf_s[16] = {0};
+    if (json_get_string(body, "power_fail", pf_s, sizeof(pf_s)) && pf_s[0]) {
+        upd.set_power_fail = true;
+        if (strcmp(pf_s, "on") == 0) {
+            upd.power_fail_mode = GROUP_POWER_FAIL_ON;
+        } else if (strcmp(pf_s, "off") == 0) {
+            upd.power_fail_mode = GROUP_POWER_FAIL_OFF;
+        } else {
+            upd.power_fail_mode = GROUP_POWER_FAIL_PREVIOUS;
+        }
     }
     esp_err_t err = group_update((uint8_t)id, &upd);
     if (err == ESP_OK) {
@@ -1445,8 +1792,8 @@ esp_err_t web_server_start(void)
     config.max_uri_handlers = 36;
     config.stack_size = 12288;
     /* OTA upload streams ~1 MiB; keep headroom between flash-write chunks. */
-    config.recv_wait_timeout = 30;
-    config.send_wait_timeout = 5;
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 8; /* Fail stuck portal sends fast; long waits starved sockets */
     config.max_open_sockets = 5; /* Headroom for status/ping while one HTML send runs */
     config.keep_alive_enable = false;
     config.backlog_conn = 2;
@@ -1464,7 +1811,9 @@ esp_err_t web_server_start(void)
         {.uri = "/api/status", .method = HTTP_GET, .handler = api_status},
         {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = api_wifi_scan},
         {.uri = "/wifi/save", .method = HTTP_POST, .handler = wifi_save},
+        {.uri = "/api/wifi/save", .method = HTTP_POST, .handler = wifi_save},
         {.uri = "/wifi/clear", .method = HTTP_POST, .handler = wifi_clear},
+        {.uri = "/api/wifi/clear-secondary", .method = HTTP_POST, .handler = wifi_clear_secondary},
         {.uri = "/api/zigbee/form", .method = HTTP_POST, .handler = api_form},
         {.uri = "/api/zigbee/leave", .method = HTTP_POST, .handler = api_leave},
         {.uri = "/api/zigbee/permit", .method = HTTP_POST, .handler = api_permit},
@@ -1482,6 +1831,7 @@ esp_err_t web_server_start(void)
         {.uri = "/api/thermostats/update", .method = HTTP_POST, .handler = api_thermo_update},
         {.uri = "/api/thermostats/remove", .method = HTTP_POST, .handler = api_thermo_remove},
         {.uri = "/api/ota", .method = HTTP_GET, .handler = api_ota_status},
+        {.uri = "/api/ota/channel", .method = HTTP_POST, .handler = api_ota_channel},
         {.uri = "/api/ota/offer", .method = HTTP_POST, .handler = api_ota_offer},
         {.uri = "/api/ota/upload", .method = HTTP_POST, .handler = api_ota_upload},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_ok},

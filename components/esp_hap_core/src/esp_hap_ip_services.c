@@ -1516,21 +1516,16 @@ static void hap_send_notification(void *arg)
     if (any_delivered) {
         wifi_manager_note_traffic();
     }
-    /* If no controller was connected and no disconnected event was sent,
-     * reannaounce mDNS. That will increment state number as required
-     * by HAP Spec R15.
-     */
+    /* Spec R15: bump mDNS when no controller is connected. */
     if (!ctrl_connected && !hap_priv.disconnected_event_sent) {
         hap_mdns_announce(false);
         hap_priv.disconnected_event_sent = true;
     }
-    /* Undelivered EVENT is common (stale Home session / no EV socket while the
-     * phone UI is idle). Provoke reconnection — same effect as lock→unlock —
-     * so remotes/automations see the new state without waiting for the user. */
-    if (!any_delivered) {
-        ESP_LOGW("hap", "EVENT undelivered (%d char, ctrl=%d) — provoke refresh",
+    /* Undelivered EVENT with a live controller usually means TX stall — session
+     * already closed above. Do not provoke (mDNS/session storms flapped STA). */
+    if (!any_delivered && ctrl_connected) {
+        ESP_LOGW("hap", "EVENT undelivered (%d char, ctrl=%d) — skip provoke",
                  num_notif_chars, (int)ctrl_connected);
-        hap_provoke_controller_refresh();
     }
 }
 

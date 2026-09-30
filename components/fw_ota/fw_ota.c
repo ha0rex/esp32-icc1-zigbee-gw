@@ -17,11 +17,21 @@
 #include "esp_partition.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "nvs.h"
 
 static const char *TAG = "fw_ota";
 
+#define NVS_NS "fw_ota"
+#define NVS_KEY_CHANNEL "channel"
+
+#define OTA_MANIFEST_STABLE \
+    "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/manifest.json"
+#define OTA_MANIFEST_NIGHTLY \
+    "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota-nightly/manifest.json"
+
 typedef struct {
     fw_ota_state_t state;
+    fw_ota_channel_t channel;
     char running_version[48];
     char available_version[48];
     char firmware_url[256];
@@ -37,6 +47,7 @@ typedef struct {
 
 static fw_ota_ctx_t s_ctx;
 static SemaphoreHandle_t s_mu;
+static bool s_channel_loaded;
 
 static void lock(void)
 {
@@ -55,6 +66,89 @@ static void unlock(void)
     }
 }
 
+static fw_ota_channel_t clamp_channel(uint8_t raw)
+{
+    return (raw == (uint8_t)FW_OTA_CHANNEL_NIGHTLY) ? FW_OTA_CHANNEL_NIGHTLY
+                                                     : FW_OTA_CHANNEL_STABLE;
+}
+
+static void load_channel_locked(void)
+{
+    if (s_channel_loaded) {
+        return;
+    }
+    s_ctx.channel = FW_OTA_CHANNEL_STABLE;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t raw = 0;
+        if (nvs_get_u8(h, NVS_KEY_CHANNEL, &raw) == ESP_OK) {
+            s_ctx.channel = clamp_channel(raw);
+        }
+        nvs_close(h);
+    }
+    s_channel_loaded = true;
+}
+
+static esp_err_t save_channel_locked(fw_ota_channel_t channel)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, NVS_KEY_CHANNEL, (uint8_t)channel);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+const char *fw_ota_channel_str(fw_ota_channel_t channel)
+{
+    return (channel == FW_OTA_CHANNEL_NIGHTLY) ? "nightly" : "stable";
+}
+
+const char *fw_ota_channel_label(fw_ota_channel_t channel)
+{
+    return (channel == FW_OTA_CHANNEL_NIGHTLY) ? "Nightly" : "Stable";
+}
+
+const char *fw_ota_manifest_url_for(fw_ota_channel_t channel)
+{
+    return (channel == FW_OTA_CHANNEL_NIGHTLY) ? OTA_MANIFEST_NIGHTLY : OTA_MANIFEST_STABLE;
+}
+
+fw_ota_channel_t fw_ota_get_channel(void)
+{
+    lock();
+    load_channel_locked();
+    fw_ota_channel_t ch = s_ctx.channel;
+    unlock();
+    return ch;
+}
+
+esp_err_t fw_ota_set_channel(fw_ota_channel_t channel)
+{
+    channel = clamp_channel((uint8_t)channel);
+    lock();
+    load_channel_locked();
+    esp_err_t err = save_channel_locked(channel);
+    if (err == ESP_OK) {
+        s_ctx.channel = channel;
+        /* Clear stale offer from the previous channel. */
+        s_ctx.update_available = false;
+        s_ctx.available_version[0] = '\0';
+        s_ctx.firmware_url[0] = '\0';
+        s_ctx.state = FW_OTA_IDLE;
+        snprintf(s_ctx.message, sizeof(s_ctx.message), "Channel set to %s",
+                 fw_ota_channel_label(channel));
+        ESP_LOGI(TAG, "OTA channel -> %s", fw_ota_channel_str(channel));
+    }
+    unlock();
+    return err;
+}
+
 static void set_running_version(void)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
@@ -63,6 +157,76 @@ static void set_running_version(void)
     } else {
         snprintf(s_ctx.running_version, sizeof(s_ctx.running_version), "unknown");
     }
+}
+
+typedef struct {
+    int major;
+    int minor;
+    int patch;
+    bool ok;
+} fw_semver_t;
+
+/** Leading X.Y.Z from strings like "0.3.2" or "0.3.1-20260929.4ed3957a". */
+static fw_semver_t parse_semver_prefix(const char *s)
+{
+    fw_semver_t v = {0, 0, 0, false};
+    if (!s || !s[0]) {
+        return v;
+    }
+    int maj = 0;
+    int min = 0;
+    int pat = 0;
+    int n = sscanf(s, "%d.%d.%d", &maj, &min, &pat);
+    if (n >= 1) {
+        v.major = maj;
+        v.minor = (n >= 2) ? min : 0;
+        v.patch = (n >= 3) ? pat : 0;
+        v.ok = true;
+    }
+    return v;
+}
+
+/** Negative if a < b, zero if equal semver prefix, positive if a > b. */
+static int semver_prefix_cmp(fw_semver_t a, fw_semver_t b)
+{
+    if (!a.ok && !b.ok) {
+        return 0;
+    }
+    if (!a.ok) {
+        return -1;
+    }
+    if (!b.ok) {
+        return 1;
+    }
+    if (a.major != b.major) {
+        return a.major - b.major;
+    }
+    if (a.minor != b.minor) {
+        return a.minor - b.minor;
+    }
+    return a.patch - b.patch;
+}
+
+/** True when running firmware should accept an OTA offer (never downgrades). */
+static bool offer_is_upgrade(const char *running, const char *offered)
+{
+    if (!running || !offered || !running[0] || !offered[0]) {
+        return false;
+    }
+    if (strcmp(running, offered) == 0) {
+        return false;
+    }
+    fw_semver_t run = parse_semver_prefix(running);
+    fw_semver_t off = parse_semver_prefix(offered);
+    int cmp = semver_prefix_cmp(run, off);
+    if (cmp > 0) {
+        return false; /* running newer than channel (e.g. 0.3.2 vs 0.3.1-…) */
+    }
+    if (cmp < 0) {
+        return true;
+    }
+    /* Same X.Y.Z — only offer if manifest string differs (rolling build refresh). */
+    return strcmp(running, offered) != 0;
 }
 
 const char *fw_ota_state_str(fw_ota_state_t st)
@@ -93,13 +257,17 @@ void fw_ota_get_status(fw_ota_status_t *out)
         return;
     }
     lock();
+    load_channel_locked();
     if (!s_ctx.running_version[0]) {
         set_running_version();
     }
     out->state = s_ctx.state;
+    out->channel = s_ctx.channel;
     snprintf(out->running_version, sizeof(out->running_version), "%s", s_ctx.running_version);
     snprintf(out->available_version, sizeof(out->available_version), "%s", s_ctx.available_version);
     snprintf(out->firmware_url, sizeof(out->firmware_url), "%s", s_ctx.firmware_url);
+    snprintf(out->manifest_url, sizeof(out->manifest_url), "%s",
+             fw_ota_manifest_url_for(s_ctx.channel));
     snprintf(out->message, sizeof(out->message), "%s", s_ctx.message);
     out->update_available = s_ctx.update_available;
     out->progress_pct = s_ctx.progress_pct;
@@ -115,10 +283,19 @@ esp_err_t fw_ota_offer(const char *version, const char *url)
     set_running_version();
     snprintf(s_ctx.available_version, sizeof(s_ctx.available_version), "%s", version);
     snprintf(s_ctx.firmware_url, sizeof(s_ctx.firmware_url), "%s", url);
-    if (strcmp(s_ctx.running_version, version) == 0) {
+    if (!offer_is_upgrade(s_ctx.running_version, version)) {
         s_ctx.state = FW_OTA_UP_TO_DATE;
         s_ctx.update_available = false;
-        snprintf(s_ctx.message, sizeof(s_ctx.message), "Already on %s", version);
+        fw_semver_t run = parse_semver_prefix(s_ctx.running_version);
+        fw_semver_t off = parse_semver_prefix(version);
+        if (semver_prefix_cmp(run, off) > 0) {
+            snprintf(s_ctx.message, sizeof(s_ctx.message), "Already on %s (newer than channel)",
+                     s_ctx.running_version);
+        } else if (strcmp(s_ctx.running_version, version) == 0) {
+            snprintf(s_ctx.message, sizeof(s_ctx.message), "Already on %s", version);
+        } else {
+            snprintf(s_ctx.message, sizeof(s_ctx.message), "Already on %s", s_ctx.running_version);
+        }
     } else {
         s_ctx.state = FW_OTA_AVAILABLE;
         s_ctx.update_available = true;
