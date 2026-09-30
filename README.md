@@ -18,7 +18,7 @@ Phone / Home app / browser
      Zigbee mesh
 ```
 
-**Current firmware version:** `0.3.33` (see `PROJECT_VER` in `CMakeLists.txt`)
+**Current firmware version:** `0.3.35` (see `PROJECT_VER` in `CMakeLists.txt`)
 
 **Repo:** [ha0rex/esp32-icc1-zigbee-gw](https://github.com/ha0rex/esp32-icc1-zigbee-gw)
 
@@ -134,7 +134,7 @@ Supported kinds (portal chip + HomeKit when exposed):
 | **Contact / Motion / Leak / Smoke** | IAS Zone (or Occupancy for PIR) | Matching HomeKit sensor |
 | **Remote** | IKEA buttons | Programmable switches or control mode |
 
-**Sensors** (Sonoff SNZB-02 / SNZB-02D / TH01, etc.): temperature, humidity, battery → HomeKit. Classic SNZB-02 (TI `00:12:4b`) is a sleepy end device — **Read values** queues one ZCL frame until the next poll; press the sensor button shortly after so it can check in. Kind detection prefers temp/humidity (and climate model IDs) over contact name fingerprints, so names like **Outdoors** are not mistaken for door/contact sensors. Bridged HomeKit AIDs are stable per Zigbee EUI (not per kind), and kind reclassify no longer removes the accessory — otherwise Home drops room and custom name.
+**Sensors** (Sonoff SNZB-02 / SNZB-02D / TH01, etc.): temperature, humidity, battery → HomeKit. Classic SNZB-02 (TI `00:12:4b`) is a sleepy end device — **Read values** queues one ZCL frame until the next poll; press the sensor button shortly after so it can check in. Kind detection prefers temp/humidity (and climate model IDs) over contact name fingerprints, so names like **Outdoors** are not mistaken for door/contact sensors. Bridged HomeKit AIDs are stable per Zigbee EUI (not per kind). The bridged accessory **kind is sticky in NVS** so reboots do not rebuild as a different service type (which made Home reject room/name edits). A one-time heal still rewrites former Contact tiles that are actually climate sensors (same AID — set room/name once after that). After create, the bridge does **not** push Name updates (Home owns room/custom name). Plugs/switches ignore On/Off attribute echoes for a few seconds after a HomeKit write so the UI does not flip back (e.g. CK-BL702).
 
 **Sonoff SWV:** pairs as Irrigation; Active in Home opens/closes the valve. Flow metering and eWeLink schedules are not bridged.
 
@@ -155,12 +155,14 @@ Limits: up to **32** devices, **8** groups × **8** members, **5** buttons per r
 
 ## Firmware updates
 
-On **System**, pick an update channel, then **Check for update → Install update**. The choice is stored on the gateway and used for later checks.
+On **System**, change the update channel dropdown (saved immediately), then **Check for update → Install update**.
+
+When an update is available the portal shows a **Changelog** from git commits since the previous publish on that channel.
 
 | Channel | What you get |
 | --- | --- |
-| **Stable** | Production builds |
-| **Nightly** | Newer experimental builds |
+| **Stable** | Production builds from `main` |
+| **Nightly** | Newer experimental builds from `dev` |
 
 The browser fetches the manifest/firmware from GitHub, then uploads the image to the gateway over local HTTP (the ESP32-C3 does not run HTTPS itself). Keep power applied during install; the gateway reboots when done.
 

@@ -116,6 +116,12 @@ typedef struct {
     bool occupancy; /**< true = occupied / motion */
     uint8_t occupancy_ep;
     bool binary_on; /**< Open/detected/active derived state for portal + HK sync */
+    /**
+     * HomeKit accessory kind lock (appended). 0 = unset (use live classify).
+     * Once set, the bridge recreates the same service layout across reboots so
+     * Home keeps room/custom name. Cleared when HomeKit expose is turned off.
+     */
+    uint8_t hk_sticky_kind;
 } zb_device_t;
 
 typedef struct {
@@ -175,6 +181,15 @@ esp_err_t zigbee_host_refresh_network(void);
 esp_err_t zigbee_host_interview_device(const uint8_t eui64[8]);
 /** Classify device kind from model + clusters (light/switch/outlet/irrigation/…). */
 zb_device_kind_t zigbee_host_device_kind(const zb_device_t *d);
+/**
+ * Kind used for HomeKit bridging: sticky if set, else live classify.
+ * Prefer this over zigbee_host_device_kind() when creating/keeping accessories.
+ */
+zb_device_kind_t zigbee_host_hk_kind(const zb_device_t *d);
+/** Persist the bridged HomeKit kind for this EUI (no-op if kind is UNKNOWN). */
+esp_err_t zigbee_host_hk_sticky_set(const uint8_t eui64[8], zb_device_kind_t kind);
+/** Clear sticky kind (call when HomeKit expose is turned off). */
+esp_err_t zigbee_host_hk_sticky_clear(const uint8_t eui64[8]);
 /** True when device is an On/Off actuator HomeKit/groups can control (excl. remotes). */
 bool zigbee_host_is_onoff_actuator(const zb_device_t *d);
 /** True when kind is a binary HomeKit sensor (contact/motion/leak/smoke). */

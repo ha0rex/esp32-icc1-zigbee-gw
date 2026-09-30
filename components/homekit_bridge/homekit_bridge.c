@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -101,6 +102,8 @@ struct hk_bridged {
     uint8_t layout_ver; /**< REMOTE_LAYOUT_VER when created */
     char acc_name[40]; /**< Last pushed accessory Name */
     uint8_t missing_ticks;
+    /** Ignore conflicting On/Off attribute reports after a HomeKit write. */
+    int64_t onoff_hold_until_us;
 };
 
 typedef struct {
@@ -238,28 +241,6 @@ static void remove_all_bridged_for_eui(const uint8_t eui64[8], const char *reaso
     }
 }
 
-static void update_accessory_name(hk_bridged_t *slot, const char *name)
-{
-    if (!slot || !slot->acc || !name || !name[0]) {
-        return;
-    }
-    if (strncmp(slot->acc_name, name, sizeof(slot->acc_name)) == 0) {
-        return;
-    }
-    hap_serv_t *info = hap_acc_get_serv_by_uuid(slot->acc, HAP_SERV_UUID_ACCESSORY_INFORMATION);
-    if (!info) {
-        return;
-    }
-    hap_char_t *hc = hap_serv_get_char_by_uuid(info, HAP_CHAR_UUID_NAME);
-    if (!hc) {
-        return;
-    }
-    hap_val_t val = {.s = (char *)name};
-    if (hap_char_update_val_silent(hc, &val) == HAP_SUCCESS) {
-        snprintf(slot->acc_name, sizeof(slot->acc_name), "%s", name);
-    }
-}
-
 static void update_char_float(hap_char_t *hc, float v, float lo, float hi)
 {
     if (!hc) {
@@ -380,12 +361,26 @@ static void update_char_bool(hap_char_t *hc, bool v)
 }
 
 /**
- * Push an On-state change that Home must see. Re-arms EV for all live sessions
- * and forces a value edge if needed so EVENT/1.0 is queued. Do NOT close the
- * session here — that raced the EVENT write and made Home miss updates until
- * lock→unlock. Undelivered EVENTs trigger provoke from the HAP notify path.
+ * Push an On-state change that Home must see. Re-arms EV on live sessions.
+ * Do NOT force a false→true edge here — that briefly published OFF and made
+ * Home flip switches back after a successful On write (CK-BL702 / plugs).
  */
 static void update_char_bool_notify(hap_char_t *hc, bool v)
+{
+    if (!hc) {
+        return;
+    }
+    const hap_val_t *cur = hap_char_get_val(hc);
+    if (cur && cur->b == v) {
+        return;
+    }
+    hap_char_enable_notif_all_sessions(hc);
+    hap_val_t val = {.b = v};
+    hap_char_update_val(hc, &val);
+}
+
+/** Remote button latches: force an edge so Home sees a press when value is unchanged. */
+static void update_char_bool_notify_edge(hap_char_t *hc, bool v)
 {
     if (!hc) {
         return;
@@ -486,7 +481,7 @@ static int switch_bulk_read(hap_read_data_t read_data[], int count, void *serv_p
 
 static zb_device_kind_t effective_kind(const zb_device_t *d)
 {
-    return zigbee_host_device_kind(d);
+    return zigbee_host_hk_kind(d);
 }
 
 static void format_serial(const uint8_t eui64[8], char *serial, size_t serial_len)
@@ -618,6 +613,8 @@ static int switch_write(hap_write_data_t write_data[], int count, void *serv_pri
                 ret = HAP_FAIL;
                 continue;
             }
+            /* Hold off attribute echoes so Home UI is not flipped back mid-command. */
+            slot->onoff_hold_until_us = esp_timer_get_time() + 3000000LL;
             hap_char_update_val(w->hc, &w->val);
             *(w->status) = HAP_STATUS_SUCCESS;
             ESP_LOGI(TAG, "HomeKit On/Off -> %s (queued)", on ? "ON" : "OFF");
@@ -696,6 +693,7 @@ static int light_write(hap_write_data_t write_data[], int count, void *serv_priv
                 ret = HAP_FAIL;
                 continue;
             }
+            slot->onoff_hold_until_us = esp_timer_get_time() + 3000000LL;
             hap_char_update_val(w->hc, &w->val);
             *(w->status) = HAP_STATUS_SUCCESS;
         } else if (!strcmp(uuid, HAP_CHAR_UUID_BRIGHTNESS)) {
@@ -944,6 +942,7 @@ static int irrigation_write(hap_write_data_t write_data[], int count, void *serv
                 ret = HAP_FAIL;
                 continue;
             }
+            slot->onoff_hold_until_us = esp_timer_get_time() + 3000000LL;
             hap_char_update_val(w->hc, &w->val);
             if (slot->in_use_char) {
                 hap_val_t iu = {.u = on ? 1 : 0};
@@ -1603,7 +1602,7 @@ static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8
             ESP_LOGW(TAG, "Remote btn %u stateful but On char NULL", (unsigned)button_index);
             return;
         }
-        update_char_bool_notify(hc, on);
+        update_char_bool_notify_edge(hc, on);
         /* Do NOT provoke (close all HAP sessions + mDNS) here. EVENT/1.0 is enough
          * when a controller is subscribed; provoke under a live portal Sniffer poll
          * has repeatedly starved C3 STA TX (ping/UI die). Idle Home may still need
@@ -1654,6 +1653,7 @@ static void on_sensor_update(const uint8_t eui64[8])
     hap_char_t *on_hc = NULL;
     hap_char_t *active_hc = NULL;
     hap_char_t *in_use_hc = NULL;
+    int64_t onoff_hold_until_us = 0;
     hap_char_t *thermo_temp[GROUP_MAX];
     hap_char_t *thermo_heat[GROUP_MAX];
     hap_char_t *thermo_hum[GROUP_MAX];
@@ -1691,11 +1691,13 @@ static void on_sensor_update(const uint8_t eui64[8])
             in_use_hc = s_bridged[i].in_use_char;
             batt_hc = s_bridged[i].batt_char;
             low_hc = s_bridged[i].low_batt_char;
+            onoff_hold_until_us = s_bridged[i].onoff_hold_until_us;
             break;
         }
         if (slot_kind == ZB_DEVICE_KIND_OUTLET || slot_kind == ZB_DEVICE_KIND_SWITCH ||
             slot_kind == ZB_DEVICE_KIND_LIGHT) {
             on_hc = s_bridged[i].on_char;
+            onoff_hold_until_us = s_bridged[i].onoff_hold_until_us;
             break;
         }
     }
@@ -1759,16 +1761,21 @@ static void on_sensor_update(const uint8_t eui64[8])
         }
     }
     if (active_hc || in_use_hc) {
-        bool on = d.has_onoff ? d.onoff_on : d.binary_on;
-        if (active_hc) {
-            update_char_uint8_notify(active_hc, on ? 1 : 0, 0, 1);
-        }
-        if (in_use_hc) {
-            update_char_uint8_notify(in_use_hc, on ? 1 : 0, 0, 1);
+        if (esp_timer_get_time() >= onoff_hold_until_us) {
+            bool on = d.has_onoff ? d.onoff_on : d.binary_on;
+            if (active_hc) {
+                update_char_uint8_notify(active_hc, on ? 1 : 0, 0, 1);
+            }
+            if (in_use_hc) {
+                update_char_uint8_notify(in_use_hc, on ? 1 : 0, 0, 1);
+            }
         }
     }
     if (on_hc && d.has_onoff) {
-        update_char_bool_notify(on_hc, d.onoff_on);
+        /* Skip echoes while a HomeKit write is in flight (CK-BL702 double-toggle). */
+        if (esp_timer_get_time() >= onoff_hold_until_us) {
+            update_char_bool_notify(on_hc, d.onoff_on);
+        }
     }
     if (d.has_battery) {
         if (batt_hc) {
@@ -1801,29 +1808,27 @@ static void on_sensor_update(const uint8_t eui64[8])
 static esp_err_t add_bridged_device(const zb_device_t *d)
 {
     zb_device_kind_t k = effective_kind(d);
+    esp_err_t err = ESP_ERR_NOT_SUPPORTED;
     if (k == ZB_DEVICE_KIND_LIGHT) {
-        return add_bridged_light(d);
+        err = add_bridged_light(d);
+    } else if (k == ZB_DEVICE_KIND_SWITCH) {
+        err = add_bridged_switch(d);
+    } else if (k == ZB_DEVICE_KIND_OUTLET) {
+        err = add_bridged_outlet(d);
+    } else if (k == ZB_DEVICE_KIND_IRRIGATION) {
+        err = add_bridged_irrigation(d);
+    } else if (k == ZB_DEVICE_KIND_SENSOR) {
+        err = add_bridged_sensor(d);
+    } else if (k == ZB_DEVICE_KIND_CONTACT || k == ZB_DEVICE_KIND_MOTION ||
+               k == ZB_DEVICE_KIND_LEAK || k == ZB_DEVICE_KIND_SMOKE) {
+        err = add_bridged_binary_sensor(d, k);
+    } else if (k == ZB_DEVICE_KIND_REMOTE) {
+        err = add_bridged_remote(d);
     }
-    if (k == ZB_DEVICE_KIND_SWITCH) {
-        return add_bridged_switch(d);
+    if (err == ESP_OK && k != ZB_DEVICE_KIND_UNKNOWN) {
+        (void)zigbee_host_hk_sticky_set(d->eui64, k);
     }
-    if (k == ZB_DEVICE_KIND_OUTLET) {
-        return add_bridged_outlet(d);
-    }
-    if (k == ZB_DEVICE_KIND_IRRIGATION) {
-        return add_bridged_irrigation(d);
-    }
-    if (k == ZB_DEVICE_KIND_SENSOR) {
-        return add_bridged_sensor(d);
-    }
-    if (k == ZB_DEVICE_KIND_CONTACT || k == ZB_DEVICE_KIND_MOTION || k == ZB_DEVICE_KIND_LEAK ||
-        k == ZB_DEVICE_KIND_SMOKE) {
-        return add_bridged_binary_sensor(d, k);
-    }
-    if (k == ZB_DEVICE_KIND_REMOTE) {
-        return add_bridged_remote(d);
-    }
-    return ESP_ERR_NOT_SUPPORTED;
+    return err;
 }
 
 static hk_group_bridged_t *find_group(uint8_t id)
@@ -2364,6 +2369,19 @@ static void sync_from_zigbee(void)
             remove_bridged(&s_bridged[i], "homekit_expose off");
             continue;
         }
+        zb_device_kind_t live = zigbee_host_device_kind(&d);
+        /* Heal climate devices stuck as Contact (name "Outdoors" etc.) even when
+         * sticky kind still locks the wrong accessory type. Same AID is reused. */
+        if (live == ZB_DEVICE_KIND_SENSOR &&
+            (s_bridged[i].kind == ZB_DEVICE_KIND_CONTACT ||
+             s_bridged[i].kind == ZB_DEVICE_KIND_MOTION ||
+             s_bridged[i].kind == ZB_DEVICE_KIND_LEAK ||
+             s_bridged[i].kind == ZB_DEVICE_KIND_SMOKE)) {
+            ESP_LOGW(TAG, "HomeKit heal binary→sensor (preserve AID, re-set room/name once)");
+            remove_bridged(&s_bridged[i], "heal climate misclassify");
+            (void)zigbee_host_hk_sticky_clear(d.eui64);
+            continue;
+        }
         zb_device_kind_t want = effective_kind(&d);
         if (want == ZB_DEVICE_KIND_UNKNOWN) {
             /* Keep last-known accessory — dropping it wipes Home room/name. */
@@ -2371,9 +2389,8 @@ static void sync_from_zigbee(void)
             continue;
         }
         if (s_bridged[i].kind != want) {
-            /* Kind reclassify (e.g. contact→sensor) must not remove+re-add: Home
-             * stores room/custom name against the bridged AID. Rebuild only when
-             * the user toggles HomeKit expose off→on in the portal. */
+            /* Kind reclassify must not remove+re-add: Home stores room/custom
+             * name against the bridged AID. Toggle HomeKit expose off→on to rebuild. */
             ESP_LOGW(TAG, "HomeKit kind %d→%d — keeping accessory to preserve room/name",
                      (int)s_bridged[i].kind, (int)want);
             continue;
@@ -2382,11 +2399,14 @@ static void sync_from_zigbee(void)
             remove_bridged(&s_bridged[i], "remote switched to control mode");
             continue;
         }
+        /* Seed sticky kind for devices bridged before sticky existed. */
+        if (d.hk_sticky_kind == 0) {
+            (void)zigbee_host_hk_sticky_set(s_bridged[i].eui64, s_bridged[i].kind);
+        }
+        /* Do not push accessory Name here — Home owns room/custom name. Portal
+         * rename updates Zigbee inventory only; Name is set at accessory create. */
         if (s_bridged[i].kind == ZB_DEVICE_KIND_LIGHT) {
-            if (d.name[0]) {
-                update_accessory_name(&s_bridged[i], d.name);
-            }
-            if (d.has_onoff) {
+            if (d.has_onoff && esp_timer_get_time() >= s_bridged[i].onoff_hold_until_us) {
                 update_char_bool(s_bridged[i].on_char, d.onoff_on);
             }
             if (d.has_level) {
@@ -2395,22 +2415,18 @@ static void sync_from_zigbee(void)
             }
         } else if (s_bridged[i].kind == ZB_DEVICE_KIND_SWITCH ||
                    s_bridged[i].kind == ZB_DEVICE_KIND_OUTLET) {
-            if (d.name[0]) {
-                update_accessory_name(&s_bridged[i], d.name);
-            }
-            if (d.has_onoff) {
+            if (d.has_onoff && esp_timer_get_time() >= s_bridged[i].onoff_hold_until_us) {
                 update_char_bool(s_bridged[i].on_char, d.onoff_on);
             }
         } else if (s_bridged[i].kind == ZB_DEVICE_KIND_IRRIGATION) {
-            if (d.name[0]) {
-                update_accessory_name(&s_bridged[i], d.name);
-            }
-            bool on = d.has_onoff ? d.onoff_on : d.binary_on;
-            if (s_bridged[i].active_char) {
-                update_char_uint8(s_bridged[i].active_char, on ? 1 : 0, 0, 1);
-            }
-            if (s_bridged[i].in_use_char) {
-                update_char_uint8(s_bridged[i].in_use_char, on ? 1 : 0, 0, 1);
+            if (esp_timer_get_time() >= s_bridged[i].onoff_hold_until_us) {
+                bool on = d.has_onoff ? d.onoff_on : d.binary_on;
+                if (s_bridged[i].active_char) {
+                    update_char_uint8(s_bridged[i].active_char, on ? 1 : 0, 0, 1);
+                }
+                if (s_bridged[i].in_use_char) {
+                    update_char_uint8(s_bridged[i].in_use_char, on ? 1 : 0, 0, 1);
+                }
             }
             if (d.has_battery && s_bridged[i].batt_char) {
                 update_char_uint8(s_bridged[i].batt_char, d.battery_pct, 0, 100);
@@ -2420,9 +2436,6 @@ static void sync_from_zigbee(void)
                    s_bridged[i].kind == ZB_DEVICE_KIND_MOTION ||
                    s_bridged[i].kind == ZB_DEVICE_KIND_LEAK ||
                    s_bridged[i].kind == ZB_DEVICE_KIND_SMOKE) {
-            if (d.name[0]) {
-                update_accessory_name(&s_bridged[i], d.name);
-            }
             if (s_bridged[i].binary_char) {
                 if (s_bridged[i].kind == ZB_DEVICE_KIND_MOTION) {
                     update_char_bool(s_bridged[i].binary_char, d.binary_on);
@@ -2445,13 +2458,10 @@ static void sync_from_zigbee(void)
                 remove_all_bridged_for_eui(s_bridged[i].eui64, "remote button layout changed");
                 continue;
             }
-            if (d.name[0]) {
-                update_accessory_name(&s_bridged[i], d.name);
-            }
             for (uint8_t bi = 0; bi < nbtn && bi < ZB_REMOTE_MAX_BUTTONS; bi++) {
                 if (s_bridged[i].btn_mode_snap[bi] == ZB_BTN_MODE_STATEFUL &&
                     s_bridged[i].btn_on_char[bi]) {
-                    /* Silent sync — live presses use update_char_bool_notify. */
+                    /* Silent sync — live presses use update_char_bool_notify_edge. */
                     update_char_bool(s_bridged[i].btn_on_char[bi], d.btn_on[bi]);
                 }
                 char bname[24];
@@ -2474,9 +2484,6 @@ static void sync_from_zigbee(void)
                 update_char_uint8(s_bridged[i].low_batt_char, d.battery_pct < 20 ? 1 : 0, 0, 1);
             }
         } else {
-            if (d.name[0]) {
-                update_accessory_name(&s_bridged[i], d.name);
-            }
             if (d.has_temp) {
                 update_char_float(s_bridged[i].temp_char, d.temperature_c, 0.0f, 100.0f);
             }

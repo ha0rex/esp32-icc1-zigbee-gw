@@ -68,6 +68,7 @@ jobs:
 
       - name: Package artifacts
         run: |
+          set -e
           mkdir -p dist
           BIN=build/esp32_icc1_zigbee_gw.bin
           test -f "$BIN"
@@ -76,11 +77,43 @@ jobs:
           VER="${{ steps.ver.outputs.version }}"
           OTA_BRANCH="${{ steps.ch.outputs.branch }}"
           RAW_BIN="https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/${OTA_BRANCH}/esp32_icc1_zigbee_gw.bin"
+
+          # Commits since the previously published OTA build (same channel).
+          PREV=""
+          if git fetch --depth=1 origin "$OTA_BRANCH" 2>/dev/null; then
+            PREV=$(git show "origin/${OTA_BRANCH}:manifest.json" 2>/dev/null \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("commit") or "")' || true)
+          fi
+          if [ -n "$PREV" ] && git cat-file -e "${PREV}^{commit}" 2>/dev/null; then
+            git log --no-merges --pretty=format:'%h%x09%s' "${PREV}..HEAD" > /tmp/ota_changelog.txt || true
+          else
+            git log --no-merges -12 --pretty=format:'%h%x09%s' > /tmp/ota_changelog.txt || true
+          fi
+          head -n 25 /tmp/ota_changelog.txt > /tmp/ota_changelog_trim.txt || true
+          mv /tmp/ota_changelog_trim.txt /tmp/ota_changelog.txt
+
           python3 - <<PY
-          import json, subprocess, datetime
+          import json, subprocess, datetime, pathlib
           ver = "${VER}"
           sha = "${SHA256}"
           commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          changelog = []
+          log_path = pathlib.Path("/tmp/ota_changelog.txt")
+          if log_path.is_file():
+              for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  if "\t" in line:
+                      short, msg = line.split("\t", 1)
+                  else:
+                      parts = line.split(" ", 1)
+                      short = parts[0]
+                      msg = parts[1] if len(parts) > 1 else ""
+                  msg = msg.strip()
+                  if not msg:
+                      continue
+                  changelog.append({"sha": short.strip(), "message": msg})
           manifest = {
               "version": ver,
               "url": "${RAW_BIN}",
@@ -88,6 +121,7 @@ jobs:
               "channel": "${{ steps.ch.outputs.branch }}",
               "built": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "commit": commit,
+              "changelog": changelog,
           }
           open("dist/manifest.json", "w").write(json.dumps(manifest, indent=2) + "\n")
           print(json.dumps(manifest, indent=2))

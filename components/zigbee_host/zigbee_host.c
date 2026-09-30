@@ -616,6 +616,60 @@ zb_device_kind_t zigbee_host_device_kind(const zb_device_t *d)
     return ZB_DEVICE_KIND_UNKNOWN;
 }
 
+zb_device_kind_t zigbee_host_hk_kind(const zb_device_t *d)
+{
+    if (!d || !d->used) {
+        return ZB_DEVICE_KIND_UNKNOWN;
+    }
+    if (d->hk_sticky_kind > (uint8_t)ZB_DEVICE_KIND_UNKNOWN &&
+        d->hk_sticky_kind <= (uint8_t)ZB_DEVICE_KIND_SMOKE) {
+        return (zb_device_kind_t)d->hk_sticky_kind;
+    }
+    return zigbee_host_device_kind(d);
+}
+
+esp_err_t zigbee_host_hk_sticky_set(const uint8_t eui64[8], zb_device_kind_t kind)
+{
+    if (!eui64 || kind == ZB_DEVICE_KIND_UNKNOWN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(s_op_mutex, portMAX_DELAY);
+    status_lock();
+    zb_device_t *d = device_find_by_eui_locked(eui64);
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    if (d) {
+        if (d->hk_sticky_kind != (uint8_t)kind) {
+            d->hk_sticky_kind = (uint8_t)kind;
+            nvs_save_devices_locked();
+        }
+        err = ESP_OK;
+    }
+    status_unlock();
+    xSemaphoreGive(s_op_mutex);
+    return err;
+}
+
+esp_err_t zigbee_host_hk_sticky_clear(const uint8_t eui64[8])
+{
+    if (!eui64) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(s_op_mutex, portMAX_DELAY);
+    status_lock();
+    zb_device_t *d = device_find_by_eui_locked(eui64);
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    if (d) {
+        if (d->hk_sticky_kind != 0) {
+            d->hk_sticky_kind = 0;
+            nvs_save_devices_locked();
+        }
+        err = ESP_OK;
+    }
+    status_unlock();
+    xSemaphoreGive(s_op_mutex);
+    return err;
+}
+
 bool zigbee_host_is_onoff_actuator(const zb_device_t *d)
 {
     zb_device_kind_t k = zigbee_host_device_kind(d);
@@ -3618,6 +3672,10 @@ esp_err_t zigbee_host_update_device(const uint8_t eui64[8], const zb_device_upda
         }
         if (upd->set_homekit) {
             d->homekit_expose = upd->homekit_expose;
+            if (!upd->homekit_expose) {
+                /* Next expose cycle may reclassify (e.g. Contact→Sensor). */
+                d->hk_sticky_kind = 0;
+            }
         }
         if (upd->set_btn_modes) {
             uint8_t n = zigbee_host_remote_button_count(d);
