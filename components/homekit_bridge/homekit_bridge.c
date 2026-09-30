@@ -489,33 +489,70 @@ static zb_device_kind_t effective_kind(const zb_device_t *d)
     return zigbee_host_device_kind(d);
 }
 
-static void format_serial(const uint8_t eui64[8], zb_device_kind_t kind, char *serial,
-                          size_t serial_len)
+static void format_serial(const uint8_t eui64[8], char *serial, size_t serial_len)
 {
     /* hap_get_unique_aid() stores this string as an NVS key (max 15 chars).
-     * Zigbee EUIs are stored little-endian: unique node bytes are at the front. */
-    const char *pfx = "th";
-    if (kind == ZB_DEVICE_KIND_LIGHT) {
-        pfx = "lb";
-    } else if (kind == ZB_DEVICE_KIND_SWITCH) {
-        pfx = "sw";
-    } else if (kind == ZB_DEVICE_KIND_REMOTE) {
-        pfx = "rd";
-    } else if (kind == ZB_DEVICE_KIND_OUTLET) {
-        pfx = "ol";
-    } else if (kind == ZB_DEVICE_KIND_IRRIGATION) {
-        pfx = "ir";
-    } else if (kind == ZB_DEVICE_KIND_CONTACT) {
-        pfx = "ct";
-    } else if (kind == ZB_DEVICE_KIND_MOTION) {
-        pfx = "mo";
-    } else if (kind == ZB_DEVICE_KIND_LEAK) {
-        pfx = "lk";
-    } else if (kind == ZB_DEVICE_KIND_SMOKE) {
-        pfx = "sm";
-    }
-    snprintf(serial, serial_len, "%s%02x%02x%02x%02x%02x%02x", pfx, eui64[0], eui64[1], eui64[2],
+     * Kind must NOT be part of the key — contact→sensor (etc.) would mint a new
+     * AID and Home would drop room / custom name. Zigbee EUIs are little-endian:
+     * unique node bytes are at the front. */
+    snprintf(serial, serial_len, "zb%02x%02x%02x%02x%02x%02x", eui64[0], eui64[1], eui64[2],
              eui64[3], eui64[4], eui64[5]);
+}
+
+/** Peek an existing bridged AID in hap_main without allocating a new one. */
+static bool peek_hap_aid(const char *key, int *aid_out)
+{
+    if (!key || !aid_out) {
+        return false;
+    }
+    nvs_handle_t h;
+    if (nvs_open("hap_main", NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    int aid = 0;
+    size_t sz = sizeof(aid);
+    esp_err_t err = nvs_get_blob(h, key, &aid, &sz);
+    nvs_close(h);
+    if (err != ESP_OK || sz != sizeof(aid) || aid <= 1) {
+        return false;
+    }
+    *aid_out = aid;
+    return true;
+}
+
+/**
+ * Stable AID per EUI. Reclaims legacy kind-prefixed keys (th…/ct…/…) so devices
+ * that already have a Home room keep the same instance id across this upgrade.
+ */
+static int aid_for_device(const uint8_t eui64[8])
+{
+    char serial[20];
+    format_serial(eui64, serial, sizeof(serial));
+
+    int aid = 0;
+    if (peek_hap_aid(serial, &aid)) {
+        return hap_get_unique_aid(serial);
+    }
+
+    static const char *legacy_pfx[] = {"th", "lb", "sw", "rd", "ol", "ir",
+                                       "ct", "mo", "lk", "sm"};
+    char legacy[20];
+    for (size_t i = 0; i < sizeof(legacy_pfx) / sizeof(legacy_pfx[0]); i++) {
+        snprintf(legacy, sizeof(legacy), "%s%02x%02x%02x%02x%02x%02x", legacy_pfx[i], eui64[0],
+                 eui64[1], eui64[2], eui64[3], eui64[4], eui64[5]);
+        if (!peek_hap_aid(legacy, &aid)) {
+            continue;
+        }
+        nvs_handle_t h;
+        if (nvs_open("hap_main", NVS_READWRITE, &h) == ESP_OK) {
+            (void)nvs_set_blob(h, serial, &aid, sizeof(aid));
+            (void)nvs_commit(h);
+            nvs_close(h);
+        }
+        ESP_LOGI(TAG, "HomeKit AID migrate %s → %s (aid=%d)", legacy, serial, aid);
+        return aid;
+    }
+    return hap_get_unique_aid(serial);
 }
 
 static void fill_identity(const zb_device_t *d, zb_device_kind_t kind, char *name, size_t name_len,
@@ -555,7 +592,7 @@ static void fill_identity(const zb_device_t *d, zb_device_kind_t kind, char *nam
     } else {
         snprintf(model, model_len, "%s", "Zigbee Sensor");
     }
-    format_serial(d->eui64, kind, serial, serial_len);
+    format_serial(d->eui64, serial, serial_len);
 }
 
 static int switch_write(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv)
@@ -741,7 +778,7 @@ static esp_err_t add_bridged_light(const zb_device_t *d)
     slot->on_char = hap_serv_get_char_by_uuid(lb, HAP_CHAR_UUID_ON);
     slot->brightness_char = hap_serv_get_char_by_uuid(lb, HAP_CHAR_UUID_BRIGHTNESS);
 
-    int aid = hap_get_unique_aid(serial);
+    int aid = aid_for_device(d->eui64);
     hap_add_bridged_accessory(acc, aid);
     inventory_notify_changed();
 
@@ -805,7 +842,7 @@ static esp_err_t add_bridged_switch(const zb_device_t *d)
     hap_acc_add_serv(acc, sw_serv);
     slot->on_char = hap_serv_get_char_by_uuid(sw_serv, HAP_CHAR_UUID_ON);
 
-    int aid = hap_get_unique_aid(serial);
+    int aid = aid_for_device(d->eui64);
     hap_add_bridged_accessory(acc, aid);
     inventory_notify_changed();
 
@@ -869,7 +906,7 @@ static esp_err_t add_bridged_outlet(const zb_device_t *d)
     hap_acc_add_serv(acc, ol);
     slot->on_char = hap_serv_get_char_by_uuid(ol, HAP_CHAR_UUID_ON);
 
-    int aid = hap_get_unique_aid(serial);
+    int aid = aid_for_device(d->eui64);
     hap_add_bridged_accessory(acc, aid);
     inventory_notify_changed();
 
@@ -1020,7 +1057,7 @@ static esp_err_t add_bridged_irrigation(const zb_device_t *d)
         }
     }
 
-    int aid = hap_get_unique_aid(serial);
+    int aid = aid_for_device(d->eui64);
     hap_add_bridged_accessory(acc, aid);
     inventory_notify_changed();
 
@@ -1155,7 +1192,7 @@ static esp_err_t add_bridged_binary_sensor(const zb_device_t *d, zb_device_kind_
         }
     }
 
-    int aid = hap_get_unique_aid(serial);
+    int aid = aid_for_device(d->eui64);
     hap_add_bridged_accessory(acc, aid);
     inventory_notify_changed();
 
@@ -1243,7 +1280,7 @@ static esp_err_t add_bridged_sensor(const zb_device_t *d)
             hap_serv_get_char_by_uuid(batt_serv, HAP_CHAR_UUID_STATUS_LOW_BATTERY);
     }
 
-    int aid = hap_get_unique_aid(serial);
+    int aid = aid_for_device(d->eui64);
     hap_add_bridged_accessory(acc, aid);
     inventory_notify_changed();
 
@@ -1499,7 +1536,7 @@ static esp_err_t add_bridged_remote(const zb_device_t *d)
             hap_serv_get_char_by_uuid(batt_serv, HAP_CHAR_UUID_STATUS_LOW_BATTERY);
     }
 
-    int aid = hap_get_unique_aid(serial);
+    int aid = aid_for_device(d->eui64);
     hap_add_bridged_accessory(acc, aid);
     inventory_notify_changed();
 
@@ -2329,11 +2366,16 @@ static void sync_from_zigbee(void)
         }
         zb_device_kind_t want = effective_kind(&d);
         if (want == ZB_DEVICE_KIND_UNKNOWN) {
-            remove_bridged(&s_bridged[i], "unsupported device kind");
+            /* Keep last-known accessory — dropping it wipes Home room/name. */
+            ESP_LOGW(TAG, "HomeKit keep accessory despite unknown kind (preserve room/name)");
             continue;
         }
         if (s_bridged[i].kind != want) {
-            remove_bridged(&s_bridged[i], "device kind changed");
+            /* Kind reclassify (e.g. contact→sensor) must not remove+re-add: Home
+             * stores room/custom name against the bridged AID. Rebuild only when
+             * the user toggles HomeKit expose off→on in the portal. */
+            ESP_LOGW(TAG, "HomeKit kind %d→%d — keeping accessory to preserve room/name",
+                     (int)s_bridged[i].kind, (int)want);
             continue;
         }
         if (want == ZB_DEVICE_KIND_REMOTE && d.remote_type == ZB_REMOTE_TYPE_CONTROL) {

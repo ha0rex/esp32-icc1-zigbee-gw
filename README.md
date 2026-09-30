@@ -18,7 +18,7 @@ Phone / Home app / browser
      Zigbee mesh
 ```
 
-**Current firmware version:** `0.3.32` (see `PROJECT_VER` in `CMakeLists.txt`)
+**Current firmware version:** `0.3.33` (see `PROJECT_VER` in `CMakeLists.txt`)
 
 **Repo:** [ha0rex/esp32-icc1-zigbee-gw](https://github.com/ha0rex/esp32-icc1-zigbee-gw)
 
@@ -134,7 +134,7 @@ Supported kinds (portal chip + HomeKit when exposed):
 | **Contact / Motion / Leak / Smoke** | IAS Zone (or Occupancy for PIR) | Matching HomeKit sensor |
 | **Remote** | IKEA buttons | Programmable switches or control mode |
 
-**Sensors** (Sonoff SNZB-02 / SNZB-02D / TH01, etc.): temperature, humidity, battery → HomeKit. Classic SNZB-02 (TI `00:12:4b`) is a sleepy end device — **Read values** queues one ZCL frame until the next poll; press the sensor button shortly after so it can check in. Kind detection prefers temp/humidity (and climate model IDs) over contact name fingerprints, so names like **Outdoors** are not mistaken for door/contact sensors.
+**Sensors** (Sonoff SNZB-02 / SNZB-02D / TH01, etc.): temperature, humidity, battery → HomeKit. Classic SNZB-02 (TI `00:12:4b`) is a sleepy end device — **Read values** queues one ZCL frame until the next poll; press the sensor button shortly after so it can check in. Kind detection prefers temp/humidity (and climate model IDs) over contact name fingerprints, so names like **Outdoors** are not mistaken for door/contact sensors. Bridged HomeKit AIDs are stable per Zigbee EUI (not per kind), and kind reclassify no longer removes the accessory — otherwise Home drops room and custom name.
 
 **Sonoff SWV:** pairs as Irrigation; Active in Home opens/closes the valve. Flow metering and eWeLink schedules are not bridged.
 

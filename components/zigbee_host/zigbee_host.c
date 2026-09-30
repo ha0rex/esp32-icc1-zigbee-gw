@@ -3768,7 +3768,10 @@ uint16_t zigbee_host_count_homekit_exposed(void)
         }
         zb_device_kind_t k = zigbee_host_device_kind(d);
         if (k == ZB_DEVICE_KIND_LIGHT || k == ZB_DEVICE_KIND_SWITCH ||
-            k == ZB_DEVICE_KIND_SENSOR || k == ZB_DEVICE_KIND_REMOTE) {
+            k == ZB_DEVICE_KIND_OUTLET || k == ZB_DEVICE_KIND_IRRIGATION ||
+            k == ZB_DEVICE_KIND_SENSOR || k == ZB_DEVICE_KIND_REMOTE ||
+            k == ZB_DEVICE_KIND_CONTACT || k == ZB_DEVICE_KIND_MOTION ||
+            k == ZB_DEVICE_KIND_LEAK || k == ZB_DEVICE_KIND_SMOKE) {
             n++;
         }
     }
