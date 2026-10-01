@@ -1,15 +1,15 @@
-# ESP32-C3 + IKEA ICC-1 Zigbee → HomeKit Gateway
+# ESP32 + IKEA ICC-1 Zigbee → HomeKit Gateway
 
-ESP-IDF firmware for an **ESP32-C3 Super Mini** that hosts an **IKEA ICC-1 / ICC-A-1** Zigbee NCP (Silicon Labs EFR32MG1) and bridges Zigbee devices into **Apple HomeKit**.
+ESP-IDF firmware for an **ESP32** host that drives an **IKEA ICC-1 / ICC-A-1** Zigbee NCP (Silicon Labs EFR32MG1) and bridges Zigbee devices into **Apple HomeKit**.
 
-The ESP32-C3 is **not** the Zigbee radio. It speaks **EZSP over ASH over UART** to the ICC-1.
+The ESP32 is **not** the Zigbee radio. It speaks **EZSP over ASH over UART** to the ICC-1.
 
 ```
 Phone / Home app / browser
         │
    Wi‑Fi (portal :80, HomeKit :8118)
         │
-   ESP32-C3 application
+   ESP32 application (Wi‑Fi + HomeKit + portal)
         │
       EZSP → ASH → UART 115200 8N1
         │
@@ -18,9 +18,19 @@ Phone / Home app / browser
      Zigbee mesh
 ```
 
-**Current firmware version:** `0.3.37` (see `PROJECT_VER` in `CMakeLists.txt`)
+**Current firmware version:** `0.3.38` (see `PROJECT_VER` in `CMakeLists.txt`)
 
 **Repo:** [ha0rex/esp32-icc1-zigbee-gw](https://github.com/ha0rex/esp32-icc1-zigbee-gw)
+
+### Supported ESP32 boards
+
+| Status | Target | Notes |
+| --- | --- | --- |
+| **Tested** | **Seeed XIAO ESP32-S3 (Plus)** | Recommended. Enough DRAM/PSRAM for HomeKit + portal; UART defaults **GPIO2 TX / GPIO4 RX** |
+| Supported in-tree | ESP32-C3 Super Mini | Builds and OTA published, but **unstable in practice** (DRAM exhaustion / panic resets under HomeKit load). Prefer S3. |
+| Other ESP32 | Any IDF-supported chip | Should work if you set the **UART GPIOs**, flash size, and `idf.py set-target` for your board. No extra board support is required beyond Kconfig / `sdkconfig.defaults.<target>`. |
+
+One tree for all targets. Select the chip with `idf.py set-target …`. The portal **Overview** and **System → Diagnostics** show board name, chip id, and UART GPIOs. **OTA publishes per-target binaries**; the portal installs the image that matches the running chip (`esp32s3`, `esp32c3`, …).
 
 ---
 
@@ -32,35 +42,47 @@ Phone / Home app / browser
 | **Device types** | Climate sensors, lights, outlets, switches, irrigation valves, contact/motion/leak/smoke (IAS), IKEA remotes |
 | **HomeKit bridge** | Opt-in exposure of devices and groups; setup code `111-22-333` |
 | **Remotes** | HomeKit buttons (stateless/stateful) **or** direct control of lights/switches/groups |
-| **Grouped devices** | General groups + **temperature** thermostats (optional heater/cooler, gap & hysteresis, humidity-forced heat) or **humidity** regulators (humidifier/dehumidifier); **After power failure** on general groups (mains power-on/brownout only — not flash/USB reboot) |
+| **Grouped devices** | General groups + **temperature** thermostats (optional heater/cooler, gap & hysteresis, humidity-forced heat) or **humidity** regulators; **After power failure** on general groups (mains power-on/brownout only — not flash/USB reboot) |
 | **Portal** | SoftAP + home Wi‑Fi management (scan APs by BSSID for mesh, primary + secondary fallback) |
 | **Sniffer** | Live Zigbee RX/TX/EVT log with friendly device names |
-| **OTA** | Dual-slot update with **Stable** / **Nightly** channels (choice remembered on the device) |
+| **OTA** | Dual-slot update with **Stable** / **Nightly** channels; CI builds each target and the portal picks the matching binary |
+| **Backup** | **System → Backup & migrate** exports names / HomeKit / remotes / groups (Zigbee pairings stay on the ICC) |
 
 ---
 
 ## Hardware
 
-| ESP32-C3 Super Mini | ICC-1 |
+### ICC-1 wiring (common)
+
+| ESP32 | ICC-1 |
 | --- | --- |
-| **GPIO6 TX** | pad **2** / **PB15** / RX |
-| **GPIO7 RX** | pad **3** / **PB14** / TX |
+| **UART TX** | pad **2** / **PB15** / RX |
+| **UART RX** | pad **3** / **PB14** / TX |
 | **3.3V** | pad **11** / VDD |
 | **GND** | pad **12** / GND |
 
-- Flash: **4MB**
-- UART: **115200 8N1**, no RTS/CTS / reset / SWD assumed
+- UART: **115200 8N1**, no RTS/CTS / reset / SWD assumed for day-to-day use
 - **Never power the ICC from 5V**
+- Pick any free GPIOs on your board; set them in `sdkconfig` / menuconfig (`ICC_UART_TX_GPIO` / `ICC_UART_RX_GPIO`)
+
+### Tested defaults (in-tree)
+
+| Board | TX | RX | Flash / notes |
+| --- | --- | --- | --- |
+| **XIAO ESP32-S3 (Plus)** | GPIO**2** (D1) | GPIO**4** (D3) | 8–16MB; octal PSRAM when present. Do **not** use GPIO3 for RX (strapping). |
+| ESP32-C3 Super Mini | GPIO**6** | GPIO**7** | 4MB. Worked for bring-up but **ran out of DRAM** with HomeKit — not recommended. |
+
+Defaults live in `sdkconfig.defaults.esp32s3` / `sdkconfig.defaults.esp32c3`.
 
 ### ICC NCP firmware
 
-The ICC must already run EmberZNet NCP firmware, for example:
+The ICC must already run EmberZNet NCP firmware — see **[Flashing the ICC NCP](docs/icc-ncp-flash.md)** for SWD wiring, Simplicity Commander steps, and pinout. Example image:
 
 `NCP_USW_115k2_F256_678_PB14-PB15-PA0.s37`
 
 - EmberZNet **6.7.8.x**
 - EZSP protocol **v8**
-- ASH over UART @ **115200 8N1**
+- ASH over UART @ **115200 8N1** (NCP UART on **PB14/PB15**)
 
 ---
 
@@ -71,9 +93,11 @@ The ICC must already run EmberZNet NCP firmware, for example:
 ```bash
 . $HOME/esp/esp-idf/export.sh   # ESP-IDF v5.x / v6.x
 cd /path/to/esp32-icc1-zigbee-gw
-idf.py set-target esp32c3
+idf.py set-target esp32s3       # recommended; or esp32c3 / your chip
 idf.py build
 ```
+
+Switching target: `idf.py fullclean` then `idf.py set-target …` again.
 
 ### First flash (dual OTA partitions)
 
@@ -107,16 +131,32 @@ Expose devices from the **Devices** tab (`Expose to HomeKit`). Remotes in “Con
 
 ---
 
+## Migrating between ESP boards (keep Zigbee devices)
+
+Zigbee pairings and the mesh live on the **ICC-1**, not the ESP. ESP NVS holds friendly names, HomeKit expose flags, remote modes, and groups.
+
+1. On the **old ESP**, export a backup:
+   - Portal **System → Backup & migrate → Download backup**, or `./tools/backup-from-gateway.sh <ip> icc-backup.json`
+   - **Without ICC attached (USB):** `./tools/backup-from-gateway.sh --usb icc-backup.json` — reads the NVS partition over serial (devices are not shown in `/api/status` until ASH connects)
+2. Flash and set up the **new ESP** (Wi‑Fi SoftAP / home network).
+3. Power down, move the **same ICC-1** (UART + 3.3V + GND) onto the new board’s wiring.
+4. On the new portal: wait until devices reappear from the NCP (or restore registers them), then **System → Restore backup…** and pick the JSON.
+5. Re-add **HomeKit** on the new board (pairing is per-ESP); room/names for bridged accessories may need a one-time touch-up in Home.
+
+Do **not** form a new Zigbee network on the new ESP if the ICC still holds the old mesh.
+
+---
+
 ## Portal
 
 | Tab | Purpose |
 | --- | --- |
-| **Overview** | ICC/ASH/EZSP health, network, Wi‑Fi, HomeKit code |
+| **Overview** | Board type, ICC/ASH/EZSP health, network, Wi‑Fi, HomeKit code |
 | **Zigbee** | Form / leave network, channel & TX power, permit join |
 | **Devices** | Inventory (live value chips without redrawing rows), rename, interview, remove, HomeKit, remote config, button test — tap a row for details |
 | **Grouped devices** | General groups; temperature thermostats (heater and/or cooler, gap/hysteresis, optional humidity-forced heat); humidity regulators (±3 % RH) — tap a row to edit |
 | **Sniffer** | Live frames with `[device name]` labels; filter RX/TX/EVT |
-| **System** | Wi‑Fi (AP list → set primary/secondary, one Save), firmware OTA (Stable / Nightly), diagnostics, forget Wi‑Fi |
+| **System** | Wi‑Fi, firmware OTA (Stable / Nightly, **board-matched** binary), diagnostics (board + heap), backup/restore, forget Wi‑Fi |
 
 ---
 
@@ -136,7 +176,7 @@ Supported kinds (portal chip + HomeKit when exposed):
 
 **Sensors** (Sonoff SNZB-02 / SNZB-02D / TH01, etc.): temperature, humidity, battery → HomeKit. Classic SNZB-02 (TI `00:12:4b`) is a sleepy end device — **Read values** queues one ZCL frame until the next poll; press the sensor button shortly after so it can check in. Kind detection prefers temp/humidity (and climate model IDs) over contact name fingerprints, so names like **Outdoors** are not mistaken for door/contact sensors. Bridged HomeKit AIDs are stable per Zigbee EUI (not per kind). The bridged accessory **kind is sticky in NVS** so reboots do not rebuild as a different service type (which made Home reject room/name edits). A one-time heal still rewrites former Contact tiles that are actually climate sensors (same AID — set room/name once after that). After create, the bridge does **not** push Name updates (Home owns room/custom name). Plugs/switches ignore On/Off attribute echoes for a few seconds after a HomeKit write so the UI does not flip back (e.g. CK-BL702).
 
-Device **kinds are compile-time** in firmware (flash code). Only accessories you expose allocate HomeKit objects on the heap — unused kinds (e.g. irrigation when you have no valve) do **not** reserve RAM. Downloading per-model “drop-ins” from GitHub would **not** free heap on the ESP32-C3: TLS download buffers and a runtime loader cost more DRAM than the small classifier/HAP create paths they would replace. Heap pressure comes from the live device table, bridged accessory slots, task stacks, and portal/HAP buffers (trimmed in **0.3.37**).
+Device **kinds are compile-time** in firmware. Only accessories you expose allocate HomeKit objects on the heap. Heap pressure scales with live inventory, bridged accessories, and portal/HAP buffers — a common failure mode on the **ESP32-C3**. Prefer **ESP32-S3** (or another chip with more internal RAM / PSRAM).
 
 **Sonoff SWV:** pairs as Irrigation; Active in Home opens/closes the valve. Flow metering and eWeLink schedules are not bridged.
 
@@ -159,14 +199,14 @@ Limits: up to **16** devices, **8** groups × **8** members, **5** buttons per r
 
 On **System**, change the update channel dropdown (saved immediately), then **Check for update → Install update**.
 
-When an update is available the portal shows a **Changelog** from git commits since the previous publish on that channel.
+CI builds **each** published target (`esp32s3`, `esp32c3`, …). The browser reads the manifest and installs **`targets.<chip>.url`** for the running board (legacy top-level `url` remains a C3 fallback for older portals).
 
 | Channel | What you get |
 | --- | --- |
 | **Stable** | Production builds from `main` |
 | **Nightly** | Newer experimental builds from `dev` |
 
-The browser fetches the manifest/firmware from GitHub, then uploads the image to the gateway over local HTTP (the ESP32-C3 does not run HTTPS itself). Keep power applied during install; the gateway reboots when done.
+The browser fetches the manifest/firmware from GitHub, then uploads the image to the gateway over local HTTP. Keep power applied during install; the gateway reboots when done.
 
 Check compares **semantic** version numbers: downgrades are never offered. If you are already newer than the selected channel, the portal shows up to date.
 
@@ -174,8 +214,10 @@ Check compares **semantic** version numbers: downgrades are never offered. If yo
 
 ## Configuration
 
-See `sdkconfig.defaults` for defaults such as:
+See `sdkconfig.defaults` plus target files:
 
+- `sdkconfig.defaults.esp32s3` — GPIO2/4, flash/PSRAM for XIAO S3 Plus
+- `sdkconfig.defaults.esp32c3` — GPIO6/7, 4MB flash (legacy)
 - Portal `:80`, HomeKit `:8118`, setup code / setup ID
 - Dual OTA partitions (`ota_0` / `ota_1`, ~1.6 MiB each)
 - Wi‑Fi AMPDU disabled (avoids silent STA on some APs)
@@ -186,20 +228,20 @@ See `sdkconfig.defaults` for defaults such as:
 
 | Symptom | What to check |
 | --- | --- |
-| RX bytes = 0 / no RSTACK | TX↔RX crossed? Common GND? ICC on **3.3V**? NCP image flashed? |
-| CRC / garbage | Baud **115200**; correct 115k2 NCP build |
-| Portal dies, ping fails, USB still up | ESP32-C3 “silent STA” or mesh **client isolation**. Firmware recovers via gateway ARP silence (after quiet) and weak-RSSI roam (&lt; about −80 dBm). Overview shows **Last reset** (`panic` / `brownout` / `task_wdt` / …) when uptime restarts. Prefer pinning ≥ about −70 dBm. Disable AP client isolation, or join SoftAP `ICC1-Gateway-…` / `192.168.4.1` to reconfigure. |
-| Panic reboot / Min heap &lt; ~15 KiB | DRAM exhaustion on the C3 (HomeKit + tables + stacks). **0.3.37** caps inventory at 16 devices, drops the duplicate status device snapshot, and trims portal/sniffer buffers + key task stacks. Overview shows **Free / Min / Largest** heap. |
+| RX bytes = 0 / no RSTACK | TX↔RX crossed? Common GND? ICC on **3.3V**? NCP image flashed? On S3, RX on **GPIO4**, not GPIO3? |
+| CRC / garbage | Baud **115200**; correct 115k2 NCP build (PB14/PB15) |
+| Portal dies, ping fails, USB still up | “Silent STA” or mesh **client isolation**. Firmware recovers via gateway ARP silence (after quiet) and weak-RSSI roam (&lt; about −80 dBm). Overview shows **Last reset**. Prefer pinning ≥ about −70 dBm. |
+| Panic reboot / low min heap | Typical on **ESP32-C3** under HomeKit. Move to **ESP32-S3** (or another roomier chip). Overview shows **Free / Min / Largest** heap and **Board**. |
 | HomeKit “No Response” | Wait for deferred start; confirm `:8118`; try lock→unlock once after large inventory changes |
 | Remote does nothing in Home | Mode = HomeKit buttons? Exposed? For control mode, complete Touchlink to a **bulb** |
-| Sensor stuck / empty readings | **Read values**, then press the sensor button within a few seconds (sleepy devices only receive while polling). If identity keeps vanishing after reboot, NVS may be full — flash this build (reclaims legacy blobs) |
-| OTA check fails | Browser can reach GitHub? Portal on home Wi‑Fi? Correct Stable/Nightly channel published? |
+| Sensor stuck / empty readings | **Read values**, then press the sensor button within a few seconds (sleepy devices only receive while polling) |
+| OTA check fails | Browser can reach GitHub? Correct channel? Manifest has a URL for **this board’s chip**? |
 
-### Serial success snapshot
+### Serial success snapshot (XIAO ESP32-S3)
 
 ```
-ICC-1 Zigbee NCP
-UART: GPIO6 TX / GPIO7 RX @ 115200
+esp32s3 + ICC-1 Zigbee NCP gateway
+UART TX=GPIO2 RX=GPIO4 @ 115200
 ASH: connected
 EZSP: protocol version 8
 EmberZNet: 6.7.8.x

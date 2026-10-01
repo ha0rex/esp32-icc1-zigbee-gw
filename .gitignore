@@ -10,3 +10,4 @@ __pycache__/
 .DS_Store
 device_state_backup.json
 device_state_backup.pretty.json
+icc-backup.json

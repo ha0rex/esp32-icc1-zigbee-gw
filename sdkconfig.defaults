@@ -1,5 +1,6 @@
-# Target: ESP32-C3 Super Mini
-CONFIG_IDF_TARGET="esp32c3"
+# Shared defaults for ESP32-C3 and ESP32-S3 (target-specific pins in
+# sdkconfig.defaults.esp32c3 / sdkconfig.defaults.esp32s3).
+# Select with: idf.py set-target esp32c3 | esp32s3
 
 # Console / logging
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
@@ -10,9 +11,10 @@ CONFIG_LOG_MAXIMUM_LEVEL=5
 
 # FreeRTOS
 CONFIG_FREERTOS_HZ=1000
+# Wi‑Fi + portal + Zigbee bring-up on S3 (PSRAM path) needs more than the 3.5 KiB default.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
-# Flash / partitions — dual OTA slots (4MB) for GitHub main-channel updates
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# Flash / partitions — dual OTA slots (layout fits 4MB; S3 Plus may be 8MB chip)
 # CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE is not set
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
@@ -24,8 +26,7 @@ CONFIG_FW_OTA_MANIFEST_URL="https://raw.githubusercontent.com/ha0rex/esp32-icc1-
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 # CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL is not set
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
-# C3 has little RAM after HomeKit — prefer smaller cert set + dynamic TLS buffers.
-# Keep 8 KiB record size (4 KiB can break HomeKit pairing).
+# Prefer smaller cert set + dynamic TLS buffers (helps C3; fine on S3).
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
@@ -45,10 +46,8 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # Catch stack smashes that otherwise show up as opaque "panic" resets.
 CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
 
-# ICC UART defaults (overridable in menuconfig)
+# ICC UART (TX/RX GPIOs overridden per target)
 CONFIG_ICC_UART_PORT_NUM=1
-CONFIG_ICC_UART_TX_GPIO=6
-CONFIG_ICC_UART_RX_GPIO=7
 CONFIG_ICC_UART_BAUD=115200
 
 # SoftAP provisioning (home Wi-Fi via portal / NVS)
@@ -60,10 +59,6 @@ CONFIG_WIFI_SSID=""
 CONFIG_WIFI_PASSWORD=""
 CONFIG_WIFI_MAX_RETRY=10
 CONFIG_WEB_HTTP_PORT=80
-
-# C3 + some APs: AMPDU BA leaves STA associated but silent to LAN clients
-CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
-CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 
 # HomeKit (HAP httpd must not collide with portal on :80)
 # Bridge homes often have several controllers (iPhone + HomePod/ATV hubs). HAP
@@ -80,10 +75,8 @@ CONFIG_LWIP_MAX_ACTIVE_TCP=24
 CONFIG_LWIP_MAX_LISTENING_TCP=16
 CONFIG_LWIP_MAX_UDP_PCBS=16
 
-# Larger app partition for HomeKit + portal (see PARTITION_TABLE above)
-
 # Allow LOCK_TCPIP_CORE from Wi‑Fi health (GARP / gateway ARP). Without this,
-# etharp_* from a non-tcpip task races lwIP and can panic-reboot the C3.
+# etharp_* from a non-tcpip task races lwIP and can panic-reboot the chip.
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 
 # ASH / EZSP debug hex dumps

@@ -352,9 +352,20 @@ static esp_err_t api_status(httpd_req_t *req)
     json_escape(hk.status, hk_st, sizeof(hk_st));
 
     size_t pos = 0;
+#if CONFIG_IDF_TARGET_ESP32S3
+    const char *board_chip = "esp32s3";
+    const char *board_name = "ESP32-S3";
+#elif CONFIG_IDF_TARGET_ESP32C3
+    const char *board_chip = "esp32c3";
+    const char *board_name = "ESP32-C3";
+#else
+    const char *board_chip = CONFIG_IDF_TARGET;
+    const char *board_name = CONFIG_IDF_TARGET;
+#endif
     pos += (size_t)snprintf(
         s_json + pos, sizeof(s_json) - pos,
-        "{\"icc\":\"%s\",\"ash\":\"%s\",\"ezsp\":%u,\"ember\":\"%s\",\"eui64\":\"%s\","
+        "{\"board\":{\"chip\":\"%s\",\"name\":\"%s\",\"uart_tx\":%d,\"uart_rx\":%d},"
+        "\"icc\":\"%s\",\"ash\":\"%s\",\"ezsp\":%u,\"ember\":\"%s\",\"eui64\":\"%s\","
         "\"network\":\"%s\",\"node_type\":\"%s\",\"net_valid\":%s,\"channel\":%u,\"pan_id\":%u,"
         "\"epid\":\"%s\",\"tx_power\":%d,\"permit_join\":%u,\"device_count\":%u,"
         "\"wifi\":\"%s\",\"has_sta\":%s,\"ssid\":\"%s\",\"bssid\":\"%s\",\"ip\":\"%s\","
@@ -367,6 +378,7 @@ static esp_err_t api_status(httpd_req_t *req)
         "\"ezsp_cmd\":%lu,\"ezsp_rsp\":%lu,\"last_error\":\"%s\","
         "\"homekit\":{\"started\":%s,\"paired\":%s,\"setup_code\":\"%s\",\"setup_id\":\"%s\","
         "\"accessories\":%u,\"status\":\"%s\"},\"devices\":[",
+        board_chip, board_name, CONFIG_ICC_UART_TX_GPIO, CONFIG_ICC_UART_RX_GPIO,
         zigbee_host_icc_status_str(zb->icc_status), zigbee_host_ash_state_str(zb->ash_state),
         (unsigned)zb->ncp.protocol_version, ver, eui,
         zb->ncp.network_state_valid ? zigbee_host_network_state_str(zb->ncp.network_state) : "UNKNOWN",
@@ -1267,7 +1279,8 @@ static esp_err_t api_device_update(httpd_req_t *req)
             upd.set_btn_names = true;
             upd.btn_name_count = (uint8_t)n;
             for (int i = 0; i < n; i++) {
-                snprintf(upd.btn_names[i], sizeof(upd.btn_names[i]), "%s", names[i]);
+                strncpy(upd.btn_names[i], names[i], sizeof(upd.btn_names[i]) - 1);
+                upd.btn_names[i][sizeof(upd.btn_names[i]) - 1] = '\0';
             }
         }
     }

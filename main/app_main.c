@@ -1,6 +1,6 @@
 /**
  * @file app_main.c
- * @brief ESP32-C3 host for IKEA ICC-1 EmberZNet NCP (EZSP over ASH over UART).
+ * @brief ESP32-C3 / ESP32-S3 host for IKEA ICC-1 EmberZNet NCP (EZSP over ASH over UART).
  */
 
 #include <stdio.h>
@@ -43,7 +43,9 @@ void app_main(void)
 {
     esp_reset_reason_t rr = esp_reset_reason();
     ESP_LOGI(TAG, "================================================");
-    ESP_LOGI(TAG, "ESP32-C3 + ICC-1 Zigbee NCP gateway");
+    ESP_LOGI(TAG, "%s + ICC-1 Zigbee NCP gateway", CONFIG_IDF_TARGET);
+    ESP_LOGI(TAG, "UART TX=GPIO%d RX=GPIO%d @ %d", CONFIG_ICC_UART_TX_GPIO,
+             CONFIG_ICC_UART_RX_GPIO, CONFIG_ICC_UART_BAUD);
     ESP_LOGI(TAG, "Reset reason: %d", (int)rr);
     ESP_LOGI(TAG, "================================================");
 

@@ -1126,8 +1126,9 @@ esp_err_t group_create_thermostat(const char *name, uint8_t thermo_kind, const u
         }
         if (!eui_is_zero(hum_sens)) {
             zb_device_t hs;
-            if (!zigbee_host_get_device(hum_sens, &hs) || !hs.has_humidity) {
-                return ESP_ERR_INVALID_ARG;
+            /* Allow restore before ZCL interview has set has_humidity. */
+            if (!zigbee_host_get_device(hum_sens, &hs)) {
+                return ESP_ERR_NOT_FOUND;
             }
         }
     }

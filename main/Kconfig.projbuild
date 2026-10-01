@@ -4,22 +4,26 @@ menu "ICC-1 Zigbee Gateway"
 
         config ICC_UART_PORT_NUM
             int "UART port number"
-            range 0 1
+            range 0 2
             default 1
             help
-                ESP32-C3 UART port used for the ICC-1 NCP (EZSP/ASH).
+                UART port used for the ICC-1 NCP (EZSP/ASH).
 
         config ICC_UART_TX_GPIO
             int "UART TX GPIO (ESP -> ICC RX)"
+            default 2 if IDF_TARGET_ESP32S3
             default 6
             help
-                ESP32 TX connected to ICC pad 2 / PB15 / RX.
+                ESP TX → ICC pad 2 / PB15 / RX.
+                Defaults: C3 GPIO6, S3 GPIO2 (XIAO D1).
 
         config ICC_UART_RX_GPIO
             int "UART RX GPIO (ESP <- ICC TX)"
+            default 4 if IDF_TARGET_ESP32S3
             default 7
             help
-                ESP32 RX connected to ICC pad 3 / PB14 / TX.
+                ESP RX ← ICC pad 3 / PB14 / TX.
+                Defaults: C3 GPIO7, S3 GPIO4 (XIAO D3; avoid strapping GPIO3).
 
         config ICC_UART_BAUD
             int "UART baud rate"

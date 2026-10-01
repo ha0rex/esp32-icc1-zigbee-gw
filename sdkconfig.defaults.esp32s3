@@ -1,0 +1,24 @@
+# Seeed XIAO ESP32-S3 (Plus) — ICC UART: TX=GPIO2 (D1), RX=GPIO4 (D3)
+# Same physical pad as C3 TX; RX moved off strapping GPIO3.
+# Plus modules typically have 8–16MB flash; header size must be ≤ chip size.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+CONFIG_ICC_UART_TX_GPIO=2
+CONFIG_ICC_UART_RX_GPIO=4
+
+# Octal PSRAM on XIAO ESP32-S3 Plus — frees internal DRAM for HomeKit
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# HomeKit HAP calls mbedtls_sha512_* directly. With HW-SHA enabled, ESP-IDF
+# undefines MBEDTLS_SHA512_C on S3 (SOC has SHA512 accel) and drops those
+# symbols — link fails. Keep software SHA for HAP compatibility.
+# CONFIG_MBEDTLS_HARDWARE_SHA is not set
+
+# Still disable AMPDU — mesh APs can silent-STA on S3 too
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n

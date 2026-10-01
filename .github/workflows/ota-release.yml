@@ -4,7 +4,9 @@ name: OTA publish
 #   main  → branch ota          (Stable)
 #   dev   → branch ota-nightly  (Nightly)
 #
-# Manifests:
+# Manifests (board-aware targets.esp32s3 / targets.esp32c3; legacy url = C3 fallback):
+# Recommended production board: ESP32-S3. CI builds every matrix target so OTA
+# installs the binary that matches the running chip.
 #   https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/manifest.json
 #   https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota-nightly/manifest.json
 
@@ -22,8 +24,12 @@ permissions:
   contents: write
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32s3, esp32c3]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,7 +51,6 @@ jobs:
             echo "tag=ota-nightly" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "Source=$REF → publish branch from outputs"
 
       - name: Version stamp
         id: ver
@@ -55,30 +60,72 @@ jobs:
           DAY=$(date -u +%Y%m%d)
           VER="${BASE}-${DAY}.${SHA}"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "OTA version: $VER (${{ steps.ch.outputs.label }})"
+          echo "OTA version: $VER (${{ steps.ch.outputs.label }}) target=${{ matrix.target }}"
           sed -i -E "s/set\(PROJECT_VER \"[^\"]+\"\)/set(PROJECT_VER \"$VER\")/" CMakeLists.txt
 
       - name: Build (ESP-IDF)
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: latest
-          target: esp32c3
+          target: ${{ matrix.target }}
           path: .
           command: idf.py build
 
-      - name: Package artifacts
+      - name: Package artifact
         run: |
           set -e
           mkdir -p dist
           BIN=build/esp32_icc1_zigbee_gw.bin
           test -f "$BIN"
-          cp "$BIN" dist/esp32_icc1_zigbee_gw.bin
-          SHA256=$(sha256sum "$BIN" | awk '{print $1}')
-          VER="${{ steps.ver.outputs.version }}"
-          OTA_BRANCH="${{ steps.ch.outputs.branch }}"
-          RAW_BIN="https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/${OTA_BRANCH}/esp32_icc1_zigbee_gw.bin"
+          cp "$BIN" "dist/esp32_icc1_zigbee_gw-${{ matrix.target }}.bin"
+          sha256sum "$BIN" | awk '{print $1}' > "dist/esp32_icc1_zigbee_gw-${{ matrix.target }}.sha256"
+          echo "${{ steps.ver.outputs.version }}" > dist/version.txt
+          echo "${{ steps.ch.outputs.branch }}" > dist/ota_branch.txt
+          echo "${{ steps.ch.outputs.label }}" > dist/ota_label.txt
+          echo "${{ steps.ch.outputs.tag }}" > dist/ota_tag.txt
+          echo "${{ steps.ch.outputs.prerelease }}" > dist/ota_prerelease.txt
 
-          # Commits since the previously published OTA build (same channel).
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-${{ matrix.target }}
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: arts
+
+      - name: Assemble dist + manifest
+        run: |
+          set -e
+          mkdir -p dist
+          cp arts/fw-esp32c3/esp32_icc1_zigbee_gw-esp32c3.bin dist/
+          cp arts/fw-esp32s3/esp32_icc1_zigbee_gw-esp32s3.bin dist/
+          # Legacy filename = C3 (older portals / bookmarks)
+          cp dist/esp32_icc1_zigbee_gw-esp32c3.bin dist/esp32_icc1_zigbee_gw.bin
+          VER=$(cat arts/fw-esp32c3/version.txt)
+          OTA_BRANCH=$(cat arts/fw-esp32c3/ota_branch.txt)
+          LABEL=$(cat arts/fw-esp32c3/ota_label.txt)
+          SHA_C3=$(cat arts/fw-esp32c3/esp32_icc1_zigbee_gw-esp32c3.sha256)
+          SHA_S3=$(cat arts/fw-esp32s3/esp32_icc1_zigbee_gw-esp32s3.sha256)
+          echo "version=$VER" >> "$GITHUB_ENV"
+          echo "ota_branch=$OTA_BRANCH" >> "$GITHUB_ENV"
+          echo "ota_label=$LABEL" >> "$GITHUB_ENV"
+          echo "ota_tag=$(cat arts/fw-esp32c3/ota_tag.txt)" >> "$GITHUB_ENV"
+          echo "ota_prerelease=$(cat arts/fw-esp32c3/ota_prerelease.txt)" >> "$GITHUB_ENV"
+          echo "sha_c3=$SHA_C3" >> "$GITHUB_ENV"
+          echo "sha_s3=$SHA_S3" >> "$GITHUB_ENV"
+
           PREV=""
           if git fetch --depth=1 origin "$OTA_BRANCH" 2>/dev/null; then
             PREV=$(git show "origin/${OTA_BRANCH}:manifest.json" 2>/dev/null \
@@ -93,9 +140,13 @@ jobs:
           mv /tmp/ota_changelog_trim.txt /tmp/ota_changelog.txt
 
           python3 - <<PY
-          import json, subprocess, datetime, pathlib
+          import json, subprocess, datetime, pathlib, os
+          ver = os.environ["VER"] if "VER" in os.environ else "${VER}"
           ver = "${VER}"
-          sha = "${SHA256}"
+          ota_branch = "${OTA_BRANCH}"
+          sha_c3 = "${SHA_C3}"
+          sha_s3 = "${SHA_S3}"
+          raw = f"https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/{ota_branch}"
           commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           changelog = []
           log_path = pathlib.Path("/tmp/ota_changelog.txt")
@@ -116,9 +167,19 @@ jobs:
                   changelog.append({"sha": short.strip(), "message": msg})
           manifest = {
               "version": ver,
-              "url": "${RAW_BIN}",
-              "sha256": sha,
-              "channel": "${{ steps.ch.outputs.branch }}",
+              "url": f"{raw}/esp32_icc1_zigbee_gw.bin",
+              "sha256": sha_c3,
+              "targets": {
+                  "esp32c3": {
+                      "url": f"{raw}/esp32_icc1_zigbee_gw-esp32c3.bin",
+                      "sha256": sha_c3,
+                  },
+                  "esp32s3": {
+                      "url": f"{raw}/esp32_icc1_zigbee_gw-esp32s3.bin",
+                      "sha256": sha_s3,
+                  },
+              },
+              "channel": ota_branch,
               "built": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "commit": commit,
               "changelog": changelog,
@@ -132,35 +193,42 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          OTA_BRANCH="${{ steps.ch.outputs.branch }}"
+          OTA_BRANCH="${{ env.ota_branch }}"
           WORK=$(mktemp -d)
-          cp dist/esp32_icc1_zigbee_gw.bin dist/manifest.json "$WORK/"
+          cp dist/esp32_icc1_zigbee_gw.bin \
+             dist/esp32_icc1_zigbee_gw-esp32c3.bin \
+             dist/esp32_icc1_zigbee_gw-esp32s3.bin \
+             dist/manifest.json "$WORK/"
           cd "$WORK"
           git init
           git checkout -b "$OTA_BRANCH"
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          git add esp32_icc1_zigbee_gw.bin manifest.json
-          git commit -m "OTA ${{ steps.ver.outputs.version }} (${{ steps.ch.outputs.label }})"
+          git add .
+          git commit -m "OTA ${{ env.version }} (${{ env.ota_label }}) c3+s3"
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/ha0rex/esp32-icc1-zigbee-gw.git"
           git push -f origin "$OTA_BRANCH"
 
       - name: Publish rolling release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.ch.outputs.tag }}
-          name: ${{ steps.ch.outputs.label }} firmware
-          prerelease: ${{ steps.ch.outputs.prerelease }}
-          make_latest: ${{ steps.ch.outputs.tag == 'ota' }}
+          tag_name: ${{ env.ota_tag }}
+          name: ${{ env.ota_label }} firmware
+          prerelease: ${{ env.ota_prerelease }}
+          make_latest: ${{ env.ota_tag == 'ota' }}
           generate_release_notes: false
           body: |
-            Rolling **${{ steps.ch.outputs.label }}** channel from `${{ github.ref_name }}`.
-            Version: `${{ steps.ver.outputs.version }}`
+            Rolling **${{ env.ota_label }}** channel from `${{ github.ref_name }}`.
+            Version: `${{ env.version }}`
+
+            Binaries: `esp32c3` + `esp32s3` (legacy `esp32_icc1_zigbee_gw.bin` = C3).
 
             Manifest:
-            `https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/${{ steps.ch.outputs.branch }}/manifest.json`
+            `https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/${{ env.ota_branch }}/manifest.json`
           files: |
             dist/esp32_icc1_zigbee_gw.bin
+            dist/esp32_icc1_zigbee_gw-esp32c3.bin
+            dist/esp32_icc1_zigbee_gw-esp32s3.bin
             dist/manifest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
