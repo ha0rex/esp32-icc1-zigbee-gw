@@ -1,0 +1,14 @@
+{
+  "version": "0.3.37-20261001.ab115b8f",
+  "url": "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota-nightly/esp32_icc1_zigbee_gw.bin",
+  "sha256": "366563c7d201e683dd3308b273540e5d2f0144df3c80eccdffbd1fc24e916c9d",
+  "channel": "ota-nightly",
+  "built": "2026-10-01T06:10:14Z",
+  "commit": "ab115b8fa076830ec2170cd124e31170fdbe632d",
+  "changelog": [
+    {
+      "sha": "ab115b8",
+      "message": "Reclaim ESP32-C3 DRAM to reduce HomeKit panic resets."
+    }
+  ]
+}
