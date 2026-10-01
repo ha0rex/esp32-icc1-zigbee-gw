@@ -1124,7 +1124,7 @@ esp_err_t wifi_manager_start(void)
         }
     }
     if (!s_wifi_health_task) {
-        if (xTaskCreate(wifi_health_task, "wifi_health", 8192, NULL, 4, &s_wifi_health_task) !=
+        if (xTaskCreate(wifi_health_task, "wifi_health", 6144, NULL, 4, &s_wifi_health_task) !=
             pdPASS) {
             s_wifi_health_task = NULL;
             ESP_LOGW(TAG, "Wi-Fi health task create failed");

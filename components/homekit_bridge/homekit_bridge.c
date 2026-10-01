@@ -2785,7 +2785,7 @@ static void homekit_start_task(void *arg)
     hap_cfg_t hap_cfg;
     hap_get_config(&hap_cfg);
     hap_cfg.task_priority = 3; /* Below Wi‑Fi/lwIP; was 5 and starved STA on C3 */
-    hap_cfg.task_stack_size = 12288;
+    hap_cfg.task_stack_size = 10240;
     hap_cfg.max_event_notif_chars = 48; /* Sensors + 5 remote buttons must not drop EV */
     /* Re-attaching bridged sensors on boot must not bump c# — that makes Home
      * forget room assignment and user-chosen names. */
@@ -2859,7 +2859,7 @@ static void homekit_start_task(void *arg)
              CONFIG_HK_SETUP_CODE, CONFIG_HK_SETUP_ID, (unsigned)s_st.accessory_count);
 
     if (!s_sync_task) {
-        xTaskCreate(sync_task, "hk_sync", 8192, NULL, 3, &s_sync_task);
+        xTaskCreate(sync_task, "hk_sync", 6144, NULL, 3, &s_sync_task);
     }
     vTaskDelete(NULL);
 }
@@ -2877,7 +2877,7 @@ esp_err_t homekit_bridge_start(void)
     snprintf(s_st.setup_code, sizeof(s_st.setup_code), "%s", CONFIG_HK_SETUP_CODE);
     snprintf(s_st.setup_id, sizeof(s_st.setup_id), "%s", CONFIG_HK_SETUP_ID);
     snprintf(s_st.status, sizeof(s_st.status), "starting");
-    if (xTaskCreate(homekit_start_task, "hk_start", 12288, NULL, 4, NULL) != pdPASS) {
+    if (xTaskCreate(homekit_start_task, "hk_start", 8192, NULL, 4, NULL) != pdPASS) {
         snprintf(s_st.status, sizeof(s_st.status), "no mem");
         return ESP_ERR_NO_MEM;
     }

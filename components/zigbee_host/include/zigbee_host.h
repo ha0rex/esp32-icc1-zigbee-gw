@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-#define ZB_HOST_MAX_DEVICES 32
+#define ZB_HOST_MAX_DEVICES 16
 
 typedef enum {
     ICC_STATUS_UNKNOWN = 0,
@@ -136,8 +136,9 @@ typedef struct {
     uint32_t connect_successes;
     uint8_t permit_join_remaining; /**< 0 = closed; approx seconds left */
     uint16_t device_count;
-    zb_device_t devices[ZB_HOST_MAX_DEVICES];
     char last_error[96];
+    /* Device slots live in zigbee_host.c (s_devices[]) — not copied into status
+     * snapshots. Portal/HomeKit use zigbee_host_get_device*() instead. */
 } zigbee_host_status_t;
 
 typedef struct {

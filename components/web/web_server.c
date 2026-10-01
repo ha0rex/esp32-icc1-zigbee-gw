@@ -28,16 +28,17 @@
 #include "ezsp.h"
 #include "fw_ota.h"
 #include "esp_app_desc.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 
 static const char *TAG = "web";
 static httpd_handle_t s_server;
 static SemaphoreHandle_t s_scan_mutex;
 static SemaphoreHandle_t s_root_mu; /**< At most one full portal HTML send */
-static char s_scan_json[4096];
-static wifi_scan_ap_t s_scan_aps[24];
-static char s_json[12288];
-/* Heap buffer for status snapshot — avoids multi-KB stack copies. */
+static char s_scan_json[2048];
+static wifi_scan_ap_t s_scan_aps[12];
+static char s_json[8192];
+/* Light status snapshot — devices are fetched via zigbee_host_get_device_at(). */
 static zigbee_host_status_t s_zb_snap;
 static int64_t s_last_handler_us; /**< Last successful URI handler completion */
 static int64_t s_root_held_us;    /**< When root HTML mutex was taken (0 = free) */
@@ -361,7 +362,7 @@ static esp_err_t api_status(httpd_req_t *req)
         "\"primary_ssid\":\"%s\",\"primary_bssid\":\"%s\",\"primary_bssid_set\":%s,"
         "\"secondary_ssid\":\"%s\",\"secondary_bssid\":\"%s\",\"secondary_bssid_set\":%s,"
         "\"has_secondary\":%s,\"active_slot\":%u,\"uptime\":\"%s\","
-        "\"reset_reason\":\"%s\",\"free_heap\":%u,\"min_free_heap\":%u,"
+        "\"reset_reason\":\"%s\",\"free_heap\":%u,\"min_free_heap\":%u,\"largest_heap\":%u,"
         "\"tx\":%lu,\"rx\":%lu,\"ash_ok\":%lu,\"ash_bad\":%lu,\"crc_err\":%lu,\"timeouts\":%lu,"
         "\"ezsp_cmd\":%lu,\"ezsp_rsp\":%lu,\"last_error\":\"%s\","
         "\"homekit\":{\"started\":%s,\"paired\":%s,\"setup_code\":\"%s\",\"setup_id\":\"%s\","
@@ -380,6 +381,7 @@ static esp_err_t api_status(httpd_req_t *req)
         wifi.secondary_bssid_set ? "true" : "false", wifi.has_secondary ? "true" : "false",
         (unsigned)wifi.active_slot, uptime, reset_reason_json(), (unsigned)esp_get_free_heap_size(),
         (unsigned)esp_get_minimum_free_heap_size(),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
         (unsigned long)zb->ash_stats.tx_bytes,
         (unsigned long)zb->ash_stats.rx_bytes, (unsigned long)zb->ash_stats.valid_frames,
         (unsigned long)zb->ash_stats.invalid_frames, (unsigned long)zb->ash_stats.crc_errors,
@@ -389,10 +391,11 @@ static esp_err_t api_status(httpd_req_t *req)
 
     bool first = true;
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES && pos + 720 < sizeof(s_json); i++) {
-        const zb_device_t *d = &zb->devices[i];
-        if (!d->used) {
+        zb_device_t dslot;
+        if (!zigbee_host_get_device_at(i, &dslot)) {
             continue;
         }
+        const zb_device_t *d = &dslot;
         char deui[40], dlab[80], dname[80], dman[80], dmodel[80], dfw[80];
         ezsp_format_eui64(d->eui64, deui, sizeof(deui));
         json_escape(d->label, dlab, sizeof(dlab));
@@ -1358,7 +1361,7 @@ static esp_err_t api_zigbee_sniff(httpd_req_t *req)
 {
     /* Must be static: EZSP_SNIFF_LOG entries are too large for the httpd task stack
      * (stack overflow → random reboot whenever the Sniffer tab polls). */
-    static char sniff_json[3072];
+    static char sniff_json[1536];
     static ezsp_sniff_entry_t s_entries[EZSP_SNIFF_LOG];
     static SemaphoreHandle_t s_sniff_api_mu;
     const uint32_t seq = ezsp_sniff_seq();

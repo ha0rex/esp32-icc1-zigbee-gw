@@ -1206,6 +1206,7 @@ static const char WEB_APP_HTML[] =
 "['Uptime',S.uptime],['Last reset',S.reset_reason||'—'],"
 "['Free heap',S.free_heap!=null?(Math.round(S.free_heap/1024)+' KiB'):'—'],"
 "['Min heap',S.min_free_heap!=null?(Math.round(S.min_free_heap/1024)+' KiB'):'—'],"
+"['Largest block',S.largest_heap!=null?(Math.round(S.largest_heap/1024)+' KiB'):'—'],"
 "['RSSI',S.rssi!=null?(S.rssi+' dBm'):'—']]);"
 "const hk=S.homekit||{};"
 "kv($('#hkKv'),["

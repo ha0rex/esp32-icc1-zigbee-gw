@@ -18,7 +18,7 @@ Phone / Home app / browser
      Zigbee mesh
 ```
 
-**Current firmware version:** `0.3.35` (see `PROJECT_VER` in `CMakeLists.txt`)
+**Current firmware version:** `0.3.37` (see `PROJECT_VER` in `CMakeLists.txt`)
 
 **Repo:** [ha0rex/esp32-icc1-zigbee-gw](https://github.com/ha0rex/esp32-icc1-zigbee-gw)
 
@@ -136,6 +136,8 @@ Supported kinds (portal chip + HomeKit when exposed):
 
 **Sensors** (Sonoff SNZB-02 / SNZB-02D / TH01, etc.): temperature, humidity, battery → HomeKit. Classic SNZB-02 (TI `00:12:4b`) is a sleepy end device — **Read values** queues one ZCL frame until the next poll; press the sensor button shortly after so it can check in. Kind detection prefers temp/humidity (and climate model IDs) over contact name fingerprints, so names like **Outdoors** are not mistaken for door/contact sensors. Bridged HomeKit AIDs are stable per Zigbee EUI (not per kind). The bridged accessory **kind is sticky in NVS** so reboots do not rebuild as a different service type (which made Home reject room/name edits). A one-time heal still rewrites former Contact tiles that are actually climate sensors (same AID — set room/name once after that). After create, the bridge does **not** push Name updates (Home owns room/custom name). Plugs/switches ignore On/Off attribute echoes for a few seconds after a HomeKit write so the UI does not flip back (e.g. CK-BL702).
 
+Device **kinds are compile-time** in firmware (flash code). Only accessories you expose allocate HomeKit objects on the heap — unused kinds (e.g. irrigation when you have no valve) do **not** reserve RAM. Downloading per-model “drop-ins” from GitHub would **not** free heap on the ESP32-C3: TLS download buffers and a runtime loader cost more DRAM than the small classifier/HAP create paths they would replace. Heap pressure comes from the live device table, bridged accessory slots, task stacks, and portal/HAP buffers (trimmed in **0.3.37**).
+
 **Sonoff SWV:** pairs as Irrigation; Active in Home opens/closes the valve. Flow metering and eWeLink schedules are not bridged.
 
 **Lights / outlets / switches:** On/Off; lights also map brightness (Level Control).
@@ -149,7 +151,7 @@ Supported kinds (portal chip + HomeKit when exposed):
 
 **Touchlink (control mode):** after join, hold the remote **≤5 cm from a real bulb** until the bulb flashes. The gateway learns that group and removes the lights from it so presses go to the gateway only. Holding the remote toward the gateway alone does **not** bind.
 
-Limits: up to **32** devices, **8** groups × **8** members, **5** buttons per remote, **8** control targets.
+Limits: up to **16** devices, **8** groups × **8** members, **5** buttons per remote, **8** control targets.
 
 ---
 
@@ -187,6 +189,7 @@ See `sdkconfig.defaults` for defaults such as:
 | RX bytes = 0 / no RSTACK | TX↔RX crossed? Common GND? ICC on **3.3V**? NCP image flashed? |
 | CRC / garbage | Baud **115200**; correct 115k2 NCP build |
 | Portal dies, ping fails, USB still up | ESP32-C3 “silent STA” or mesh **client isolation**. Firmware recovers via gateway ARP silence (after quiet) and weak-RSSI roam (&lt; about −80 dBm). Overview shows **Last reset** (`panic` / `brownout` / `task_wdt` / …) when uptime restarts. Prefer pinning ≥ about −70 dBm. Disable AP client isolation, or join SoftAP `ICC1-Gateway-…` / `192.168.4.1` to reconfigure. |
+| Panic reboot / Min heap &lt; ~15 KiB | DRAM exhaustion on the C3 (HomeKit + tables + stacks). **0.3.37** caps inventory at 16 devices, drops the duplicate status device snapshot, and trims portal/sniffer buffers + key task stacks. Overview shows **Free / Min / Largest** heap. |
 | HomeKit “No Response” | Wait for deferred start; confirm `:8118`; try lock→unlock once after large inventory changes |
 | Remote does nothing in Home | Mode = HomeKit buttons? Exposed? For control mode, complete Touchlink to a **bulb** |
 | Sensor stuck / empty readings | **Read values**, then press the sensor button within a few seconds (sleepy devices only receive while polling). If identity keeps vanishing after reboot, NVS may be full — flash this build (reclaims legacy blobs) |

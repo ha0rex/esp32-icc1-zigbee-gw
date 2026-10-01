@@ -328,8 +328,8 @@ typedef struct {
 } ezsp_zcl_message_t;
 
 /** Portal sniffer ring-buffer entry (raw Zigbee RX/TX/events). */
-#define EZSP_SNIFF_LOG  32
-#define EZSP_SNIFF_DATA 48
+#define EZSP_SNIFF_LOG  8
+#define EZSP_SNIFF_DATA 32
 typedef enum {
     EZSP_SNIFF_RX = 0,
     EZSP_SNIFF_TX = 1,

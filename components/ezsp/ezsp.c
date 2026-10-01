@@ -122,7 +122,7 @@ static void sent_q_push(uint16_t node, uint16_t cluster, uint8_t status)
     }
 }
 
-#define EZSP_ZCL_Q_LEN 24
+#define EZSP_ZCL_Q_LEN 12
 static ezsp_zcl_message_t s_zcl_q[EZSP_ZCL_Q_LEN];
 static uint8_t s_zcl_q_head;
 static uint8_t s_zcl_q_tail;

@@ -25,8 +25,11 @@ static const char *TAG = "zigbee_host";
 #define NVS_NS "zb_net"
 
 static zigbee_host_status_t s_status;
-/** Heap scratch for NVS pack/migrate — allocated only while saving (frees ~15 KiB BSS). */
+/** Device inventory (separate from status so portal snapshots stay ~200 B). */
+static zb_device_t s_devices[ZB_HOST_MAX_DEVICES];
+/** Heap scratch for NVS pack/migrate — allocated only while saving. */
 static zb_device_t *s_nvs_scratch;
+static uint16_t s_nvs_scratch_cap;
 /** Button latch/name changes mark dirty; flush off the hot path (NVS flash freezes status_lock). */
 static volatile bool s_devices_nvs_dirty;
 static int64_t s_devices_nvs_last_flush_ms;
@@ -640,7 +643,9 @@ esp_err_t zigbee_host_hk_sticky_set(const uint8_t eui64[8], zb_device_kind_t kin
     if (d) {
         if (d->hk_sticky_kind != (uint8_t)kind) {
             d->hk_sticky_kind = (uint8_t)kind;
-            nvs_save_devices_locked();
+            /* Defer flash — immediate save allocates ~device-table DRAM and panics the C3
+             * when HomeKit/portal are already tight on heap. */
+            s_devices_nvs_dirty = true;
         }
         err = ESP_OK;
     }
@@ -661,7 +666,7 @@ esp_err_t zigbee_host_hk_sticky_clear(const uint8_t eui64[8])
     if (d) {
         if (d->hk_sticky_kind != 0) {
             d->hk_sticky_kind = 0;
-            nvs_save_devices_locked();
+            s_devices_nvs_dirty = true;
         }
         err = ESP_OK;
     }
@@ -977,7 +982,7 @@ static void migrate_e1810_btn_order_locked(void)
     }
     bool changed = false;
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        zb_device_t *d = &s_status.devices[i];
+        zb_device_t *d = &s_devices[i];
         if (!d->used || zigbee_host_remote_button_count(d) < 5) {
             continue;
         }
@@ -1733,7 +1738,7 @@ static void detach_lights_from_group_unlocked(uint16_t gid, uint16_t remote_node
     uint16_t ndetach = 0;
     status_lock();
     for (uint16_t di = 0; di < ZB_HOST_MAX_DEVICES; di++) {
-        zb_device_t *ld = &s_status.devices[di];
+        zb_device_t *ld = &s_devices[di];
         if (!ld->used || ld->node_id == 0 || ld->node_id == remote_node) {
             continue;
         }
@@ -1749,7 +1754,7 @@ static void detach_lights_from_group_unlocked(uint16_t gid, uint16_t remote_node
         /* Keep CONTROL targets — they need native Level groupcasts for dimming. */
         bool is_ctrl_target = false;
         for (uint16_t ri = 0; ri < ZB_HOST_MAX_DEVICES; ri++) {
-            zb_device_t *rd = &s_status.devices[ri];
+            zb_device_t *rd = &s_devices[ri];
             if (!rd->used || rd->remote_type != ZB_REMOTE_TYPE_CONTROL) {
                 continue;
             }
@@ -1951,17 +1956,17 @@ static void device_upsert_locked(const uint8_t eui64[8], uint16_t node_id, uint8
     }
 
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (s_status.devices[i].used && memcmp(s_status.devices[i].eui64, eui64, 8) == 0) {
-            s_status.devices[i].node_id = node_id;
-            s_status.devices[i].node_type = node_type;
-            s_status.devices[i].last_seen_ms = now_ms();
-            device_refresh_label(&s_status.devices[i]);
+        if (s_devices[i].used && memcmp(s_devices[i].eui64, eui64, 8) == 0) {
+            s_devices[i].node_id = node_id;
+            s_devices[i].node_type = node_type;
+            s_devices[i].last_seen_ms = now_ms();
+            device_refresh_label(&s_devices[i]);
             return;
         }
     }
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (!s_status.devices[i].used) {
-            zb_device_t *d = &s_status.devices[i];
+        if (!s_devices[i].used) {
+            zb_device_t *d = &s_devices[i];
             memset(d, 0, sizeof(*d));
             d->used = true;
             memcpy(d->eui64, eui64, 8);
@@ -1989,8 +1994,8 @@ static void device_remove_locked(const uint8_t eui64[8])
         return;
     }
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (s_status.devices[i].used && memcmp(s_status.devices[i].eui64, eui64, 8) == 0) {
-            memset(&s_status.devices[i], 0, sizeof(s_status.devices[i]));
+        if (s_devices[i].used && memcmp(s_devices[i].eui64, eui64, 8) == 0) {
+            memset(&s_devices[i], 0, sizeof(s_devices[i]));
             if (s_status.device_count > 0) {
                 s_status.device_count--;
             }
@@ -2002,26 +2007,48 @@ static void device_remove_locked(const uint8_t eui64[8])
 /** Pack used devices into scratch (caller holds status_lock). */
 static uint16_t nvs_pack_devices_locked(void)
 {
-    if (!s_nvs_scratch) {
+    if (!s_nvs_scratch || s_nvs_scratch_cap == 0) {
         return 0;
     }
     uint16_t n = 0;
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (s_status.devices[i].used) {
-            s_nvs_scratch[n++] = s_status.devices[i];
+        if (!s_devices[i].used) {
+            continue;
         }
+        if (n >= s_nvs_scratch_cap) {
+            ESP_LOGE(TAG, "NVS scratch overflow (cap=%u)", (unsigned)s_nvs_scratch_cap);
+            break;
+        }
+        s_nvs_scratch[n++] = s_devices[i];
     }
     return n;
 }
 
+/** Allocate scratch sized to the current used count (not the full 32-slot table). */
 static zb_device_t *nvs_scratch_acquire(void)
 {
-    if (!s_nvs_scratch) {
-        s_nvs_scratch = calloc(ZB_HOST_MAX_DEVICES, sizeof(zb_device_t));
-        if (!s_nvs_scratch) {
-            ESP_LOGE(TAG, "NVS scratch alloc failed (%u bytes)",
-                     (unsigned)(ZB_HOST_MAX_DEVICES * sizeof(zb_device_t)));
+    uint16_t need = 0;
+    for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
+        if (s_devices[i].used) {
+            need++;
         }
+    }
+    if (need == 0) {
+        need = 1;
+    }
+    if (s_nvs_scratch && s_nvs_scratch_cap < need) {
+        free(s_nvs_scratch);
+        s_nvs_scratch = NULL;
+        s_nvs_scratch_cap = 0;
+    }
+    if (!s_nvs_scratch) {
+        s_nvs_scratch = calloc(need, sizeof(zb_device_t));
+        if (!s_nvs_scratch) {
+            ESP_LOGE(TAG, "NVS scratch alloc failed (%u bytes for %u devices)",
+                     (unsigned)(need * sizeof(zb_device_t)), (unsigned)need);
+            return NULL;
+        }
+        s_nvs_scratch_cap = need;
     }
     return s_nvs_scratch;
 }
@@ -2030,6 +2057,7 @@ static void nvs_scratch_release(void)
 {
     free(s_nvs_scratch);
     s_nvs_scratch = NULL;
+    s_nvs_scratch_cap = 0;
 }
 
 /** Drop legacy device blobs that fragment the 24 KiB NVS partition. */
@@ -2156,34 +2184,40 @@ static void nvs_load_devices_locked(void)
         return;
     }
 
-    memset(s_status.devices, 0, sizeof(s_status.devices));
+    memset(s_devices, 0, sizeof(s_devices));
     uint16_t n = 0;
     bool loaded = false;
-    if (nvs_get_u16(h, "dev_n", &n) == ESP_OK && n > 0 && n <= ZB_HOST_MAX_DEVICES) {
+    if (nvs_get_u16(h, "dev_n", &n) == ESP_OK && n > 0) {
         size_t sz = 0;
         if (nvs_get_blob(h, "devs5", NULL, &sz) == ESP_OK && sz > 0 && (sz % n) == 0) {
             size_t old_sz = sz / n;
             uint8_t *raw = calloc(1, sz);
             if (raw && nvs_get_blob(h, "devs5", raw, &sz) == ESP_OK) {
                 size_t copy = old_sz < sizeof(zb_device_t) ? old_sz : sizeof(zb_device_t);
-                for (uint16_t i = 0; i < n; i++) {
-                    memset(&s_status.devices[i], 0, sizeof(zb_device_t));
-                    memcpy(&s_status.devices[i], raw + (size_t)i * old_sz, copy);
-                    s_status.devices[i].used = true;
+                uint16_t load_n = n > ZB_HOST_MAX_DEVICES ? ZB_HOST_MAX_DEVICES : n;
+                for (uint16_t i = 0; i < load_n; i++) {
+                    memset(&s_devices[i], 0, sizeof(zb_device_t));
+                    memcpy(&s_devices[i], raw + (size_t)i * old_sz, copy);
+                    s_devices[i].used = true;
                 }
                 loaded = true;
+                if (n > ZB_HOST_MAX_DEVICES) {
+                    ESP_LOGW(TAG, "NVS had %u devices — kept first %u (ZB_HOST_MAX_DEVICES)",
+                             (unsigned)n, (unsigned)ZB_HOST_MAX_DEVICES);
+                }
                 ESP_LOGI(TAG, "Loaded %u device(s) from NVS (rec=%uB cur=%uB name0='%s' hk0=%d)",
-                         (unsigned)n, (unsigned)old_sz, (unsigned)sizeof(zb_device_t),
-                         s_status.devices[0].name, (int)s_status.devices[0].homekit_expose);
+                         (unsigned)load_n, (unsigned)old_sz, (unsigned)sizeof(zb_device_t),
+                         s_devices[0].name, (int)s_devices[0].homekit_expose);
             }
             free(raw);
         }
     }
 
     if (!loaded) {
-        /* Recover a single known device from older full-table blobs if present. */
-        size_t full = sizeof(s_status.devices);
-        zb_device_t *s_full = nvs_scratch_acquire();
+        /* Recover from older full-table blobs (up to 32 slots historically). */
+        enum { LEGACY_MAX = 32 };
+        size_t full = (size_t)LEGACY_MAX * sizeof(zb_device_t);
+        zb_device_t *s_full = calloc(LEGACY_MAX, sizeof(zb_device_t));
         if (!s_full) {
             nvs_close(h);
             return;
@@ -2191,38 +2225,38 @@ static void nvs_load_devices_locked(void)
         const char *keys[] = {"devs4", "devs3", "devs2"};
         for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]) && !loaded; k++) {
             size_t sz = full;
-            memset(s_full, 0, sizeof(zb_device_t) * ZB_HOST_MAX_DEVICES);
+            memset(s_full, 0, full);
             if (nvs_get_blob(h, keys[k], s_full, &sz) != ESP_OK) {
                 continue;
             }
             uint16_t count = 0;
-            memset(s_status.devices, 0, sizeof(s_status.devices));
-            for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
+            memset(s_devices, 0, sizeof(s_devices));
+            for (uint16_t i = 0; i < LEGACY_MAX && count < ZB_HOST_MAX_DEVICES; i++) {
                 if (!s_full[i].used) {
                     continue;
                 }
-                s_status.devices[count++] = s_full[i];
+                s_devices[count++] = s_full[i];
             }
             if (count) {
                 loaded = true;
                 ESP_LOGI(TAG, "Migrated %u device(s) from %s", (unsigned)count, keys[k]);
             }
         }
-        nvs_scratch_release();
+        free(s_full);
     }
 
     uint16_t count = 0;
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (s_status.devices[i].used) {
+        if (s_devices[i].used) {
             /* Force re-confirm reporting after boot — older firmware set this
              * optimistically without waiting for CfgReportRsp / Attribute Report.
              * last_interview_ms is tick-based (not wall clock), so reset it too. */
-            if (device_looks_like_temp_sensor(&s_status.devices[i])) {
-                s_status.devices[i].sensor_reporting = false;
-                s_status.devices[i].sensor_cfg_step = 0;
-                s_status.devices[i].last_interview_ms = 0;
+            if (device_looks_like_temp_sensor(&s_devices[i])) {
+                s_devices[i].sensor_reporting = false;
+                s_devices[i].sensor_cfg_step = 0;
+                s_devices[i].last_interview_ms = 0;
             }
-            migrate_remote_targets_locked(&s_status.devices[i]);
+            migrate_remote_targets_locked(&s_devices[i]);
             count++;
         }
     }
@@ -2234,8 +2268,8 @@ static void nvs_load_devices_locked(void)
 static zb_device_t *device_find_by_node_locked(uint16_t node_id)
 {
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (s_status.devices[i].used && s_status.devices[i].node_id == node_id) {
-            return &s_status.devices[i];
+        if (s_devices[i].used && s_devices[i].node_id == node_id) {
+            return &s_devices[i];
         }
     }
     return NULL;
@@ -2247,8 +2281,8 @@ static zb_device_t *device_find_by_eui_locked(const uint8_t eui64[8])
         return NULL;
     }
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (s_status.devices[i].used && memcmp(s_status.devices[i].eui64, eui64, 8) == 0) {
-            return &s_status.devices[i];
+        if (s_devices[i].used && memcmp(s_devices[i].eui64, eui64, 8) == 0) {
+            return &s_devices[i];
         }
     }
     return NULL;
@@ -2732,7 +2766,7 @@ static void process_zcl_messages_locked(void)
                         uint8_t nsnap = 0;
                         for (uint16_t ri = 0; ri < ZB_HOST_MAX_DEVICES && nsnap < ZB_CTRL_SNAP_MAX;
                              ri++) {
-                            zb_device_t *rd = &s_status.devices[ri];
+                            zb_device_t *rd = &s_devices[ri];
                             if (rd->used && rd->remote_type == ZB_REMOTE_TYPE_CONTROL &&
                                 (rd->remote_group_id == gid || rd->node_id == msg.sender)) {
                                 rd->remote_group_id = gid;
@@ -2907,7 +2941,7 @@ static void process_zcl_messages_locked(void)
             if ((now_ms() - s_last_touchlink_mgmt_ms) > 8000) {
                 s_last_touchlink_mgmt_ms = now_ms();
                 for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-                    zb_device_t *r = &s_status.devices[i];
+                    zb_device_t *r = &s_devices[i];
                     if (!r->used || r->remote_bound) {
                         continue;
                     }
@@ -2960,7 +2994,7 @@ static void process_zcl_messages_locked(void)
 static bool any_unbound_remote_locked(void)
 {
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        zb_device_t *d = &s_status.devices[i];
+        zb_device_t *d = &s_devices[i];
         if (!d->used || d->remote_bound) {
             continue;
         }
@@ -3174,7 +3208,7 @@ static void process_join_events_locked(void)
     if (changed) {
         uint16_t count = 0;
         for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-            if (s_status.devices[i].used) {
+            if (s_devices[i].used) {
                 count++;
             }
         }
@@ -3212,7 +3246,7 @@ static void refresh_devices_locked(void)
 
     uint16_t count = 0;
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (s_status.devices[i].used) {
+        if (s_devices[i].used) {
             count++;
         }
     }
@@ -3319,7 +3353,7 @@ static esp_err_t probe_ncp(void)
     uint16_t restore_gids[4];
     uint8_t restore_gid_n = 0;
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        zb_device_t *d = &s_status.devices[i];
+        zb_device_t *d = &s_devices[i];
         if (!d->used || d->node_id == 0) {
             continue;
         }
@@ -3353,7 +3387,7 @@ static esp_err_t probe_ncp(void)
     /* Queue CONTROL detach — do not block connect / race HomeKit with EZSP here. */
     uint8_t n_boot_ctrl = 0;
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES && n_boot_ctrl < ZB_CTRL_SNAP_MAX; i++) {
-        zb_device_t *d = &s_status.devices[i];
+        zb_device_t *d = &s_devices[i];
         if (!d->used || d->remote_type != ZB_REMOTE_TYPE_CONTROL) {
             continue;
         }
@@ -3773,7 +3807,7 @@ esp_err_t zigbee_host_remove_device(const uint8_t eui64[8])
     device_remove_locked(eui64);
     uint16_t count = 0;
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (s_status.devices[i].used) {
+        if (s_devices[i].used) {
             count++;
         }
     }
@@ -3807,8 +3841,8 @@ bool zigbee_host_get_device_at(uint16_t index, zb_device_t *out)
     }
     bool ok = false;
     status_lock();
-    if (s_status.devices[index].used) {
-        *out = s_status.devices[index];
+    if (s_devices[index].used) {
+        *out = s_devices[index];
         ok = true;
     }
     status_unlock();
@@ -3820,7 +3854,7 @@ uint16_t zigbee_host_count_homekit_exposed(void)
     uint16_t n = 0;
     status_lock();
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        zb_device_t *d = &s_status.devices[i];
+        zb_device_t *d = &s_devices[i];
         if (!d->used || !d->homekit_expose) {
             continue;
         }
@@ -3847,7 +3881,7 @@ esp_err_t zigbee_host_register_device(const uint8_t eui64[8], uint16_t node_id, 
     device_upsert_locked(eui64, node_id, node_type);
     uint16_t count = 0;
     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (s_status.devices[i].used) {
+        if (s_devices[i].used) {
             count++;
         }
     }
@@ -3917,7 +3951,7 @@ esp_err_t zigbee_host_form_network(const zigbee_form_options_t *opt)
     refresh_network_locked();
     nvs_save_network(&s_status.ncp.net);
     s_status.device_count = 0;
-    memset(s_status.devices, 0, sizeof(s_status.devices));
+    memset(s_devices, 0, sizeof(s_devices));
     nvs_save_devices_locked();
     s_status.last_error[0] = '\0';
     status_unlock();
@@ -3940,7 +3974,7 @@ esp_err_t zigbee_host_leave_network(void)
     status_lock();
     refresh_network_locked();
     s_status.device_count = 0;
-    memset(s_status.devices, 0, sizeof(s_status.devices));
+    memset(s_devices, 0, sizeof(s_devices));
     nvs_save_devices_locked();
     s_status.permit_join_remaining = 0;
     if (err != ESP_OK) {
@@ -4030,7 +4064,7 @@ static void process_pending_permit_unlocked(void)
             }
             status_lock();
             for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-                zb_device_t *d = &s_status.devices[i];
+                zb_device_t *d = &s_devices[i];
                 if (!d->used || d->remote_bound) {
                     continue;
                 }
@@ -4116,7 +4150,7 @@ static void host_task(void *arg)
                         uint16_t nunassigned = 0;
                         uint16_t nrem = 0;
                         for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-                            zb_device_t *d = &s_status.devices[i];
+                            zb_device_t *d = &s_devices[i];
                             if (!d->used) {
                                 continue;
                             }
@@ -4140,7 +4174,7 @@ static void host_task(void *arg)
                         if (!owner_d && nrem == 1) {
                             owner_d = unassigned; /* only remote present */
                             for (uint16_t i = 0; !owner_d && i < ZB_HOST_MAX_DEVICES; i++) {
-                                zb_device_t *d = &s_status.devices[i];
+                                zb_device_t *d = &s_devices[i];
                                 if (d->used && (zigbee_host_device_kind(d) == ZB_DEVICE_KIND_REMOTE ||
                                                 eui_looks_like_ikea_remote(d->eui64))) {
                                     owner_d = d;
@@ -4150,7 +4184,7 @@ static void host_task(void *arg)
                         /* Prefer HOMEKIT remotes still missing a group over CONTROL ones. */
                         if (!owner_d) {
                             for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-                                zb_device_t *d = &s_status.devices[i];
+                                zb_device_t *d = &s_devices[i];
                                 if (!d->used || d->remote_group_id != 0) {
                                     continue;
                                 }
@@ -4349,7 +4383,7 @@ static void host_task(void *arg)
                 bool have_sensor_cfg = false;
                 if (interview_due && s_status.ncp.network_state == EZSP_JOINED_NETWORK) {
                     for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-                        zb_device_t *d = &s_status.devices[i];
+                        zb_device_t *d = &s_devices[i];
                         if (!d->used) {
                             continue;
                         }
@@ -4477,7 +4511,7 @@ esp_err_t zigbee_host_start(void)
     ezsp_set_host_wake(host_wake_from_ezsp);
 
     if (!s_task) {
-        if (xTaskCreate(host_task, "zigbee_host", 16384, NULL, 5, &s_task) != pdPASS) {
+        if (xTaskCreate(host_task, "zigbee_host", 12288, NULL, 5, &s_task) != pdPASS) {
             return ESP_ERR_NO_MEM;
         }
     }
@@ -4501,17 +4535,7 @@ void zigbee_host_get_status(zigbee_host_status_t *out)
     ezsp_get_stats(&s_status.ezsp_stats);
     s_status.ash_state = ash_get_state();
     update_permit_remaining();
-    /* Copy header + used slots only — a full 32-device struct assign (~14KB)
-     * under the lock starved the portal httpd on the unicore C3. */
-    size_t hdr = offsetof(zigbee_host_status_t, devices);
-    memcpy(out, &s_status, hdr);
-    memset(out->devices, 0, sizeof(out->devices));
-    for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
-        if (s_status.devices[i].used) {
-            out->devices[i] = s_status.devices[i];
-        }
-    }
-    memcpy(out->last_error, s_status.last_error, sizeof(out->last_error));
+    *out = s_status;
     xSemaphoreGive(s_status_mutex);
 }
 
