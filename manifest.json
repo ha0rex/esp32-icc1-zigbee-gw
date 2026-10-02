@@ -1,0 +1,24 @@
+{
+  "version": "0.3.51-20261002.38db93b4",
+  "url": "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/esp32_icc1_zigbee_gw.bin",
+  "sha256": "8dc5bd05d6784f9e33d7e9c18dae64df540098f0000533f6aca54006ea98194c",
+  "targets": {
+    "esp32c3": {
+      "url": "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/esp32_icc1_zigbee_gw-esp32c3.bin",
+      "sha256": "8dc5bd05d6784f9e33d7e9c18dae64df540098f0000533f6aca54006ea98194c"
+    },
+    "esp32s3": {
+      "url": "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota/esp32_icc1_zigbee_gw-esp32s3.bin",
+      "sha256": "8c4ad3fa72532d2080f6ef15ab7e05ea10b846cdff65f53f4784286c64e13849"
+    }
+  },
+  "channel": "ota",
+  "built": "2026-10-02T14:07:23Z",
+  "commit": "38db93b4fbf95a0842007dfc008c4ac05290b85b",
+  "changelog": [
+    {
+      "sha": "38db93b",
+      "message": "Add SNZB-02D wake-button thermostat cycling and EXT1 display (0.3.51)."
+    }
+  ]
+}
