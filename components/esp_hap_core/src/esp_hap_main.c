@@ -203,8 +203,10 @@ static void hap_common_sm(hap_internal_event_t event)
 static void hap_loop_task(void *param)
 {
     hap_state_t cur_state = HAP_STATE_NONE;
-    /* Larger than stock 10 so button TRIGGER_NOTIF is not dropped under load. */
-    xQueue = xQueueCreate( 32, sizeof(hap_event_ctx_t) );
+    /* Larger than stock 10 so button TRIGGER_NOTIF is not dropped under load.
+     * Sensor bursts used to fill this and fall back to a cross-task inline EVENT
+     * flush (removed) — prefer headroom here instead. */
+    xQueue = xQueueCreate( 48, sizeof(hap_event_ctx_t) );
     hap_event_ctx_t hap_event;
     bool loop_continue = true;
     ESP_MFI_DEBUG(ESP_MFI_DEBUG_INFO, "HAP Main Loop Started");

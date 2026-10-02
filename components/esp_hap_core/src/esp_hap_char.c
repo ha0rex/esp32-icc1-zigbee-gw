@@ -26,6 +26,7 @@
 #include <math.h>
 #include <string.h>
 #include <esp_log.h>
+#include <esp_memory_utils.h>
 #include "esp_mfi_debug.h"
 
 #include <esp_hap_main.h>
@@ -35,6 +36,34 @@
 #include <esp_hap_database.h>
 
 static QueueHandle_t hap_event_queue;
+
+/** True if p is a live DRAM/PSRAM heap object (rejects NULL and garbage like 0x60923). */
+static inline bool hap_heap_ptr_ok(const void *p)
+{
+    return p && (esp_ptr_in_dram(p) || esp_ptr_external_ram(p));
+}
+
+/** Drop any pending EVENT queue entries that point at a char about to be freed. */
+static void hap_event_queue_drop_char(hap_char_t *doomed)
+{
+    if (!hap_event_queue || !doomed) {
+        return;
+    }
+    hap_char_t *keep[48];
+    int n = 0;
+    hap_char_t *hc;
+    while (xQueueReceive(hap_event_queue, &hc, 0) == pdTRUE) {
+        if (hc == doomed) {
+            continue;
+        }
+        if (n < (int)(sizeof(keep) / sizeof(keep[0]))) {
+            keep[n++] = hc;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        (void)xQueueSend(hap_event_queue, &keep[i], 0);
+    }
+}
 
 /**
  * @brief get characteristics's value
@@ -88,13 +117,52 @@ int hap_event_queue_deinit()
     return HAP_SUCCESS;
 }
 
+bool hap_char_is_registered(hap_char_t *needle)
+{
+    hap_acc_t *ha;
+    hap_serv_t *hs;
+    hap_char_t *hc;
+
+    if (!hap_heap_ptr_ok(needle)) {
+        return false;
+    }
+    for (ha = hap_get_first_acc(); ha; ha = hap_acc_get_next(ha)) {
+        for (hs = hap_acc_get_first_serv(ha); hs; hs = hap_serv_get_next(hs)) {
+            for (hc = hap_serv_get_first_char(hs); hc; hc = hap_char_get_next(hc)) {
+                if (hc == needle) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void hap_event_queue_purge_accessory(hap_acc_t *ha)
+{
+    hap_serv_t *hs;
+    hap_char_t *hc;
+
+    if (!ha) {
+        return;
+    }
+    for (hs = hap_acc_get_first_serv(ha); hs; hs = hap_serv_get_next(hs)) {
+        for (hc = hap_serv_get_first_char(hs); hc; hc = hap_char_get_next(hc)) {
+            hap_event_queue_drop_char(hc);
+        }
+    }
+}
+
 hap_char_t * hap_get_pending_notif_char()
 {
     hap_char_t *hc;
-    if (!hap_event_queue || xQueueReceive(hap_event_queue, &hc, 0) != pdTRUE) {
-        return NULL;
+    while (hap_event_queue && xQueueReceive(hap_event_queue, &hc, 0) == pdTRUE) {
+        if (hap_char_is_registered(hc)) {
+            return hc;
+        }
+        ESP_LOGW("hap", "drop stale EVENT char %p (not on bridge)", (void *)hc);
     }
-    return hc;
+    return NULL;
 }
 
 bool hap_notif_pending(void)
@@ -105,6 +173,13 @@ bool hap_notif_pending(void)
 static int hap_queue_event(hap_char_t *hc)
 {
     int ret;
+    if (!hap_heap_ptr_ok(hc)) {
+        return HAP_FAIL;
+    }
+    if (!hap_char_is_registered(hc)) {
+        ESP_LOGW("hap", "notif skip — characteristic not on bridge");
+        return HAP_FAIL;
+    }
     if (!hap_event_queue) {
         ESP_LOGW("hap", "notif queue not ready");
         return HAP_FAIL;
@@ -115,11 +190,12 @@ static int hap_queue_event(hap_char_t *hc)
         ret = xQueueSend(hap_event_queue, &hc, 0);
     }
     if (ret == pdTRUE) {
+        /* Never flush EVENTs from the caller task (zigbee/httpd). Concurrent
+         * hap_send_notification raced the HAP loop and LoadProhibited in
+         * hap_serv_get_parent after sensor bursts. HAP loop drains via
+         * TRIGGER_NOTIF and the short-poll when hap_notif_pending(). */
         if (hap_send_event(HAP_INTERNAL_EVENT_TRIGGER_NOTIF) != HAP_SUCCESS) {
-            /* HAP loop busy/stuck — flush inline so Home still gets the edge.
-             * Direct send on the session fd is safe (same as hap_http_send_notif). */
-            ESP_LOGW("hap", "TRIGGER_NOTIF deferred — inline EVENT flush");
-            hap_http_send_notif();
+            ESP_LOGW("hap", "TRIGGER_NOTIF deferred — HAP loop will flush pending");
         }
         return HAP_SUCCESS;
     }
@@ -518,6 +594,8 @@ hap_char_format_t hap_char_get_format(hap_char_t *hc)
 void hap_char_delete(hap_char_t *hc)
 {
     ESP_MFI_ASSERT(hc);
+    /* Accessory rebuild can free chars while EVENTs are still queued — scrub first. */
+    hap_event_queue_drop_char(hc);
     __hap_char_t *_hc = (__hap_char_t *)hc;
     if (_hc->format == HAP_CHAR_FORMAT_STRING) {
         if (_hc->val.s) {
@@ -594,14 +672,21 @@ hap_char_t *hap_char_get_next(hap_char_t *hc)
 
 hap_serv_t *hap_char_get_parent(hap_char_t *hc)
 {
-    return ((__hap_char_t *)hc)->parent;
-
+    if (!hap_heap_ptr_ok(hc)) {
+        return NULL;
+    }
+    hap_serv_t *hs = ((__hap_char_t *)hc)->parent;
+    /* Reject dangling/corrupt parent (LoadProhibited at hs+0x10 / parent field). */
+    return hap_heap_ptr_ok(hs) ? hs : NULL;
 }
 
 #define set_bit(val, index)	((val) |= (1 << index))
 #define reset_bit(val, index)	((val) &= ~(1 << index))
 void hap_char_manage_notification(hap_char_t *hc, int index, bool ev)
 {
+    if (!hap_char_is_registered(hc)) {
+        return;
+    }
 	__hap_char_t *_hc = (__hap_char_t *)hc;
 	if (ev)
 		set_bit(_hc->ev_ctrls, index);
@@ -611,6 +696,9 @@ void hap_char_manage_notification(hap_char_t *hc, int index, bool ev)
 
 bool hap_char_is_ctrl_subscribed(hap_char_t *hc, int index)
 {
+    if (!hap_char_is_registered(hc)) {
+        return false;
+    }
 	__hap_char_t *_hc = (__hap_char_t *)hc;
 	return (_hc->ev_ctrls & (1 << index)) ? true : false;
 }
@@ -640,6 +728,9 @@ void hap_char_set_owner_ctrl(hap_char_t *hc, int index)
 
 bool hap_char_is_ctrl_owner(hap_char_t *hc, int index)
 {
+    if (!hap_char_is_registered(hc)) {
+        return false;
+    }
 	__hap_char_t *_hc = (__hap_char_t *)hc;
 	return (_hc->owner_ctrl & (1 << index)) ? true : false;
 }

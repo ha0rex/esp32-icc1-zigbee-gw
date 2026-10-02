@@ -33,6 +33,7 @@
 #include <esp_hap_database.h>
 #include <esp_hap_keystore.h>
 #include <esp_hap_main.h>
+#include <esp_hap_char.h>
 
 /* Primary Accessory Pointer */
 static __hap_acc_t *primary_acc;
@@ -425,6 +426,7 @@ void hap_remove_bridged_accessory(hap_acc_t *ha)
 		ESP_MFI_DEBUG(ESP_MFI_DEBUG_ERR, "Cannot remove primary accessory");
     } else {
         if (ha) {
+            hap_event_queue_purge_accessory(ha);
             hap_remove_acc_from_list(primary_acc, (__hap_acc_t *)ha);
             if (!hap_priv.cfg.disable_config_num_update) {
                 hap_update_config_number();
@@ -443,6 +445,7 @@ void hap_acc_delete(hap_acc_t *ha)
 	 */
 	if (!ha)
 		return;
+    hap_event_queue_purge_accessory(ha);
 	__hap_acc_t *_ha = (__hap_acc_t *)ha;
 	__hap_serv_t *_hs = (__hap_serv_t *)_ha->servs;
 	while (_hs) {

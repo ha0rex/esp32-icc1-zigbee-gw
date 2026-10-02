@@ -96,6 +96,10 @@ int hap_event_queue_deinit();
 hap_char_t * hap_get_pending_notif_char();
 /** True if characteristic notifications are waiting to be sent. */
 bool hap_notif_pending(void);
+/** Drop pending EVENT queue entries for every char on an accessory (before remove/delete). */
+void hap_event_queue_purge_accessory(hap_acc_t *ha);
+/** True if hc is still linked under a live accessory/service tree. */
+bool hap_char_is_registered(hap_char_t *hc);
 #ifdef __cplusplus
 }
 #endif

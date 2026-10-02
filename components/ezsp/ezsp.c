@@ -168,6 +168,12 @@ static uint16_t s_last_btn_remote_node;
 static int64_t s_last_real_btn_rx_ms;
 static uint16_t s_last_real_btn_gid;
 static uint16_t s_last_real_btn_cluster;
+/** Last OnOff/Level messageSent synth we invented (paired with one-shot real-RX echo drop). */
+static int64_t s_last_synth_ms;
+static uint16_t s_last_synth_gid;
+static uint16_t s_last_synth_cluster;
+static uint16_t s_last_synth_node; /* owner short addr used for the synth */
+static bool s_synth_echo_pending; /* true until one matching real client cmd is dropped */
 /** Any multicast RX on a button cluster/group (incl. light reports) — kill empty invent. */
 static int64_t s_last_mcast_rx_ms;
 static uint16_t s_last_mcast_rx_gid;
@@ -456,17 +462,9 @@ static void handle_incoming_message(const uint8_t *params, size_t params_len)
     sniff_push(EZSP_SNIFF_RX, msg_type, msg.sender, msg.profile_id, msg.cluster_id, group_id,
                msg.source_endpoint, msg.destination_endpoint, msg.last_hop_rssi, 0, msg.data,
                msg.len);
-    /* Any groupcast RX on button clusters — suppress empty messageSent synth (lights report
-     * OnOff/Level on the same group; inventing Toggle from those relay confirms floods the
-     * host and starves HTTP/HomeKit). */
-    if (group_id != 0 &&
-        (msg.cluster_id == ZCL_CLUSTER_ON_OFF || msg.cluster_id == ZCL_CLUSTER_LEVEL_CONTROL ||
-         msg.cluster_id == ZCL_CLUSTER_SCENES || msg.cluster_id == ZCL_CLUSTER_IKEA_BUTTON)) {
-        s_last_mcast_rx_ms = ezsp_now_ms();
-        s_last_mcast_rx_gid = group_id;
-        s_last_mcast_rx_cluster = msg.cluster_id;
-    }
-    /* Real button multicast — remember direction from client→server cmds. */
+    /* Real button multicast — remember direction from client→server cmds.
+     * Drop the delayed OnOff echo of a messageSent synth before arming mcast/real
+     * "recent" markers (those would otherwise mute the next intentional press). */
     if (msg.len >= 3 &&
         (msg.cluster_id == ZCL_CLUSTER_ON_OFF || msg.cluster_id == ZCL_CLUSTER_LEVEL_CONTROL ||
          msg.cluster_id == ZCL_CLUSTER_SCENES || msg.cluster_id == ZCL_CLUSTER_IKEA_BUTTON)) {
@@ -474,7 +472,26 @@ static void handle_incoming_message(const uint8_t *params, size_t params_len)
         bool cluster_specific = (fc & 0x01) != 0;
         bool server_to_client = (fc & 0x08) != 0;
         if (cluster_specific && !server_to_client) {
-            s_last_real_btn_rx_ms = ezsp_now_ms();
+            int64_t now_btn = ezsp_now_ms();
+            if (s_synth_echo_pending && (now_btn - s_last_synth_ms) >= 2500) {
+                s_synth_echo_pending = false; /* expired — do not eat a later real press */
+            }
+            /* One physical OnOff press → messageSent synth Toggle, then delayed real
+             * On/Off/Toggle (often unicast group=0 to the fake bulb, or same groupcast).
+             * Drop exactly one matching real by group OR sender node. */
+            bool echo_match_gid = (s_last_synth_gid != 0 && group_id == s_last_synth_gid);
+            bool echo_match_node =
+                (s_last_synth_node != 0 && msg.sender == s_last_synth_node);
+            if (s_synth_echo_pending && msg.cluster_id == ZCL_CLUSTER_ON_OFF &&
+                msg.cluster_id == s_last_synth_cluster && (echo_match_gid || echo_match_node) &&
+                (now_btn - s_last_synth_ms) > 20) {
+                s_synth_echo_pending = false;
+                ESP_LOGI(TAG,
+                         "Drop OnOff echo after synth group=%u node=0x%04X (dt=%lld ms)",
+                         (unsigned)group_id, msg.sender, (long long)(now_btn - s_last_synth_ms));
+                return; /* sniffed already; do not feed host / do not arm recent markers */
+            }
+            s_last_real_btn_rx_ms = now_btn;
             s_last_real_btn_gid = group_id;
             s_last_real_btn_cluster = msg.cluster_id;
             size_t hdr = 1 + ((fc & 0x04) ? 2 : 0) + 1; /* fc [mfg] seq */
@@ -487,6 +504,16 @@ static void handle_incoming_message(const uint8_t *params, size_t params_len)
                     msg.data[msg.len - 1] ? ZCL_IKEA_ARROW_LEFT : ZCL_IKEA_ARROW_RIGHT;
             }
         }
+    }
+    /* Any groupcast RX on button clusters — suppress empty messageSent synth (lights report
+     * OnOff/Level on the same group; inventing Toggle from those relay confirms floods the
+     * host and starves HTTP/HomeKit). */
+    if (group_id != 0 &&
+        (msg.cluster_id == ZCL_CLUSTER_ON_OFF || msg.cluster_id == ZCL_CLUSTER_LEVEL_CONTROL ||
+         msg.cluster_id == ZCL_CLUSTER_SCENES || msg.cluster_id == ZCL_CLUSTER_IKEA_BUTTON)) {
+        s_last_mcast_rx_ms = ezsp_now_ms();
+        s_last_mcast_rx_gid = group_id;
+        s_last_mcast_rx_cluster = msg.cluster_id;
     }
     /* IKEA F&B: queue Identify Query Response from fake-bulb endpoint only. */
     if (msg.cluster_id == ZCL_CLUSTER_IDENTIFY && msg.len >= 3) {
@@ -595,11 +622,12 @@ static void handle_unsolicited(uint16_t fid, const uint8_t *params, size_t param
                 }
                 pdata = params + off + 1;
             }
-            /* Sensor / bind delivery results drive the one-frame sleepy setup state machine. */
+            /* Sensor / bind / Sonoff EXT1 delivery results drive the one-frame sleepy SM. */
             bool sensorish = cluster == ZCL_CLUSTER_TEMP_MEASUREMENT ||
                              cluster == ZCL_CLUSTER_REL_HUMIDITY ||
                              cluster == ZCL_CLUSTER_POWER_CONFIG || cluster == ZCL_CLUSTER_BASIC ||
-                             cluster == ZDO_CLUSTER_BIND_REQ || cluster == ZDO_CLUSTER_BIND_RSP;
+                             cluster == ZCL_CLUSTER_SONOFF_CUSTOM || cluster == ZDO_CLUSTER_BIND_REQ ||
+                             cluster == ZDO_CLUSTER_BIND_RSP;
             if (sensorish) {
                 sent_q_push(dest, cluster, st);
             }
@@ -695,27 +723,30 @@ static void handle_unsolicited(uint16_t fid, const uint8_t *params, size_t param
                         /* Level / Scenes / IKEA: no payload ⇒ cannot know direction. */
                         syn.len = 0;
                     }
-                    static int64_t s_last_synth_ms;
-                    static uint16_t s_last_synth_cluster;
-                    static uint16_t s_last_synth_gid;
                     int64_t now = ezsp_now_ms();
-                    /* OnOff: wider window — one press → messageSent + delayed real RX. */
-                    int64_t dup_ms = (cluster == ZCL_CLUSTER_ON_OFF) ? 2500 : 400;
+                    /* Short dup window: same press can get multiple messageSent confirms.
+                     * After a real button cmd, suppress OnOff invent longer — messageSent often
+                     * lags the real RX by 0.5–2s (would double-fire HomeKit). That does not
+                     * mute the next press: a new real RX still arrives, and a new synth is
+                     * allowed once real_recent expires. */
+                    int64_t dup_ms = 350;
                     bool dup = (cluster == s_last_synth_cluster) && (learn_gid == s_last_synth_gid) &&
                                (now - s_last_synth_ms) < dup_ms;
-                    /* Real button cmd OR any group multicast (light report) — skip invent.
-                     * OnOff power presses often deliver real RX 0.5–2s after messageSent. */
-                    int64_t skip_ms = (cluster == ZCL_CLUSTER_ON_OFF) ? 2500 : 600;
+                    int64_t skip_ms = (cluster == ZCL_CLUSTER_ON_OFF) ? 2000 : 450;
                     bool real_recent = (learn_gid == s_last_real_btn_gid) &&
                                        (cluster == s_last_real_btn_cluster) &&
                                        (now - s_last_real_btn_rx_ms) < skip_ms;
+                    /* Light attribute reports on the group — short mute only. */
+                    int64_t mcast_skip_ms = 450;
                     bool mcast_recent = (learn_gid == s_last_mcast_rx_gid) &&
                                         (cluster == s_last_mcast_rx_cluster) &&
-                                        (now - s_last_mcast_rx_ms) < skip_ms;
+                                        (now - s_last_mcast_rx_ms) < mcast_skip_ms;
                     if (syn.len > 0 && !dup && !real_recent && !mcast_recent) {
                         s_last_synth_ms = now;
                         s_last_synth_cluster = cluster;
                         s_last_synth_gid = learn_gid;
+                        s_last_synth_node = owner;
+                        s_synth_echo_pending = (cluster == ZCL_CLUSTER_ON_OFF);
                         ESP_LOGI(TAG,
                                  "Synth button RX from relay group=%u cluster=0x%04X node=0x%04X "
                                  "len=%u",
@@ -1626,6 +1657,49 @@ esp_err_t ezsp_zcl_read_attributes(uint16_t node_id, uint8_t dest_ep, uint16_t c
     esp_err_t err = ezsp_send_unicast(node_id, &aps, zcl, zlen, &st);
     ESP_LOGI(TAG, "ZCL read cluster=0x%04X node=0x%04X -> %s", cluster_id, node_id,
              ezsp_ember_status_str(st));
+    return err;
+}
+
+esp_err_t ezsp_zcl_write_attributes(uint16_t node_id, uint8_t dest_ep, uint16_t cluster_id,
+                                    const ezsp_zcl_write_attr_t *attrs, size_t attr_count)
+{
+    if (!attrs || attr_count == 0 || attr_count > 4) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* FC + seq + cmd + up to 4 × (attr 2 + type 1 + value ≤8) */
+    uint8_t zcl[3 + 4 * 11];
+    size_t zlen = 0;
+    zcl[zlen++] = 0x00; /* frame control: client→server, general */
+    zcl[zlen++] = ++s_zcl_seq;
+    zcl[zlen++] = 0x02; /* Write Attributes */
+    for (size_t i = 0; i < attr_count; i++) {
+        if (attrs[i].value_len == 0 || attrs[i].value_len > 8) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (zlen + 3 + attrs[i].value_len > sizeof(zcl)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        zcl[zlen++] = (uint8_t)(attrs[i].attr_id & 0xFF);
+        zcl[zlen++] = (uint8_t)(attrs[i].attr_id >> 8);
+        zcl[zlen++] = attrs[i].data_type;
+        memcpy(zcl + zlen, attrs[i].value_le, attrs[i].value_len);
+        zlen += attrs[i].value_len;
+    }
+
+    ezsp_aps_frame_t aps;
+    memset(&aps, 0, sizeof(aps));
+    aps.profile_id = ZCL_PROFILE_HA;
+    aps.cluster_id = cluster_id;
+    aps.source_endpoint = 1;
+    aps.destination_endpoint = dest_ep ? dest_ep : 1;
+    aps.options = (uint16_t)(EMBER_APS_OPTION_RETRY | EMBER_APS_OPTION_ENABLE_ROUTE_DISCOVERY);
+    aps.group_id = 0;
+    aps.sequence = s_zcl_seq;
+
+    uint8_t st = 0;
+    esp_err_t err = ezsp_send_unicast(node_id, &aps, zcl, zlen, &st);
+    ESP_LOGI(TAG, "ZCL write cluster=0x%04X node=0x%04X attrs=%u -> %s", cluster_id, node_id,
+             (unsigned)attr_count, ezsp_ember_status_str(st));
     return err;
 }
 

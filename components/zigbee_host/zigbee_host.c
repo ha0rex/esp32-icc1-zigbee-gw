@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -18,8 +19,6 @@
 #include "freertos/task.h"
 #include "nvs.h"
 #include "sdkconfig.h"
-
-#include <stdlib.h>
 
 static const char *TAG = "zigbee_host";
 #define NVS_NS "zb_net"
@@ -41,6 +40,7 @@ static bool s_pending_permit;
 static uint8_t s_pending_permit_dur;
 static zb_remote_button_cb_t s_remote_btn_cb;
 static zb_sensor_update_cb_t s_sensor_upd_cb;
+static zb_sensor_button_cb_t s_sensor_btn_cb;
 /** HomeKit button cb must not run under s_op_mutex/status_lock (re-enters those locks). */
 #define ZB_HK_BTN_Q 8
 typedef struct {
@@ -50,6 +50,22 @@ typedef struct {
 } hk_btn_evt_t;
 static hk_btn_evt_t s_hk_btn_q[ZB_HK_BTN_Q];
 static uint8_t s_hk_btn_q_len;
+
+/** Climate sensor wake-button events (OnOff Toggle). */
+#define ZB_SENSOR_BTN_Q 4
+static uint8_t s_sensor_btn_q[ZB_SENSOR_BTN_Q][8];
+static uint8_t s_sensor_btn_q_len;
+
+/**
+ * Pending Sonoff EXT1 display write (0xFC11).
+ * Sleepy: one attribute per APS frame, tracked via s_sensor_tx_* + messageSent.
+ * Step 0 = temperature_sensor_select(1), step 1 = external_temperature (°C×100).
+ */
+static bool s_ext_disp_pending;
+static uint8_t s_ext_disp_eui[8];
+static float s_ext_disp_temp_c;
+static uint8_t s_ext_disp_step; /**< 0 = select, 1 = temp */
+static bool s_ext_disp_inflight; /**< current s_sensor_tx_* frame is EXT1 */
 
 /** Defer sensor→HomeKit pushes out of status_lock / ZCL parse. */
 #define ZB_SENSOR_UPD_Q 6
@@ -110,6 +126,36 @@ static void flush_hk_btn_callbacks(void)
         s_hk_btn_q_len--;
         if (s_remote_btn_cb) {
             s_remote_btn_cb(e.eui64, e.button_index, e.event);
+        }
+    }
+}
+
+static void sensor_btn_q_push(const uint8_t eui64[8])
+{
+    if (!eui64) {
+        return;
+    }
+    for (uint8_t i = 0; i < s_sensor_btn_q_len; i++) {
+        if (memcmp(s_sensor_btn_q[i], eui64, 8) == 0) {
+            return;
+        }
+    }
+    if (s_sensor_btn_q_len >= ZB_SENSOR_BTN_Q) {
+        memmove(&s_sensor_btn_q[0], &s_sensor_btn_q[1], (ZB_SENSOR_BTN_Q - 1) * 8);
+        s_sensor_btn_q_len = ZB_SENSOR_BTN_Q - 1;
+    }
+    memcpy(s_sensor_btn_q[s_sensor_btn_q_len++], eui64, 8);
+}
+
+static void flush_sensor_btn_callbacks(void)
+{
+    while (s_sensor_btn_q_len > 0) {
+        uint8_t eui[8];
+        memcpy(eui, s_sensor_btn_q[0], 8);
+        memmove(&s_sensor_btn_q[0], &s_sensor_btn_q[1], (s_sensor_btn_q_len - 1) * 8);
+        s_sensor_btn_q_len--;
+        if (s_sensor_btn_cb) {
+            s_sensor_btn_cb(eui);
         }
     }
 }
@@ -177,6 +223,7 @@ static uint8_t s_level_q_len;
 
 static zb_device_t *device_find_by_eui_locked(const uint8_t eui64[8]);
 static zb_device_t *device_find_by_node_locked(uint16_t node_id);
+static void press_log_push(const uint8_t eui64[8], uint8_t button_1based, uint8_t event);
 static void nvs_save_devices_locked(void);
 static void sensor_try_send_one_unlocked(zb_device_t *d);
 
@@ -774,10 +821,27 @@ bool zigbee_host_btn_is_stateful(const zb_device_t *d, uint8_t button_index)
         return false;
     }
     uint8_t n = zigbee_host_remote_button_count(d);
+    if (n == 0) {
+        /* Climate wake button: 0=None, 1=Stateless, 2=Stateful */
+        if (button_index == 0 &&
+            (d->has_temp || d->has_humidity || zigbee_host_device_kind(d) == ZB_DEVICE_KIND_SENSOR)) {
+            return d->btn_mode[0] == ZB_SENSOR_BTN_STATEFUL;
+        }
+        return false;
+    }
     if (button_index >= n) {
         return false;
     }
     return d->btn_mode[button_index] == ZB_BTN_MODE_STATEFUL;
+}
+
+bool zigbee_host_sensor_btn_homekit(const zb_device_t *d)
+{
+    if (!d) {
+        return false;
+    }
+    uint8_t m = d->btn_mode[0];
+    return m == ZB_SENSOR_BTN_STATELESS || m == ZB_SENSOR_BTN_STATEFUL;
 }
 
 bool zigbee_host_btn_get_on(const uint8_t eui64[8], uint8_t button_index)
@@ -840,6 +904,134 @@ void zigbee_host_set_remote_button_cb(zb_remote_button_cb_t cb)
 void zigbee_host_set_sensor_update_cb(zb_sensor_update_cb_t cb)
 {
     s_sensor_upd_cb = cb;
+}
+
+void zigbee_host_set_sensor_button_cb(zb_sensor_button_cb_t cb)
+{
+    s_sensor_btn_cb = cb;
+}
+
+/** Debounced wake-button from climate sensors (SNZB-02D OnOff Toggle). */
+static void emit_sensor_button(const zb_device_t *d)
+{
+    if (!d || !d->used) {
+        return;
+    }
+    static int64_t s_last_ms;
+    static uint16_t s_last_node;
+    int64_t now = now_ms();
+    if (d->node_id == s_last_node && (now - s_last_ms) < 400) {
+        ESP_LOGI(TAG, "Sensor button merged node=0x%04X (%lld ms)", d->node_id,
+                 (long long)(now - s_last_ms));
+        return;
+    }
+    s_last_ms = now;
+    s_last_node = d->node_id;
+    ESP_LOGI(TAG, "Sensor wake button node=0x%04X eui=..%02X%02X", d->node_id, d->eui64[0],
+             d->eui64[1]);
+    press_log_push(d->eui64, 1, HK_BTN_EVENT_SINGLE);
+    sensor_btn_q_push(d->eui64);
+}
+
+/** One ZCL Write Attributes on 0xFC11 (no mfg code — SNZB-02D rejects manf frames). */
+static bool send_ext_display_step_unlocked(const zb_device_t *d, uint8_t step, float temp_c)
+{
+    if (!d || !d->used || d->node_id == 0xFFFF || d->node_id == 0) {
+        return false;
+    }
+    ezsp_zcl_write_attr_t attr;
+    memset(&attr, 0, sizeof(attr));
+    uint8_t ep = d->sensor_ep ? d->sensor_ep : 1;
+    if (step == 0) {
+        /* 0x600E temperature_sensor_select = external (1), type UINT8 / 32 */
+        attr.attr_id = ZCL_ATTR_SONOFF_TEMP_SENSOR_SELECT;
+        attr.data_type = 0x20;
+        attr.value_len = 1;
+        attr.value_le[0] = 1;
+        ESP_LOGI(TAG, "Sensor 0x%04X: EXT1 select=external (0x600E)", d->node_id);
+    } else {
+        /* 0x600D external_temperature = °C × 100, type INT16 / 41 */
+        int16_t raw = (int16_t)(temp_c * 100.0f + (temp_c >= 0.0f ? 0.5f : -0.5f));
+        attr.attr_id = ZCL_ATTR_SONOFF_EXT_TEMP;
+        attr.data_type = 0x29;
+        attr.value_len = 2;
+        attr.value_le[0] = (uint8_t)(raw & 0xFF);
+        attr.value_le[1] = (uint8_t)((raw >> 8) & 0xFF);
+        ESP_LOGI(TAG, "Sensor 0x%04X: EXT1 temp=%.2f °C raw=%d (0x600D)", d->node_id,
+                 (double)temp_c, (int)raw);
+    }
+    return ezsp_zcl_write_attributes(d->node_id, ep, ZCL_CLUSTER_SONOFF_CUSTOM, &attr, 1) ==
+           ESP_OK;
+}
+
+/**
+ * Prefer EXT1 over interview/read when pending for this device.
+ * Returns true if a frame was queued (caller must NOT also mark tx).
+ */
+static bool sensor_try_ext_display_unlocked(zb_device_t *d)
+{
+    if (!d || !d->used || !s_ext_disp_pending || s_sensor_tx_pending) {
+        return false;
+    }
+    if (memcmp(d->eui64, s_ext_disp_eui, 8) != 0) {
+        return false;
+    }
+    uint8_t step = s_ext_disp_step;
+    float t = s_ext_disp_temp_c;
+    if (!send_ext_display_step_unlocked(d, step, t)) {
+        return false;
+    }
+    s_sensor_tx_pending = true;
+    s_sensor_tx_node = d->node_id;
+    s_sensor_tx_ms = now_ms();
+    s_ext_disp_inflight = true;
+    return true;
+}
+
+esp_err_t zigbee_host_queue_ext_display_temp(const uint8_t eui64[8], float temp_c)
+{
+    if (!eui64) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (temp_c < -50.0f) {
+        temp_c = -50.0f;
+    }
+    if (temp_c > 125.0f) {
+        temp_c = 125.0f;
+    }
+    status_lock();
+    memcpy(s_ext_disp_eui, eui64, 8);
+    s_ext_disp_temp_c = temp_c;
+    s_ext_disp_pending = true;
+    s_ext_disp_step = 0; /* always re-enable external mode then write temp */
+    zb_device_t *d = device_find_by_eui_locked(eui64);
+    zb_device_t copy = {0};
+    bool try_now = false;
+    if (d && d->used) {
+        copy = *d;
+        try_now = true;
+    }
+    status_unlock();
+    if (!try_now) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    /* Same wake window as the button — one sleepy APS frame, await messageSent. */
+    xSemaphoreTake(s_op_mutex, portMAX_DELAY);
+    /* If an interview frame for this node is still marked in-flight but stalled, free the
+     * slot so EXT1 can use the wake window (NCP may still finish the old frame). */
+    if (s_sensor_tx_pending && s_sensor_tx_node == copy.node_id && !s_ext_disp_inflight &&
+        (now_ms() - s_sensor_tx_ms) > 1500) {
+        ESP_LOGW(TAG, "Sensor 0x%04X: yield interview slot for EXT1", copy.node_id);
+        s_sensor_tx_pending = false;
+    }
+    bool queued = sensor_try_ext_display_unlocked(&copy);
+    xSemaphoreGive(s_op_mutex);
+    if (s_task) {
+        xTaskNotifyGive(s_task);
+    }
+    ESP_LOGI(TAG, "EXT1 queued %.1f °C for ..%02X%02X (%s)", (double)temp_c, eui64[0], eui64[1],
+             queued ? "tx now" : "wait poll/slot");
+    return ESP_OK;
 }
 
 static void press_log_push(const uint8_t eui64[8], uint8_t button_1based, uint8_t event)
@@ -1268,18 +1460,20 @@ static void relay_remote_to_target_locked(const zb_device_t *remote, uint8_t but
         return;
     }
     /* Debounce: messageSent synth + real RX can both fire for one press.
-     * IKEA Move (hold-to-dim) repeats — allow rate-limited steps, not a full ignore. */
+     * IKEA Move (hold-to-dim) repeats — allow rate-limited steps, not a full ignore.
+     * Power used to mute for 2.5s (ate intentional re-presses); EZSP now drops the
+     * delayed OnOff echo once, so a short floor is enough here. */
     static int64_t s_last_ms;
     static uint16_t s_last_node;
     static uint8_t s_last_btn;
     static bool s_room_on; /* last commanded room power (not stale device reports) */
     static uint16_t s_room_node;
     int64_t now = now_ms();
-    uint32_t debounce_ms = 350;
+    uint32_t debounce_ms = 120;
     if (button_index == 0) {
-        debounce_ms = 2500; /* power: synth + delayed real Off/Toggle */
+        debounce_ms = 280; /* power: merge near-simultaneous synth + real only */
     } else if (button_index == 1 || button_index == 2) {
-        debounce_ms = (event == HK_BTN_EVENT_LONG) ? 320 : 200;
+        debounce_ms = (event == HK_BTN_EVENT_LONG) ? 320 : 120;
     }
     if (remote->node_id == s_last_node && button_index == s_last_btn &&
         (now - s_last_ms) < (int64_t)debounce_ms) {
@@ -1400,23 +1594,34 @@ static void emit_remote_button(const zb_device_t *d, uint8_t button_index, uint8
     if (nb == 0 || button_index >= nb) {
         return;
     }
-    /* messageSent synth + real multicast RX can both fire for one physical press.
-     * Power (btn 0): synth Toggle then real On/Off/Toggle often 0.5–2s apart —
-     * without a wide window the stateful HK switch flips twice (off→on→off). */
+    /* messageSent synth + delayed real On/Off can both map to power (btn 0).
+     * Merge near-simultaneous dupes; for power also eat exactly one later echo
+     * (up to 2.5s) so HomeKit sees a single press without muting re-presses. */
     static int64_t s_emit_ms;
     static uint16_t s_emit_node;
     static uint8_t s_emit_btn;
+    static bool s_echo_armed;
     int64_t now = now_ms();
-    int64_t debounce_ms = (button_index == 0) ? 2500 : 350;
-    if (d->node_id == s_emit_node && button_index == s_emit_btn &&
-        (now - s_emit_ms) < debounce_ms) {
-        ESP_LOGI(TAG, "Remote btn %u debounced (%lld ms)", (unsigned)button_index,
-                 (long long)(now - s_emit_ms));
-        return;
+    int64_t merge_ms = (button_index == 0) ? 300 : 120;
+    int64_t echo_ms = (button_index == 0) ? 2500 : 400;
+    if (d->node_id == s_emit_node && button_index == s_emit_btn) {
+        int64_t dt = now - s_emit_ms;
+        if (dt < merge_ms) {
+            ESP_LOGI(TAG, "Remote btn %u merged (%lld ms)", (unsigned)button_index,
+                     (long long)dt);
+            return;
+        }
+        if (s_echo_armed && dt < echo_ms) {
+            s_echo_armed = false;
+            ESP_LOGI(TAG, "Remote btn %u echo suppressed (%lld ms)", (unsigned)button_index,
+                     (long long)dt);
+            return;
+        }
     }
     s_emit_ms = now;
     s_emit_node = d->node_id;
     s_emit_btn = button_index;
+    s_echo_armed = true;
 
     ESP_LOGI(TAG, "Remote button eui=..%02X%02X btn=%u event=%u type=%u", d->eui64[0], d->eui64[1],
              (unsigned)button_index, (unsigned)event, (unsigned)d->remote_type);
@@ -1554,6 +1759,38 @@ static void process_sensor_sent_events_unlocked(void)
             continue;
         }
         s_sensor_tx_pending = false;
+        if (s_ext_disp_inflight) {
+            s_ext_disp_inflight = false;
+            if (st == EMBER_SUCCESS) {
+                if (s_ext_disp_step == 0) {
+                    s_ext_disp_step = 1;
+                    ESP_LOGI(TAG, "Sensor 0x%04X EXT1 select ok → write temp", node);
+                    status_lock();
+                    zb_device_t *ed = device_find_by_node_locked(node);
+                    if (ed && ed->used) {
+                        next_copy = *ed;
+                        send_next = true;
+                    }
+                    status_unlock();
+                } else {
+                    s_ext_disp_pending = false;
+                    ESP_LOGI(TAG, "Sensor 0x%04X EXT1 temp delivery ok", node);
+                }
+            } else {
+                ESP_LOGW(TAG, "Sensor 0x%04X EXT1 step%u delivery 0x%02X — retry next poll",
+                         node, (unsigned)s_ext_disp_step, st);
+                /* Free slot; next poll/button will retry this step. */
+                status_lock();
+                zb_device_t *ed = device_find_by_node_locked(node);
+                if (ed && ed->used && s_ext_disp_pending) {
+                    next_copy = *ed;
+                    send_next = true;
+                }
+                status_unlock();
+            }
+            (void)cluster;
+            continue;
+        }
         status_lock();
         zb_device_t *d = device_find_by_node_locked(node);
         if (d && d->used && device_looks_like_temp_sensor(d)) {
@@ -1581,6 +1818,11 @@ static void process_sensor_sent_events_unlocked(void)
                 ESP_LOGW(TAG, "Sensor 0x%04X delivery 0x%02X — keep step%u (retry next poll)",
                          node, st, (unsigned)d->sensor_cfg_step);
             }
+            /* Prefer pending EXT1 over continuing interview on this node. */
+            if (s_ext_disp_pending && memcmp(d->eui64, s_ext_disp_eui, 8) == 0) {
+                next_copy = *d;
+                send_next = true;
+            }
         }
         status_unlock();
         (void)cluster;
@@ -1589,9 +1831,14 @@ static void process_sensor_sent_events_unlocked(void)
     if (s_sensor_tx_pending && (now_ms() - s_sensor_tx_ms) > 70000) {
         ESP_LOGW(TAG, "Sensor 0x%04X tx slot timeout — retry", s_sensor_tx_node);
         s_sensor_tx_pending = false;
+        if (s_ext_disp_inflight) {
+            s_ext_disp_inflight = false;
+        }
     }
     if (send_next) {
-        sensor_try_send_one_unlocked(&next_copy);
+        if (!sensor_try_ext_display_unlocked(&next_copy)) {
+            sensor_try_send_one_unlocked(&next_copy);
+        }
     }
 }
 
@@ -1599,6 +1846,10 @@ static void process_sensor_sent_events_unlocked(void)
 static void sensor_try_send_one_unlocked(zb_device_t *d)
 {
     if (!d || !d->used || s_sensor_tx_pending) {
+        return;
+    }
+    /* EXT1 (thermostat target on LCD) wins over interview/read. */
+    if (sensor_try_ext_display_unlocked(d)) {
         return;
     }
     zb_device_t copy = *d;
@@ -2263,6 +2514,40 @@ static void nvs_load_devices_locked(void)
     s_status.device_count = count;
     nvs_close(h);
     migrate_e1810_btn_order_locked();
+
+    /* One-shot: climate wake btn_mode was 0=Stateless / 1=Stateful; now
+     * 0=None (default) / 1=Stateless / 2=Stateful. Remap legacy Stateful(1)→2. */
+    {
+        nvs_handle_t mh;
+        uint8_t done = 0;
+        if (nvs_open(NVS_NS, NVS_READWRITE, &mh) == ESP_OK) {
+            (void)nvs_get_u8(mh, "sbtn_v2", &done);
+            if (!done) {
+                bool dirty = false;
+                for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
+                    zb_device_t *d = &s_devices[i];
+                    if (!d->used || zigbee_host_remote_button_count(d) > 0) {
+                        continue;
+                    }
+                    if (!device_looks_like_temp_sensor(d)) {
+                        continue;
+                    }
+                    if (d->btn_mode[0] == 1) {
+                        d->btn_mode[0] = ZB_SENSOR_BTN_STATEFUL;
+                        dirty = true;
+                    }
+                    /* legacy Stateless(0) becomes None — no HK button by default */
+                }
+                (void)nvs_set_u8(mh, "sbtn_v2", 1);
+                (void)nvs_commit(mh);
+                if (dirty) {
+                    s_devices_nvs_dirty = true;
+                }
+                ESP_LOGI(TAG, "Migrated climate wake-button modes (None default)");
+            }
+            nvs_close(mh);
+        }
+    }
 }
 
 static zb_device_t *device_find_by_node_locked(uint16_t node_id)
@@ -2601,6 +2886,14 @@ static bool parse_zcl_payload_locked(zb_device_t *d, uint16_t cluster, const uin
         }
         if (cluster == ZCL_CLUSTER_ON_OFF || cluster == ZCL_CLUSTER_LEVEL_CONTROL ||
             cluster == ZCL_CLUSTER_SCENES || cluster == ZCL_CLUSTER_IKEA_BUTTON) {
+            /* Climate sensors (SNZB-02D): wake button is OnOff Toggle — handle before
+             * the sleepy→fake-bulb remote path (Toggle often lands on ep1). */
+            if (cluster == ZCL_CLUSTER_ON_OFF && cmd == ZCL_CMD_TOGGLE &&
+                device_looks_like_temp_sensor(d) &&
+                zigbee_host_device_kind(d) != ZB_DEVICE_KIND_REMOTE) {
+                emit_sensor_button(d);
+                return false;
+            }
             bool known_remote = zigbee_host_device_kind(d) == ZB_DEVICE_KIND_REMOTE ||
                                 model_looks_like_remote(d->model) ||
                                 model_looks_like_remote(d->name) ||
@@ -3713,14 +4006,27 @@ esp_err_t zigbee_host_update_device(const uint8_t eui64[8], const zb_device_upda
         }
         if (upd->set_btn_modes) {
             uint8_t n = zigbee_host_remote_button_count(d);
-            if (n == 0) {
-                n = ZB_REMOTE_MAX_BUTTONS;
-            }
-            uint8_t lim = upd->btn_mode_count < n ? upd->btn_mode_count : n;
-            for (uint8_t i = 0; i < lim && i < ZB_REMOTE_MAX_BUTTONS; i++) {
-                uint8_t m = upd->btn_modes[i];
-                d->btn_mode[i] = (m == ZB_BTN_MODE_STATEFUL) ? ZB_BTN_MODE_STATEFUL
-                                                             : ZB_BTN_MODE_STATELESS;
+            bool climate = (n == 0) && (d->has_temp || d->has_humidity ||
+                                        zigbee_host_device_kind(d) == ZB_DEVICE_KIND_SENSOR);
+            if (climate) {
+                uint8_t m = upd->btn_mode_count > 0 ? upd->btn_modes[0] : ZB_SENSOR_BTN_NONE;
+                if (m == ZB_SENSOR_BTN_STATEFUL) {
+                    d->btn_mode[0] = ZB_SENSOR_BTN_STATEFUL;
+                } else if (m == ZB_SENSOR_BTN_STATELESS) {
+                    d->btn_mode[0] = ZB_SENSOR_BTN_STATELESS;
+                } else {
+                    d->btn_mode[0] = ZB_SENSOR_BTN_NONE;
+                }
+            } else {
+                if (n == 0) {
+                    n = ZB_REMOTE_MAX_BUTTONS;
+                }
+                uint8_t lim = upd->btn_mode_count < n ? upd->btn_mode_count : n;
+                for (uint8_t i = 0; i < lim && i < ZB_REMOTE_MAX_BUTTONS; i++) {
+                    uint8_t m = upd->btn_modes[i];
+                    d->btn_mode[i] = (m == ZB_BTN_MODE_STATEFUL) ? ZB_BTN_MODE_STATEFUL
+                                                                 : ZB_BTN_MODE_STATELESS;
+                }
             }
         }
         if (upd->set_btn_names) {
@@ -4130,8 +4436,9 @@ static void host_task(void *arg)
                 process_zcl_messages_locked();
                 status_unlock();
                 xSemaphoreGive(s_op_mutex);
-                bool had_btn = s_hk_btn_q_len > 0;
+                bool had_btn = s_hk_btn_q_len > 0 || s_sensor_btn_q_len > 0;
                 flush_hk_btn_callbacks();
+                flush_sensor_btn_callbacks();
                 flush_sensor_upd_callbacks();
                 /* Force flush only after a button latch; otherwise debounce (≤5s). */
                 nvs_flush_devices_if_dirty(had_btn);
@@ -4290,7 +4597,7 @@ static void host_task(void *arg)
                     }
                     status_unlock();
                     if (is_sensor &&
-                        (!pcopy.sensor_reporting ||
+                        (s_ext_disp_pending || !pcopy.sensor_reporting ||
                          (now_ms() - pcopy.last_interview_ms) > 300000)) {
                         xSemaphoreTake(s_op_mutex, portMAX_DELAY);
                         sensor_try_send_one_unlocked(&pcopy);
@@ -4467,8 +4774,9 @@ static void host_task(void *arg)
                     xSemaphoreTake(s_op_mutex, portMAX_DELAY);
                 }
                 xSemaphoreGive(s_op_mutex);
-                bool btn_pending = s_hk_btn_q_len > 0;
+                bool btn_pending = s_hk_btn_q_len > 0 || s_sensor_btn_q_len > 0;
                 flush_hk_btn_callbacks();
+                flush_sensor_btn_callbacks();
                 flush_sensor_upd_callbacks();
                 nvs_flush_devices_if_dirty(btn_pending);
             }

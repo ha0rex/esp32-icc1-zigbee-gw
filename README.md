@@ -18,7 +18,7 @@ Phone / Home app / browser
      Zigbee mesh
 ```
 
-**Current firmware version:** `0.3.38` (see `PROJECT_VER` in `CMakeLists.txt`)
+**Current firmware version:** `0.3.51` (see `PROJECT_VER` in `CMakeLists.txt`)
 
 **Repo:** [ha0rex/esp32-icc1-zigbee-gw](https://github.com/ha0rex/esp32-icc1-zigbee-gw)
 
@@ -170,11 +170,13 @@ Supported kinds (portal chip + HomeKit when exposed):
 | **Outlet** | Plug models (`S31`, `BASICZBR3`, …) | Outlet |
 | **Switch** | Generic On/Off | Switch |
 | **Irrigation** | Valve / Sonoff **SWV** / irrigation models | Irrigation System + Valve (open/close = On/Off; no native schedules) |
-| **Sensor** | Temp / humidity | Temperature + Humidity (+ battery) |
+| **Sensor** | Temp / humidity | Temperature + Humidity (+ battery); optional wake button (None / SPS / Switch) |
 | **Contact / Motion / Leak / Smoke** | IAS Zone (or Occupancy for PIR) | Matching HomeKit sensor |
 | **Remote** | IKEA buttons | Programmable switches or control mode |
 
 **Sensors** (Sonoff SNZB-02 / SNZB-02D / TH01, etc.): temperature, humidity, battery → HomeKit. Classic SNZB-02 (TI `00:12:4b`) is a sleepy end device — **Read values** queues one ZCL frame until the next poll; press the sensor button shortly after so it can check in. Kind detection prefers temp/humidity (and climate model IDs) over contact name fingerprints, so names like **Outdoors** are not mistaken for door/contact sensors. Bridged HomeKit AIDs are stable per Zigbee EUI (not per kind). The bridged accessory **kind is sticky in NVS** so reboots do not rebuild as a different service type (which made Home reject room/name edits). A one-time heal still rewrites former Contact tiles that are actually climate sensors (same AID — set room/name once after that). After create, the bridge does **not** push Name updates (Home owns room/custom name). Plugs/switches ignore On/Off attribute echoes for a few seconds after a HomeKit write so the UI does not flip back (e.g. CK-BL702).
+
+**SNZB-02D wake button:** the physical button sends Zigbee OnOff Toggle. In the device edit modal, **Switch type** is **None** (default — no HomeKit button accessory), **Stateless** (programmable switch), or **Stateful** (On/Off that toggles on each press). If that sensor is the temperature sensor of a **Grouped thermostat**, each press still raises the target by **0.5 °C** (wraps 38→10 °C) and best-effort writes Sonoff **0xFC11** (`0x600E=external`, then `0x600D` = °C×100) for the small **EXT1** LCD area (large digits stay local). Delivery is confirmed via `messageSent`; failures retry on the next poll. Official Z2M docs expose these attrs mainly on **SNZB-02DR2**; community reports SNZB-02D ~1.0.4+.
 
 Device **kinds are compile-time** in firmware. Only accessories you expose allocate HomeKit objects on the heap. Heap pressure scales with live inventory, bridged accessories, and portal/HAP buffers — a common failure mode on the **ESP32-C3**. Prefer **ESP32-S3** (or another chip with more internal RAM / PSRAM).
 
@@ -186,7 +188,7 @@ Device **kinds are compile-time** in firmware. Only accessories you expose alloc
 
 | Mode | Behaviour |
 | --- | --- |
-| **HomeKit buttons** | Each button → programmable switch and/or stateful On/Off in Home; names editable |
+| **HomeKit buttons** | Each button → programmable switch and/or stateful On/Off in Home; names editable. Presses notify HomeKit immediately (duplicate Zigbee echoes from one physical press are filtered; intentional re-presses are not muted for seconds). |
 | **Control a device** | Power (and related) presses toggle selected lights / switches / groups on the Zigbee side; **not** exposed to HomeKit |
 
 **Touchlink (control mode):** after join, hold the remote **≤5 cm from a real bulb** until the bulb flashes. The gateway learns that group and removes the lights from it so presses go to the gateway only. Holding the remote toward the gateway alone does **not** bind.

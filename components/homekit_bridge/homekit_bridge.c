@@ -80,6 +80,7 @@ struct hk_bridged {
     bool used;
     uint8_t eui64[8];
     zb_device_kind_t kind;
+    bool is_sensor_btn; /**< Companion SPS for climate sensor wake button */
     hap_acc_t *acc;
     hap_char_t *temp_char;
     hap_char_t *hum_char;
@@ -212,7 +213,19 @@ static int accessory_identify(hap_acc_t *ha)
 static hk_bridged_t *find_bridged(const uint8_t eui64[8])
 {
     for (int i = 0; i < HK_MAX_BRIDGED; i++) {
-        if (s_bridged[i].used && memcmp(s_bridged[i].eui64, eui64, 8) == 0) {
+        if (s_bridged[i].used && !s_bridged[i].is_sensor_btn &&
+            memcmp(s_bridged[i].eui64, eui64, 8) == 0) {
+            return &s_bridged[i];
+        }
+    }
+    return NULL;
+}
+
+static hk_bridged_t *find_bridged_sensor_btn(const uint8_t eui64[8])
+{
+    for (int i = 0; i < HK_MAX_BRIDGED; i++) {
+        if (s_bridged[i].used && s_bridged[i].is_sensor_btn &&
+            memcmp(s_bridged[i].eui64, eui64, 8) == 0) {
             return &s_bridged[i];
         }
     }
@@ -547,6 +560,15 @@ static int aid_for_device(const uint8_t eui64[8])
         ESP_LOGI(TAG, "HomeKit AID migrate %s → %s (aid=%d)", legacy, serial, aid);
         return aid;
     }
+    return hap_get_unique_aid(serial);
+}
+
+/** Stable AID for the climate-sensor wake-button companion accessory. */
+static int aid_for_sensor_button(const uint8_t eui64[8])
+{
+    char serial[20];
+    snprintf(serial, sizeof(serial), "bt%02x%02x%02x%02x%02x%02x", eui64[0], eui64[1], eui64[2],
+             eui64[3], eui64[4], eui64[5]);
     return hap_get_unique_aid(serial);
 }
 
@@ -1206,6 +1228,109 @@ static esp_err_t add_bridged_binary_sensor(const zb_device_t *d, zb_device_kind_
     return ESP_OK;
 }
 
+static esp_err_t add_bridged_sensor_button(const zb_device_t *d, const char *sensor_name)
+{
+    if (!d || !d->used || !d->homekit_expose) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!zigbee_host_sensor_btn_homekit(d)) {
+        hk_bridged_t *existing = find_bridged_sensor_btn(d->eui64);
+        if (existing) {
+            remove_bridged(existing, "sensor button none");
+        }
+        return ESP_OK;
+    }
+    uint8_t want_mode = zigbee_host_btn_is_stateful(d, 0) ? ZB_SENSOR_BTN_STATEFUL
+                                                          : ZB_SENSOR_BTN_STATELESS;
+    hk_bridged_t *existing = find_bridged_sensor_btn(d->eui64);
+    if (existing) {
+        if (existing->btn_mode_snap[0] == want_mode && existing->button_count == 1) {
+            return ESP_OK;
+        }
+        remove_bridged(existing, "sensor button mode change");
+    }
+    hk_bridged_t *slot = alloc_bridged();
+    if (!slot) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char name[40];
+    if (sensor_name && sensor_name[0]) {
+        snprintf(name, sizeof(name), "%s Button", sensor_name);
+    } else {
+        snprintf(name, sizeof(name), "Sensor Button");
+    }
+    char serial[20];
+    snprintf(serial, sizeof(serial), "bt%02x%02x%02x%02x%02x%02x", d->eui64[0], d->eui64[1],
+             d->eui64[2], d->eui64[3], d->eui64[4], d->eui64[5]);
+    char manufacturer[32], model[32];
+    snprintf(manufacturer, sizeof(manufacturer), "%s",
+             d->manufacturer[0] ? d->manufacturer : "Unknown");
+    snprintf(model, sizeof(model), "%s", d->model[0] ? d->model : "SNZB-02D");
+    const char *fw_rev = "1.0.0";
+    bool stateful = (want_mode == ZB_SENSOR_BTN_STATEFUL);
+
+    hap_acc_cfg_t cfg = {
+        .name = name,
+        .manufacturer = manufacturer,
+        .model = model,
+        .serial_num = serial,
+        .fw_rev = (char *)fw_rev,
+        .hw_rev = "1.0",
+        .pv = "1.1.0",
+        .cid = stateful ? HAP_CID_SWITCH : HAP_CID_PROGRAMMABLE_SWITCH,
+        .identify_routine = accessory_identify,
+    };
+
+    hap_acc_t *acc = hap_acc_create(&cfg);
+    if (!acc) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    hap_serv_t *serv = NULL;
+    if (stateful) {
+        bool on = d->btn_on[0];
+        serv = hap_serv_switch_create(on);
+        if (!serv) {
+            hap_acc_delete(acc);
+            return ESP_ERR_NO_MEM;
+        }
+        hap_serv_add_char(serv, hap_char_name_create("Button"));
+        hap_serv_set_priv(serv, slot);
+        hap_acc_add_serv(acc, serv);
+        slot->btn_on_char[0] = hap_serv_get_char_by_uuid(serv, HAP_CHAR_UUID_ON);
+        slot->on_char = slot->btn_on_char[0];
+    } else {
+        serv = hap_serv_stateless_programmable_switch_create(0);
+        if (!serv) {
+            hap_acc_delete(acc);
+            return ESP_ERR_NO_MEM;
+        }
+        hap_serv_add_char(serv, hap_char_name_create("Button"));
+        hap_acc_add_serv(acc, serv);
+        slot->btn_event_char[0] =
+            hap_serv_get_char_by_uuid(serv, HAP_CHAR_UUID_PROGRAMMABLE_SWITCH_EVENT);
+    }
+    slot->button_count = 1;
+    slot->btn_mode_snap[0] = want_mode;
+
+    int aid = aid_for_sensor_button(d->eui64);
+    hap_add_bridged_accessory(acc, aid);
+    inventory_notify_changed();
+
+    slot->used = true;
+    slot->kind = ZB_DEVICE_KIND_SENSOR;
+    slot->is_sensor_btn = true;
+    slot->missing_ticks = 0;
+    memcpy(slot->eui64, d->eui64, 8);
+    slot->acc = acc;
+    snprintf(slot->acc_name, sizeof(slot->acc_name), "%s", name);
+    s_st.accessory_count++;
+    ESP_LOGI(TAG, "HomeKit exposed sensor button: %s aid=%d serial=%s mode=%s", name, aid, serial,
+             stateful ? "stateful" : "stateless");
+    return ESP_OK;
+}
+
 static esp_err_t add_bridged_sensor(const zb_device_t *d)
 {
     if (!d || !d->used || !d->homekit_expose) {
@@ -1292,6 +1417,7 @@ static esp_err_t add_bridged_sensor(const zb_device_t *d)
     s_st.accessory_count++;
     ESP_LOGI(TAG, "HomeKit exposed sensor: %s mfr=%s model=%s aid=%d serial=%s (temp+humidity+batt)",
              name, manufacturer, model, aid, serial);
+    (void)add_bridged_sensor_button(d, name);
     return ESP_OK;
 }
 
@@ -1554,6 +1680,100 @@ static esp_err_t add_bridged_remote(const zb_device_t *d)
     return ESP_OK;
 }
 
+static void on_sensor_button(const uint8_t eui64[8])
+{
+    if (!eui64) {
+        return;
+    }
+    float new_target = 0.0f;
+    bool cycled = thermostat_on_sensor_button(eui64, &new_target);
+    if (cycled) {
+        (void)zigbee_host_queue_ext_display_temp(eui64, new_target);
+    }
+
+    zb_device_t d;
+    bool have_d = zigbee_host_get_device(eui64, &d);
+    bool hk_btn = have_d && zigbee_host_sensor_btn_homekit(&d);
+    bool stateful = hk_btn && zigbee_host_btn_is_stateful(&d, 0);
+
+    if (!s_started) {
+        if (stateful) {
+            (void)zigbee_host_btn_toggle(eui64, 0);
+        }
+        return;
+    }
+
+    hap_char_t *ev = NULL;
+    hap_char_t *on_hc = NULL;
+    hap_char_t *targ_temps[GROUP_MAX];
+    float targ_vals[GROUP_MAX];
+    uint8_t ntarg = 0;
+    bool on_after = false;
+    if (s_sync_mu) {
+        xSemaphoreTake(s_sync_mu, portMAX_DELAY);
+    }
+    if (hk_btn) {
+        hk_bridged_t *slot = find_bridged_sensor_btn(eui64);
+        if (slot && slot->button_count > 0) {
+            if (stateful) {
+                on_hc = slot->btn_on_char[0] ? slot->btn_on_char[0] : slot->on_char;
+            } else {
+                ev = slot->btn_event_char[0];
+            }
+        }
+    }
+    if (cycled) {
+        for (uint16_t ti = 0; ti < GROUP_MAX && ntarg < GROUP_MAX; ti++) {
+            if (!s_groups[ti].used || s_groups[ti].group_type != GROUP_TYPE_THERMOSTAT) {
+                continue;
+            }
+            group_t t;
+            if (!group_get_by_id(s_groups[ti].group_id, &t)) {
+                continue;
+            }
+            if (t.thermo_kind != GROUP_THERMO_KIND_TEMP) {
+                continue;
+            }
+            if (memcmp(t.sensor_eui, eui64, 8) != 0) {
+                continue;
+            }
+            if (s_groups[ti].targ_temp_char) {
+                targ_temps[ntarg] = s_groups[ti].targ_temp_char;
+                targ_vals[ntarg] = t.target_c;
+                ntarg++;
+            }
+        }
+    }
+    if (s_sync_mu) {
+        xSemaphoreGive(s_sync_mu);
+    }
+
+    if (hk_btn) {
+        if (stateful) {
+            on_after = zigbee_host_btn_toggle(eui64, 0);
+            if (on_hc) {
+                update_char_bool_notify_edge(on_hc, on_after);
+                ESP_LOGI(TAG, "HomeKit sensor button stateful toggle -> %s",
+                         on_after ? "ON" : "OFF");
+            } else {
+                ESP_LOGW(TAG, "Sensor button: no HomeKit Switch accessory");
+            }
+        } else if (ev) {
+            hap_char_enable_notif_all_sessions(ev);
+            hap_val_t val = {.i = (int)HK_BTN_EVENT_SINGLE};
+            hap_char_update_val(ev, &val);
+            ESP_LOGI(TAG, "HomeKit sensor button single press");
+        } else {
+            ESP_LOGW(TAG, "Sensor button: no HomeKit SPS accessory");
+        }
+    }
+    for (uint8_t i = 0; i < ntarg; i++) {
+        update_char_float_notify(targ_temps[i], targ_vals[i], 10.0f, 38.0f);
+        ESP_LOGI(TAG, "HomeKit thermostat target → %.1f °C (sensor button)",
+                 (double)targ_vals[i]);
+    }
+}
+
 static void on_remote_button(const uint8_t eui64[8], uint8_t button_index, uint8_t event)
 {
     if (!eui64) {
@@ -1663,12 +1883,23 @@ static void on_sensor_update(const uint8_t eui64[8])
     uint8_t thermo_h[GROUP_MAX];
     uint8_t thermo_hd_val[GROUP_MAX];
     uint8_t nthermo = 0;
+    memset(thermo_temp, 0, sizeof(thermo_temp));
+    memset(thermo_heat, 0, sizeof(thermo_heat));
+    memset(thermo_hum, 0, sizeof(thermo_hum));
+    memset(thermo_hd_char, 0, sizeof(thermo_hd_char));
+    memset(thermo_t, 0, sizeof(thermo_t));
+    memset(thermo_rh, 0, sizeof(thermo_rh));
+    memset(thermo_h, 0, sizeof(thermo_h));
+    memset(thermo_hd_val, 0, sizeof(thermo_hd_val));
 
     if (s_sync_mu) {
         xSemaphoreTake(s_sync_mu, portMAX_DELAY);
     }
     for (int i = 0; i < HK_MAX_BRIDGED; i++) {
         if (!s_bridged[i].used || memcmp(s_bridged[i].eui64, eui64, 8) != 0) {
+            continue;
+        }
+        if (s_bridged[i].is_sensor_btn) {
             continue;
         }
         slot_kind = s_bridged[i].kind;
@@ -1733,9 +1964,11 @@ static void on_sensor_update(const uint8_t eui64[8])
             thermo_temp[nthermo] = t.has_current_temp ? s_groups[ti].curr_temp_char : NULL;
             thermo_heat[nthermo] = s_groups[ti].curr_state_char;
             thermo_hum[nthermo] = t.has_current_humidity ? s_groups[ti].curr_hum_char : NULL;
+            thermo_hd_char[nthermo] = NULL;
             thermo_t[nthermo] = t.current_temp_c;
             thermo_h[nthermo] = hk_current_heat_cool_state(&t);
             thermo_rh[nthermo] = t.current_humidity_pct;
+            thermo_hd_val[nthermo] = 0;
             if (thermo_temp[nthermo] || thermo_heat[nthermo] || thermo_hum[nthermo]) {
                 nthermo++;
             }
@@ -2369,6 +2602,10 @@ static void sync_from_zigbee(void)
             remove_bridged(&s_bridged[i], "homekit_expose off");
             continue;
         }
+        if (s_bridged[i].is_sensor_btn) {
+            /* Companion SPS — keep while the climate sensor stays exposed. */
+            continue;
+        }
         zb_device_kind_t live = zigbee_host_device_kind(&d);
         /* Heal climate devices stuck as Contact (name "Outdoors" etc.) even when
          * sticky kind still locks the wrong accessory type. Same AID is reused. */
@@ -2502,6 +2739,17 @@ static void sync_from_zigbee(void)
         zb_device_t d;
         if (zigbee_host_get_device_at(j, &d) && d.homekit_expose) {
             add_bridged_device(&d);
+            if (effective_kind(&d) == ZB_DEVICE_KIND_SENSOR) {
+                char nm[40];
+                if (d.name[0]) {
+                    snprintf(nm, sizeof(nm), "%s", d.name);
+                } else if (d.model[0]) {
+                    snprintf(nm, sizeof(nm), "%s", d.model);
+                } else {
+                    snprintf(nm, sizeof(nm), "Sensor");
+                }
+                (void)add_bridged_sensor_button(&d, nm);
+            }
         }
     }
 
@@ -2610,6 +2858,16 @@ static uint32_t compute_inventory_sig(void)
                 h ^= (uint32_t)d.btn_mode[bi] << (bi * 2);
                 h *= 16777619u;
             }
+        }
+        if (k == ZB_DEVICE_KIND_SENSOR) {
+            h ^= 0x62746e31u; /* climate sensors may expose a wake-button accessory */
+            h *= 16777619u;
+            uint8_t sm = d.btn_mode[0];
+            if (sm != ZB_SENSOR_BTN_STATELESS && sm != ZB_SENSOR_BTN_STATEFUL) {
+                sm = ZB_SENSOR_BTN_NONE;
+            }
+            h ^= (uint32_t)sm;
+            h *= 16777619u;
         }
     }
     for (uint16_t tj = 0; tj < GROUP_MAX; tj++) {
@@ -2874,6 +3132,7 @@ esp_err_t homekit_bridge_start(void)
     }
     zigbee_host_set_remote_button_cb(on_remote_button);
     zigbee_host_set_sensor_update_cb(on_sensor_update);
+    zigbee_host_set_sensor_button_cb(on_sensor_button);
     snprintf(s_st.setup_code, sizeof(s_st.setup_code), "%s", CONFIG_HK_SETUP_CODE);
     snprintf(s_st.setup_id, sizeof(s_st.setup_id), "%s", CONFIG_HK_SETUP_ID);
     snprintf(s_st.status, sizeof(s_st.status), "starting");

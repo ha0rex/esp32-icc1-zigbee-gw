@@ -21,6 +21,13 @@ typedef enum {
 
 #define ZB_BTN_MODE_STATELESS 0
 #define ZB_BTN_MODE_STATEFUL  1
+/**
+ * Climate sensor wake-button modes in btn_mode[0] (not used by remotes).
+ * None is the default (memset 0) — no HomeKit companion accessory.
+ */
+#define ZB_SENSOR_BTN_NONE      0
+#define ZB_SENSOR_BTN_STATELESS 1
+#define ZB_SENSOR_BTN_STATEFUL  2
 
 #define ZB_REMOTE_TYPE_HOMEKIT  0 /**< Per-button HomeKit SPS / Switch */
 #define ZB_REMOTE_TYPE_CONTROL  1 /**< Control selected lights/switches (GW-synced absolute) */
@@ -205,6 +212,11 @@ const char *zigbee_host_remote_button_name(const zb_device_t *d, uint8_t button_
 esp_err_t zigbee_host_btn_set_name(const uint8_t eui64[8], uint8_t button_index, const char *name);
 /** True if button_index (0-based) is configured as a stateful HomeKit switch. */
 bool zigbee_host_btn_is_stateful(const zb_device_t *d, uint8_t button_index);
+/**
+ * Climate wake-button HomeKit exposure: false when mode is NONE (default).
+ * Remotes ignore this — use zigbee_host_btn_is_stateful / button_count.
+ */
+bool zigbee_host_sensor_btn_homekit(const zb_device_t *d);
 /** Read/toggle/set latch for a stateful remote button; persists to NVS. */
 bool zigbee_host_btn_get_on(const uint8_t eui64[8], uint8_t button_index);
 esp_err_t zigbee_host_btn_set_on(const uint8_t eui64[8], uint8_t button_index, bool on);
@@ -223,6 +235,19 @@ void zigbee_host_set_remote_button_cb(zb_remote_button_cb_t cb);
  */
 typedef void (*zb_sensor_update_cb_t)(const uint8_t eui64[8]);
 void zigbee_host_set_sensor_update_cb(zb_sensor_update_cb_t cb);
+
+/**
+ * Optional callback when a climate sensor wake button sends OnOff Toggle.
+ * Fired outside status_lock (same queue as remote buttons).
+ */
+typedef void (*zb_sensor_button_cb_t)(const uint8_t eui64[8]);
+void zigbee_host_set_sensor_button_cb(zb_sensor_button_cb_t cb);
+
+/**
+ * Best-effort push of external temperature to Sonoff SNZB-02D EXT1 display
+ * (cluster 0xFC11). Queues a Write Attributes while the sleepy sensor is awake.
+ */
+esp_err_t zigbee_host_queue_ext_display_temp(const uint8_t eui64[8], float temp_c);
 
 #define ZB_REMOTE_PRESS_LOG 12
 

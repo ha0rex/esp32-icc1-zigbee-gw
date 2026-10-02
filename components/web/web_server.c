@@ -34,9 +34,13 @@
 static const char *TAG = "web";
 static httpd_handle_t s_server;
 static SemaphoreHandle_t s_scan_mutex;
+static SemaphoreHandle_t s_status_mutex; /**< Serializes shared s_json / s_zb_snap */
 static SemaphoreHandle_t s_root_mu; /**< At most one full portal HTML send */
-static char s_scan_json[2048];
-static wifi_scan_ap_t s_scan_aps[12];
+/** Enough for a dense 2.4 GHz neighbourhood; must match scan call max. */
+#define WEB_SCAN_AP_MAX 32
+static wifi_scan_ap_t s_scan_aps[WEB_SCAN_AP_MAX];
+/** ~100 bytes/AP worst case + wrapper; 32 APs need headroom past 2 KiB. */
+static char s_scan_json[4096];
 static char s_json[8192];
 /* Light status snapshot — devices are fetched via zigbee_host_get_device_at(). */
 static zigbee_host_status_t s_zb_snap;
@@ -312,6 +316,14 @@ static const char *reset_reason_json(void)
 static esp_err_t api_status(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Connection", "close");
+    /* Portal polls /api/status every few seconds; overlapping requests used to
+     * race on s_json/s_zb_snap and panic (heap/stack corruption). */
+    if (!s_status_mutex || xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(800)) != pdTRUE) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_hdr(req, "Retry-After", "1");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"busy\":true}");
+    }
     wifi_manager_status_t wifi;
     zigbee_host_get_status(&s_zb_snap);
     wifi_manager_get_status(&wifi);
@@ -435,13 +447,25 @@ static esp_err_t api_status(httpd_req_t *req)
             (unsigned)zigbee_host_remote_button_count(d));
         {
             uint8_t nb = zigbee_host_remote_button_count(d);
+            bool climate = (nb == 0) && (d->has_temp || d->has_humidity ||
+                                         zigbee_host_device_kind(d) == ZB_DEVICE_KIND_SENSOR);
             if (nb > ZB_REMOTE_MAX_BUTTONS) {
                 nb = ZB_REMOTE_MAX_BUTTONS;
             }
+            if (climate) {
+                nb = 1; /* wake-button mode in btn_mode[0] */
+            }
             for (uint8_t bi = 0; bi < nb; bi++) {
+                uint8_t mode = d->btn_mode[bi];
+                if (climate) {
+                    if (mode != ZB_SENSOR_BTN_STATELESS && mode != ZB_SENSOR_BTN_STATEFUL) {
+                        mode = ZB_SENSOR_BTN_NONE;
+                    }
+                } else {
+                    mode = (mode == ZB_BTN_MODE_STATEFUL) ? 1 : 0;
+                }
                 pos += (size_t)snprintf(s_json + pos, sizeof(s_json) - pos, "%s%u",
-                                        bi ? "," : "",
-                                        (unsigned)(d->btn_mode[bi] == ZB_BTN_MODE_STATEFUL ? 1 : 0));
+                                        bi ? "," : "", (unsigned)mode);
             }
             pos += (size_t)snprintf(s_json + pos, sizeof(s_json) - pos, "],\"button_on\":[");
             for (uint8_t bi = 0; bi < nb; bi++) {
@@ -451,9 +475,23 @@ static esp_err_t api_status(httpd_req_t *req)
             pos += (size_t)snprintf(s_json + pos, sizeof(s_json) - pos, "],\"button_names\":[");
             for (uint8_t bi = 0; bi < nb; bi++) {
                 char bn[48];
-                json_escape(zigbee_host_remote_button_name(d, bi), bn, sizeof(bn));
+                if (climate) {
+                    json_escape("Button", bn, sizeof(bn));
+                } else {
+                    json_escape(zigbee_host_remote_button_name(d, bi), bn, sizeof(bn));
+                }
                 pos += (size_t)snprintf(s_json + pos, sizeof(s_json) - pos, "%s\"%s\"", bi ? "," : "",
                                         bn);
+            }
+            /* Close button_names[]; sensor wake-button mode is a sibling field. */
+            pos += (size_t)snprintf(s_json + pos, sizeof(s_json) - pos, "]");
+            if (climate) {
+                uint8_t sm = d->btn_mode[0];
+                if (sm != ZB_SENSOR_BTN_STATELESS && sm != ZB_SENSOR_BTN_STATEFUL) {
+                    sm = ZB_SENSOR_BTN_NONE;
+                }
+                pos += (size_t)snprintf(s_json + pos, sizeof(s_json) - pos,
+                                        ",\"sensor_btn_mode\":%u", (unsigned)sm);
             }
         }
         {
@@ -473,7 +511,8 @@ static esp_err_t api_status(httpd_req_t *req)
             if (tc > ZB_REMOTE_MAX_TARGETS) {
                 tc = ZB_REMOTE_MAX_TARGETS;
             }
-            pos = json_append(s_json, sizeof(s_json), pos, "],\"remote_type\":%u,\"targets\":[",
+            /* button_names already closed above — continue the device object. */
+            pos = json_append(s_json, sizeof(s_json), pos, ",\"remote_type\":%u,\"targets\":[",
                               (unsigned)((d->remote_type == ZB_REMOTE_TYPE_CONTROL)
                                              ? ZB_REMOTE_TYPE_CONTROL
                                              : ZB_REMOTE_TYPE_HOMEKIT));
@@ -628,6 +667,7 @@ static esp_err_t api_status(httpd_req_t *req)
     if (err == ESP_OK) {
         web_note_handler_ok();
     }
+    xSemaphoreGive(s_status_mutex);
     return err;
 }
 
@@ -780,19 +820,35 @@ static esp_err_t api_wifi_scan(httpd_req_t *req)
         return httpd_resp_sendstr(req, "{\"aps\":[],\"busy\":true}");
     }
     memset(s_scan_aps, 0, sizeof(s_scan_aps));
-    int n = wifi_manager_scan_aps(s_scan_aps, 24);
+    int n = wifi_manager_scan_aps(s_scan_aps, WEB_SCAN_AP_MAX);
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > WEB_SCAN_AP_MAX) {
+        n = WEB_SCAN_AP_MAX;
+    }
     size_t pos = 0;
     pos += (size_t)snprintf(s_scan_json + pos, sizeof(s_scan_json) - pos, "{\"aps\":[");
-    for (int i = 0; i < n && pos + 120 < sizeof(s_scan_json); i++) {
+    int written = 0;
+    for (int i = 0; i < n; i++) {
+        /* Leave room for closing `],"count":NN}` (~16 bytes) + one AP (~120). */
+        if (pos + 140 >= sizeof(s_scan_json)) {
+            break;
+        }
         char sessid[80], sebssid[48];
         json_escape(s_scan_aps[i].ssid, sessid, sizeof(sessid));
         json_escape(s_scan_aps[i].bssid, sebssid, sizeof(sebssid));
-        pos += (size_t)snprintf(
-            s_scan_json + pos, sizeof(s_scan_json) - pos,
-            "%s{\"ssid\":\"%s\",\"bssid\":\"%s\",\"rssi\":%d,\"channel\":%u}", i ? "," : "", sessid,
-            sebssid, (int)s_scan_aps[i].rssi, (unsigned)s_scan_aps[i].channel);
+        int w = snprintf(s_scan_json + pos, sizeof(s_scan_json) - pos,
+                         "%s{\"ssid\":\"%s\",\"bssid\":\"%s\",\"rssi\":%d,\"channel\":%u}",
+                         written ? "," : "", sessid, sebssid, (int)s_scan_aps[i].rssi,
+                         (unsigned)s_scan_aps[i].channel);
+        if (w < 0 || (size_t)w >= sizeof(s_scan_json) - pos) {
+            break;
+        }
+        pos += (size_t)w;
+        written++;
     }
-    snprintf(s_scan_json + pos, sizeof(s_scan_json) - pos, "],\"count\":%d}", n);
+    snprintf(s_scan_json + pos, sizeof(s_scan_json) - pos, "],\"count\":%d}", written);
     httpd_resp_set_type(req, "application/json");
     esp_err_t err = httpd_resp_sendstr(req, s_scan_json);
     xSemaphoreGive(s_scan_mutex);
@@ -1269,6 +1325,18 @@ static esp_err_t api_device_update(httpd_req_t *req)
                 upd.btn_modes[i] =
                     (modes[i] == ZB_BTN_MODE_STATEFUL) ? ZB_BTN_MODE_STATEFUL : ZB_BTN_MODE_STATELESS;
             }
+        }
+    } else if (strstr(body, "\"sensor_btn_mode\"")) {
+        /* Climate sensor wake button — 0=None, 1=Stateless, 2=Stateful. */
+        upd.set_btn_modes = true;
+        upd.btn_mode_count = 1;
+        int m = json_get_int(body, "sensor_btn_mode", ZB_SENSOR_BTN_NONE);
+        if (m == ZB_SENSOR_BTN_STATEFUL) {
+            upd.btn_modes[0] = ZB_SENSOR_BTN_STATEFUL;
+        } else if (m == ZB_SENSOR_BTN_STATELESS) {
+            upd.btn_modes[0] = ZB_SENSOR_BTN_STATELESS;
+        } else {
+            upd.btn_modes[0] = ZB_SENSOR_BTN_NONE;
         }
     }
     if (strstr(body, "\"button_names\"")) {
@@ -1795,6 +1863,9 @@ esp_err_t web_server_start(void)
     }
     if (!s_scan_mutex) {
         s_scan_mutex = xSemaphoreCreateMutex();
+    }
+    if (!s_status_mutex) {
+        s_status_mutex = xSemaphoreCreateMutex();
     }
     if (!s_root_mu) {
         s_root_mu = xSemaphoreCreateMutex();

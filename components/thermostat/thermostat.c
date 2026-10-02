@@ -1346,6 +1346,53 @@ esp_err_t thermostat_set_target(uint8_t id, float target_c)
     return group_update(id, &upd);
 }
 
+bool thermostat_on_sensor_button(const uint8_t sensor_eui[8], float *target_out)
+{
+    if (!sensor_eui) {
+        return false;
+    }
+    uint8_t best_id = 0;
+    float best_target = 0.0f;
+    bool found = false;
+    lock();
+    for (uint16_t i = 0; i < GROUP_MAX; i++) {
+        group_t *g = &s_list[i];
+        if (!g->used || g->type != GROUP_TYPE_THERMOSTAT) {
+            continue;
+        }
+        if (g->thermo_kind != GROUP_THERMO_KIND_TEMP) {
+            continue;
+        }
+        if (memcmp(g->sensor_eui, sensor_eui, 8) != 0) {
+            continue;
+        }
+        if (!found || g->id < best_id) {
+            found = true;
+            best_id = g->id;
+            best_target = g->target_c;
+        }
+    }
+    unlock();
+    if (!found) {
+        return false;
+    }
+    float next = best_target + 0.5f;
+    if (next > 38.0f + 0.01f) {
+        next = 10.0f;
+    } else {
+        next = clamp_target(next);
+    }
+    if (thermostat_set_target(best_id, next) != ESP_OK) {
+        return false;
+    }
+    if (target_out) {
+        *target_out = next;
+    }
+    ESP_LOGI(TAG, "Sensor button: thermostat id=%u target %.1f → %.1f °C", (unsigned)best_id,
+             (double)best_target, (double)next);
+    return true;
+}
+
 esp_err_t thermostat_set_mode(uint8_t id, uint8_t mode)
 {
     group_update_t upd = {0};

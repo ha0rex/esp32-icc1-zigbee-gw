@@ -23,9 +23,15 @@
   */
 #include <string.h>
 #include <hap_platform_memory.h>
+#include <esp_memory_utils.h>
 
 #include <esp_hap_serv.h>
 #include <esp_mfi_debug.h>
+
+static inline bool hap_heap_ptr_ok(const void *p)
+{
+    return p && (esp_ptr_in_dram(p) || esp_ptr_external_ram(p));
+}
 
 void hap_serv_mark_primary(hap_serv_t *hs)
 {
@@ -305,11 +311,11 @@ hap_serv_t *hap_serv_get_next(hap_serv_t *hs)
 
 hap_acc_t *hap_serv_get_parent(hap_serv_t *hs)
 {
-    if (hs) {
-        return ((__hap_serv_t *)hs)->parent;
-    } else {
+    if (!hap_heap_ptr_ok(hs)) {
         return NULL;
     }
+    hap_acc_t *ha = ((__hap_serv_t *)hs)->parent;
+    return hap_heap_ptr_ok(ha) ? ha : NULL;
 }
 
 void hap_serv_set_priv(hap_serv_t *hs, void *priv)

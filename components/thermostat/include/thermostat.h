@@ -172,6 +172,13 @@ esp_err_t group_set_brightness(uint8_t id, uint8_t brightness_pct);
 /** Re-read sensor into any thermostat using this EUI and re-evaluate heat/cool. */
 void group_on_sensor_updated(const uint8_t sensor_eui[8]);
 
+/**
+ * Wake-button on a climate sensor: bump target of the first temperature thermostat
+ * that uses this EUI as sensor_eui by +0.5°C, wrapping 38→10.
+ * Returns true and writes *target_out if a group was updated.
+ */
+bool thermostat_on_sensor_button(const uint8_t sensor_eui[8], float *target_out);
+
 #ifdef __cplusplus
 }
 #endif

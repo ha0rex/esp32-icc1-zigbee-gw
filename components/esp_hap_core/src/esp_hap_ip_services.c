@@ -26,6 +26,7 @@
 #include <json_parser.h>
 #include <hap_platform_memory.h>
 #include <esp_log.h>
+#include <esp_memory_utils.h>
 #include <string.h>
 #include <esp_mfi_debug.h>
 #include <esp_hap_main.h>
@@ -34,6 +35,7 @@
 #include <esp_hap_pairings.h>
 #include <esp_hap_network_io.h>
 #include <esp_hap_secure_message.h>
+#include <esp_hap_char.h>
 
 /* Optional — provided by wifi_manager when linked into the gateway app. */
 void wifi_manager_note_traffic(void) __attribute__((weak));
@@ -55,6 +57,8 @@ void wifi_manager_note_tx_fail(void) {}
 #include <hap_platform_httpd.h>
 #include <hap_platform_os.h>
 #include <esp_hap_ip_services.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #ifdef ESP_MFI_DEBUG_ENABLE
 #define ESP_MFI_DEBUG_PLAIN(fmt, ...)   \
@@ -1242,8 +1246,14 @@ static int hap_http_get_characteristics(httpd_req_t *req)
         }
         hc->update_called = false;
 
+		hap_serv_t *hs = hap_char_get_parent((hap_char_t *)hc);
+		hap_acc_t *ha_parent = hs ? hap_serv_get_parent(hs) : NULL;
+		if (!ha_parent) {
+			ESP_LOGW("hap", "GET skip char — missing parent");
+			continue;
+		}
 		json_gen_start_object(&jstr);
-		__hap_acc_t *ha = (__hap_acc_t *)hap_serv_get_parent(hc->parent);
+		__hap_acc_t *ha = (__hap_acc_t *)ha_parent;
 		json_gen_obj_set_int(&jstr, "aid", ha->aid);
 		json_gen_obj_set_int(&jstr, "iid", hc->iid);
 
@@ -1404,8 +1414,25 @@ static struct httpd_uri hap_prepare = {
     .handler = hap_http_put_prepare,
 };
 
+/* Serialize EVENT builds — zigbee/httpd must not call hap_http_send_notif(). */
+static SemaphoreHandle_t s_notif_mu;
+static TaskHandle_t s_notif_task;
+
 static void hap_send_notification(void *arg)
 {
+    (void)arg;
+    if (!s_notif_mu) {
+        s_notif_mu = xSemaphoreCreateMutex();
+    }
+    if (s_notif_task == xTaskGetCurrentTaskHandle()) {
+        ESP_LOGW("hap", "EVENT flush reenter — defer");
+        return;
+    }
+    if (s_notif_mu && xSemaphoreTake(s_notif_mu, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGW("hap", "EVENT flush busy — will retry");
+        return;
+    }
+    s_notif_task = xTaskGetCurrentTaskHandle();
     int num_char = hap_priv.cfg.max_event_notif_chars;
     if (num_char < 1) {
         num_char = 8;
@@ -1433,6 +1460,10 @@ static void hap_send_notification(void *arg)
     }
     /* If no characteristic notifications are pending, exit */
     if (i == 0) {
+        s_notif_task = NULL;
+        if (s_notif_mu) {
+            xSemaphoreGive(s_notif_mu);
+        }
         return;
     }
     num_notif_chars = i;
@@ -1460,7 +1491,19 @@ static void hap_send_notification(void *arg)
         bool notif_to_send = false;
         for (j = 0; j < num_notif_chars; j++) {
             hap_char_t *hc = char_arr[j];
+            if (!hap_char_is_registered(hc)) {
+                ESP_LOGW("hap", "EVENT skip char %p — not on bridge", (void *)hc);
+                continue;
+            }
             __hap_char_t *_hc = ( __hap_char_t *)hc;
+            hap_serv_t *hs = hap_char_get_parent(hc);
+            hap_acc_t *ha = hs ? hap_serv_get_parent(hs) : NULL;
+            /* Stale/corrupt char after accessory rebuild or a raced flush — skip. */
+            if (!hs || !ha) {
+                ESP_LOGW("hap", "EVENT skip char %p — missing service/accessory parent",
+                         (void *)hc);
+                continue;
+            }
             /* Owner skip is only for write-echo. External/hardware updates must
              * always reach Home — clear owner and deliver. */
             if (hap_char_is_ctrl_owner(hc, i)) {
@@ -1476,7 +1519,6 @@ static void hap_send_notification(void *arg)
             }
 
             json_gen_start_object(&jstr);
-            hap_acc_t *ha = hap_serv_get_parent(hap_char_get_parent(hc));
             int aid = ((__hap_acc_t *)ha)->aid;
             json_gen_obj_set_int(&jstr, "aid", aid);
             json_gen_obj_set_int(&jstr, "iid", _hc->iid);
@@ -1526,6 +1568,10 @@ static void hap_send_notification(void *arg)
     if (!any_delivered && ctrl_connected) {
         ESP_LOGW("hap", "EVENT undelivered (%d char, ctrl=%d) — skip provoke",
                  num_notif_chars, (int)ctrl_connected);
+    }
+    s_notif_task = NULL;
+    if (s_notif_mu) {
+        xSemaphoreGive(s_notif_mu);
     }
 }
 

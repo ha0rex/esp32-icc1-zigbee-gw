@@ -175,6 +175,10 @@ extern "C" {
 #define ZCL_CLUSTER_OCCUPANCY                  0x0406
 #define ZCL_CLUSTER_IAS_ZONE                   0x0500
 #define ZCL_CLUSTER_IKEA_BUTTON                0xFC7F /**< IKEA manufacturer-specific */
+#define ZCL_CLUSTER_SONOFF_CUSTOM              0xFC11 /**< Sonoff SNZB-02D external display */
+#define ZCL_ATTR_SONOFF_EXT_TEMP               0x600D /**< INT16, °C × 100 */
+#define ZCL_ATTR_SONOFF_TEMP_SENSOR_SELECT     0x600E /**< UINT8: 0=internal, 1=external */
+#define ZCL_ATTR_SONOFF_EXT_HUMIDITY           0x6018 /**< UINT16, % × 100 */
 
 #define ZCL_ATTR_MANUFACTURER_NAME             0x0004
 #define ZCL_ATTR_MODEL_IDENTIFIER              0x0005
@@ -400,6 +404,19 @@ esp_err_t ezsp_send_unicast(uint16_t node_id, const ezsp_aps_frame_t *aps, const
 /** Build and send a ZCL Read Attributes command. */
 esp_err_t ezsp_zcl_read_attributes(uint16_t node_id, uint8_t dest_ep, uint16_t cluster_id,
                                    const uint16_t *attr_ids, size_t attr_count);
+/**
+ * One attribute record for Write Attributes (cmd 0x02).
+ * value_le must be little-endian bytes of length value_len (1–8).
+ */
+typedef struct {
+    uint16_t attr_id;
+    uint8_t data_type;
+    uint8_t value_len;
+    uint8_t value_le[8];
+} ezsp_zcl_write_attr_t;
+/** ZCL Write Attributes (general cmd 0x02) for up to 4 attributes. */
+esp_err_t ezsp_zcl_write_attributes(uint16_t node_id, uint8_t dest_ep, uint16_t cluster_id,
+                                    const ezsp_zcl_write_attr_t *attrs, size_t attr_count);
 /**
  * ZCL Configure Reporting (cmd 0x06) for one attribute.
  * change_le: little-endian reportable-change bytes (length depends on data_type).
