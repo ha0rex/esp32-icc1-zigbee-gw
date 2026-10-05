@@ -1055,6 +1055,10 @@ int hap_char_update_val(hap_char_t *hc, hap_val_t *val);
  */
 int hap_char_update_val_silent(hap_char_t *hc, hap_val_t *val);
 
+/** Queue an EVENT even when the stored value did not change.
+ * Stateless button presses reuse the same event number. */
+int hap_char_raise_event(hap_char_t *hc);
+
 /**
  * @brief Get the current value of characteristic
  *

@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "peer_link.h"
+
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -19,6 +21,7 @@
 static const char *TAG = "group";
 #define NVS_NS "thermo"
 #define NVS_KEY "grp4"       /* cooler + gap/hysteresis + humidity force */
+#define NVS_REFS "refs1"     /* remote device refs + window hold */
 #define NVS_KEY_V3 "grp3"    /* humidity thermostat fields */
 #define NVS_KEY_V2 "grp2"    /* power-fail + last on/brightness */
 #define NVS_KEY_V1 "grp1"    /* members only — migrate */
@@ -116,7 +119,32 @@ typedef struct {
     bool homekit_expose;
 } thermo_legacy_t;
 
+typedef struct {
+    uint8_t id;
+    char sensor_ref[40];
+    char switch_ref[40];
+    char cooler_ref[40];
+    char window_ref[40];
+    uint8_t window_hold;
+    uint8_t saved_heating;
+} group_ref_persist_t;
+
+static bool ref_is_remote(const char *ref)
+{
+    return ref && strncmp(ref, "remote:", 7) == 0 && ref[7] != 0;
+}
+
+static void copy_ref(char *dst, size_t n, const char *src)
+{
+    if (!dst || n == 0) {
+        return;
+    }
+    snprintf(dst, n, "%s", src ? src : "");
+}
+
 static group_t s_list[GROUP_MAX];
+static group_t *find_by_id_locked(uint8_t id);
+static int window_contact(const group_t *g);
 static SemaphoreHandle_t s_mutex;
 static TaskHandle_t s_task;
 static TaskHandle_t s_power_task;
@@ -138,12 +166,12 @@ static bool eui_is_zero(const uint8_t eui[8])
 
 bool group_thermo_has_heater(const group_t *g)
 {
-    return g && !eui_is_zero(g->switch_eui);
+    return g && (!eui_is_zero(g->switch_eui) || ref_is_remote(g->switch_ref));
 }
 
 bool group_thermo_has_cooler(const group_t *g)
 {
-    return g && !eui_is_zero(g->cooler_eui);
+    return g && (!eui_is_zero(g->cooler_eui) || ref_is_remote(g->cooler_ref));
 }
 
 static uint8_t clamp_power_fail(uint8_t mode)
@@ -302,6 +330,23 @@ static void nvs_save_locked(void)
         p->humidity_force_heat = s_list[i].humidity_force_heat;
     }
     if (nvs_set_blob(h, NVS_KEY, packed, sizeof(packed)) == ESP_OK) {
+        group_ref_persist_t refs[GROUP_MAX];
+        memset(refs, 0, sizeof(refs));
+        uint16_t rn = 0;
+        for (uint16_t i = 0; i < GROUP_MAX; i++) {
+            if (!s_list[i].used) {
+                continue;
+            }
+            refs[rn].id = s_list[i].id;
+            copy_ref(refs[rn].sensor_ref, sizeof(refs[rn].sensor_ref), s_list[i].sensor_ref);
+            copy_ref(refs[rn].switch_ref, sizeof(refs[rn].switch_ref), s_list[i].switch_ref);
+            copy_ref(refs[rn].cooler_ref, sizeof(refs[rn].cooler_ref), s_list[i].cooler_ref);
+            copy_ref(refs[rn].window_ref, sizeof(refs[rn].window_ref), s_list[i].window_ref);
+            refs[rn].window_hold = s_list[i].window_hold ? 1 : 0;
+            refs[rn].saved_heating = s_list[i].saved_heating ? 1 : 0;
+            rn++;
+        }
+        nvs_set_blob(h, NVS_REFS, refs, sizeof(refs));
         nvs_set_u8(h, "next_id", s_next_id);
         nvs_erase_key(h, NVS_KEY_V3);
         nvs_erase_key(h, NVS_KEY_V2);
@@ -513,6 +558,25 @@ static void nvs_load_locked(void)
     if (nvs_get_u8(h, "next_id", &next) == ESP_OK && next >= 1) {
         s_next_id = next;
     }
+    group_ref_persist_t refs[GROUP_MAX];
+    size_t rsz = sizeof(refs);
+    if (nvs_get_blob(h, NVS_REFS, refs, &rsz) == ESP_OK && rsz == sizeof(refs)) {
+        for (uint16_t i = 0; i < GROUP_MAX; i++) {
+            if (refs[i].id == 0) {
+                continue;
+            }
+            group_t *g = find_by_id_locked(refs[i].id);
+            if (!g) {
+                continue;
+            }
+            copy_ref(g->sensor_ref, sizeof(g->sensor_ref), refs[i].sensor_ref);
+            copy_ref(g->switch_ref, sizeof(g->switch_ref), refs[i].switch_ref);
+            copy_ref(g->cooler_ref, sizeof(g->cooler_ref), refs[i].cooler_ref);
+            copy_ref(g->window_ref, sizeof(g->window_ref), refs[i].window_ref);
+            g->window_hold = refs[i].window_hold != 0;
+            g->saved_heating = refs[i].saved_heating != 0;
+        }
+    }
     nvs_close(h);
 }
 
@@ -588,15 +652,27 @@ static void refresh_runtime_locked(group_t *g)
             g->has_current_temp = false;
             return;
         }
-        zb_device_t sensor;
-        if (!zigbee_host_get_device(g->sensor_eui, &sensor)) {
-            g->has_current_temp = false;
+        if (ref_is_remote(g->sensor_ref)) {
+            peer_dev_t dev;
+            if (!peer_link_device(g->sensor_ref + 7, &dev) || !dev.ok || !dev.has_temp) {
+                g->has_current_temp = false;
+            } else {
+                g->has_current_temp = true;
+                g->current_temp_c = dev.temp_c;
+            }
         } else {
-            g->has_current_temp = sensor.has_temp;
-            if (sensor.has_temp) {
-                g->current_temp_c = sensor.temperature_c;
+            zb_device_t sensor;
+            if (!zigbee_host_get_device(g->sensor_eui, &sensor)) {
+                g->has_current_temp = false;
+            } else {
+                g->has_current_temp = sensor.has_temp;
+                if (sensor.has_temp) {
+                    g->current_temp_c = sensor.temperature_c;
+                }
             }
         }
+        int win = window_contact(g);
+        g->window_open = (win == 1) || (win < 0 && g->window_hold);
         refresh_humidity_locked(g);
         return;
     }
@@ -743,6 +819,76 @@ static esp_err_t set_actuator(const uint8_t eui[8], bool on)
     return zigbee_host_set_onoff(eui, on);
 }
 
+static esp_err_t set_actuator_ex(const uint8_t eui[8], const char *ref, bool on)
+{
+    if (ref_is_remote(ref)) {
+        return peer_link_set_remote(ref + 7, on);
+    }
+    return set_actuator(eui, on);
+}
+
+/** 1 open, 0 closed, -1 no sensor or no reading. */
+static int window_contact(const group_t *g)
+{
+    if (!g || !g->window_ref[0]) {
+        return -1;
+    }
+    if (ref_is_remote(g->window_ref)) {
+        peer_dev_t dev;
+        if (!peer_link_device(g->window_ref + 7, &dev) || !dev.ok || !dev.has_contact) {
+            return -1;
+        }
+        return dev.contact_open ? 1 : 0;
+    }
+    uint8_t eui[8];
+    uint8_t tmp[8];
+    int n = 0;
+    const char *p = g->window_ref;
+    while (*p && n < 8) {
+        while (*p == ':' || *p == '-' || *p == ' ') {
+            p++;
+        }
+        if (!p[0] || !p[1]) {
+            return -1;
+        }
+        int hi = -1, lo = -1;
+        if (p[0] >= '0' && p[0] <= '9') {
+            hi = p[0] - '0';
+        } else if (p[0] >= 'a' && p[0] <= 'f') {
+            hi = p[0] - 'a' + 10;
+        } else if (p[0] >= 'A' && p[0] <= 'F') {
+            hi = p[0] - 'A' + 10;
+        }
+        if (p[1] >= '0' && p[1] <= '9') {
+            lo = p[1] - '0';
+        } else if (p[1] >= 'a' && p[1] <= 'f') {
+            lo = p[1] - 'a' + 10;
+        } else if (p[1] >= 'A' && p[1] <= 'F') {
+            lo = p[1] - 'A' + 10;
+        }
+        if (hi < 0 || lo < 0) {
+            return -1;
+        }
+        tmp[n++] = (uint8_t)((hi << 4) | lo);
+        p += 2;
+    }
+    if (n != 8) {
+        return -1;
+    }
+    /* Portal EUIs are displayed big-endian; the host stores them little-endian. */
+    for (int i = 0; i < 8; i++) {
+        eui[i] = tmp[7 - i];
+    }
+    zb_device_t dev;
+    if (!zigbee_host_get_device(eui, &dev)) {
+        return -1;
+    }
+    if (zigbee_host_device_kind(&dev) != ZB_DEVICE_KIND_CONTACT && !dev.has_ias_zone) {
+        return -1;
+    }
+    return dev.binary_on ? 1 : 0;
+}
+
 /**
  * Temperature thermostat:
  *  - gap: heat ON at target-gap, cool ON at target+gap; deadband in between
@@ -756,6 +902,7 @@ static void apply_temp_control(group_t *g)
     bool has_cooler = group_thermo_has_cooler(g);
     bool want_heat = false;
     bool want_cool = false;
+    bool decided = g->mode == THERMO_MODE_OFF;
 
     if (g->mode == THERMO_MODE_OFF) {
         want_heat = false;
@@ -775,7 +922,9 @@ static void apply_temp_control(group_t *g)
         if (humidity_forcing) {
             want_heat = true;
             want_cool = false;
+            decided = true;
         } else if (g->has_current_temp) {
+            decided = true;
             float cur = g->current_temp_c;
             float tgt = g->target_c;
             float gap = clamp_gap(g->gap_c);
@@ -805,7 +954,14 @@ static void apply_temp_control(group_t *g)
             if (want_heat && want_cool) {
                 want_cool = false;
             }
-        } else {
+        }
+    }
+
+    if (!decided) {
+        int win = g->window_ref[0] ? window_contact(g) : -1;
+        bool window_acts = (win == 1) || (win < 0 && g->window_hold) ||
+                           (win == 0 && g->window_hold) || (!g->window_ref[0] && g->window_hold);
+        if (!window_acts) {
             return;
         }
     }
@@ -817,20 +973,53 @@ static void apply_temp_control(group_t *g)
         want_cool = false;
     }
 
+    /* Window open stops heating. Closing restores the heater to the state it
+     * had when the window opened, including "was off, so stay off". */
+    bool hold_before = g->window_hold;
+    if (g->window_ref[0]) {
+        int win = window_contact(g);
+        if (win == 1) {
+            if (!g->window_hold) {
+                g->saved_heating = g->heating;
+                g->window_hold = true;
+            }
+            g->window_open = true;
+            want_heat = false;
+        } else if (win == 0) {
+            g->window_open = false;
+            if (g->window_hold) {
+                bool allow = g->mode == THERMO_MODE_HEAT || g->mode == THERMO_MODE_AUTO;
+                want_heat = g->saved_heating && allow && has_heater;
+                g->window_hold = false;
+            }
+        } else if (g->window_hold) {
+            g->window_open = true;
+            want_heat = false;
+        }
+    } else if (g->window_hold) {
+        bool allow = g->mode == THERMO_MODE_HEAT || g->mode == THERMO_MODE_AUTO;
+        want_heat = g->saved_heating && allow && has_heater;
+        g->window_hold = false;
+        g->window_open = false;
+    }
+
     if (want_heat == g->heating && want_cool == g->cooling) {
+        if (hold_before != g->window_hold) {
+            nvs_save_locked();
+        }
         return;
     }
 
     /* Mutual exclusion on the wire: turn the other off before turning one on. */
     if (want_heat && g->cooling) {
-        if (set_actuator(g->cooler_eui, false) != ESP_OK) {
+        if (set_actuator_ex(g->cooler_eui, g->cooler_ref, false) != ESP_OK) {
             ESP_LOGW(TAG, "Group %u cooler OFF failed", (unsigned)g->id);
             return;
         }
         g->cooling = false;
     }
     if (want_cool && g->heating) {
-        if (set_actuator(g->switch_eui, false) != ESP_OK) {
+        if (set_actuator_ex(g->switch_eui, g->switch_ref, false) != ESP_OK) {
             ESP_LOGW(TAG, "Group %u heater OFF failed", (unsigned)g->id);
             return;
         }
@@ -838,14 +1027,14 @@ static void apply_temp_control(group_t *g)
     }
 
     if (want_heat != g->heating) {
-        if (set_actuator(g->switch_eui, want_heat) != ESP_OK) {
+        if (set_actuator_ex(g->switch_eui, g->switch_ref, want_heat) != ESP_OK) {
             ESP_LOGW(TAG, "Group %u heater cmd failed", (unsigned)g->id);
             return;
         }
         g->heating = want_heat;
     }
     if (want_cool != g->cooling) {
-        if (set_actuator(g->cooler_eui, want_cool) != ESP_OK) {
+        if (set_actuator_ex(g->cooler_eui, g->cooler_ref, want_cool) != ESP_OK) {
             ESP_LOGW(TAG, "Group %u cooler cmd failed", (unsigned)g->id);
             return;
         }
@@ -890,7 +1079,7 @@ static void apply_humidity_regulator(group_t *g)
     if (want_on == g->heating) {
         return;
     }
-    if (set_actuator(g->switch_eui, want_on) != ESP_OK) {
+    if (set_actuator_ex(g->switch_eui, g->switch_ref, want_on) != ESP_OK) {
         ESP_LOGW(TAG, "Group %u humidity actuator failed", (unsigned)g->id);
         return;
     }
@@ -944,6 +1133,7 @@ static void control_task(void *arg)
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(4000));
     for (;;) {
+        peer_link_refresh();
         lock();
         for (uint16_t i = 0; i < GROUP_MAX; i++) {
             if (s_list[i].used && s_list[i].type == GROUP_TYPE_THERMOSTAT) {
@@ -968,7 +1158,7 @@ esp_err_t group_start(void)
     nvs_save_locked();
     unlock();
     if (!s_task) {
-        if (xTaskCreate(control_task, "groups", 4096, NULL, 4, &s_task) != pdPASS) {
+        if (xTaskCreate(control_task, "groups", 12288, NULL, 4, &s_task) != pdPASS) {
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1076,15 +1266,20 @@ esp_err_t group_create_thermostat(const char *name, uint8_t thermo_kind, const u
                                   const uint8_t cooler_eui[8], float target_c,
                                   float target_humidity_pct, float gap_c, float hysteresis_c,
                                   bool humidity_force_heat, uint8_t mode, bool homekit_expose,
-                                  uint8_t *id_out)
+                                  const char *sensor_ref, const char *switch_ref,
+                                  const char *cooler_ref, const char *window_ref, uint8_t *id_out)
 {
-    if (!name || !name[0] || !sensor_eui) {
+    if (!name || !name[0]) {
         return ESP_ERR_INVALID_ARG;
     }
     thermo_kind = clamp_thermo_kind(thermo_kind);
+    bool remote_sensor = ref_is_remote(sensor_ref);
     zb_device_t sens;
-    if (!zigbee_host_get_device(sensor_eui, &sens)) {
-        return ESP_ERR_NOT_FOUND;
+    memset(&sens, 0, sizeof(sens));
+    if (!remote_sensor) {
+        if (!sensor_eui || !zigbee_host_get_device(sensor_eui, &sens)) {
+            return ESP_ERR_NOT_FOUND;
+        }
     }
 
     uint8_t heater[8] = {0};
@@ -1100,25 +1295,29 @@ esp_err_t group_create_thermostat(const char *name, uint8_t thermo_kind, const u
         memcpy(hum_sens, humidity_sensor_eui, 8);
     }
 
+    bool remote_heat = ref_is_remote(switch_ref);
+    bool remote_cool = ref_is_remote(cooler_ref);
     if (thermo_kind == GROUP_THERMO_KIND_HUMIDITY) {
-        if (eui_is_zero(heater) || !sens.has_humidity) {
+        if ((!remote_heat && eui_is_zero(heater)) || (!remote_sensor && !sens.has_humidity)) {
             return ESP_ERR_INVALID_ARG;
         }
-        zb_device_t sw;
-        if (!zigbee_host_get_device(heater, &sw)) {
-            return ESP_ERR_NOT_FOUND;
-        }
-    } else {
-        if (eui_is_zero(heater) && eui_is_zero(cooler)) {
-            return ESP_ERR_INVALID_ARG;
-        }
-        if (!eui_is_zero(heater)) {
+        if (!remote_heat) {
             zb_device_t sw;
             if (!zigbee_host_get_device(heater, &sw)) {
                 return ESP_ERR_NOT_FOUND;
             }
         }
-        if (!eui_is_zero(cooler)) {
+    } else {
+        if (!remote_heat && eui_is_zero(heater) && !remote_cool && eui_is_zero(cooler)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (!remote_heat && !eui_is_zero(heater)) {
+            zb_device_t sw;
+            if (!zigbee_host_get_device(heater, &sw)) {
+                return ESP_ERR_NOT_FOUND;
+            }
+        }
+        if (!remote_cool && !eui_is_zero(cooler)) {
             zb_device_t sw;
             if (!zigbee_host_get_device(cooler, &sw)) {
                 return ESP_ERR_NOT_FOUND;
@@ -1133,8 +1332,8 @@ esp_err_t group_create_thermostat(const char *name, uint8_t thermo_kind, const u
         }
     }
 
-    bool has_h = !eui_is_zero(heater);
-    bool has_c = !eui_is_zero(cooler);
+    bool has_h = remote_heat || !eui_is_zero(heater);
+    bool has_c = remote_cool || !eui_is_zero(cooler);
     mode = normalize_thermo_mode(mode, thermo_kind, has_h, has_c);
 
     lock();
@@ -1155,6 +1354,21 @@ esp_err_t group_create_thermostat(const char *name, uint8_t thermo_kind, const u
     memcpy(g->humidity_sensor_eui, hum_sens, 8);
     memcpy(g->switch_eui, heater, 8);
     memcpy(g->cooler_eui, cooler, 8);
+    if (remote_sensor) {
+        copy_ref(g->sensor_ref, sizeof(g->sensor_ref), sensor_ref);
+        memset(g->sensor_eui, 0, sizeof(g->sensor_eui));
+    }
+    if (remote_heat) {
+        copy_ref(g->switch_ref, sizeof(g->switch_ref), switch_ref);
+        memset(g->switch_eui, 0, sizeof(g->switch_eui));
+    }
+    if (remote_cool) {
+        copy_ref(g->cooler_ref, sizeof(g->cooler_ref), cooler_ref);
+        memset(g->cooler_eui, 0, sizeof(g->cooler_eui));
+    }
+    if (ref_is_remote(window_ref) || (window_ref && window_ref[0])) {
+        copy_ref(g->window_ref, sizeof(g->window_ref), window_ref);
+    }
     g->target_c = clamp_target(target_c > 0 ? target_c : 21.0f);
     g->target_humidity_pct =
         clamp_target_humidity(target_humidity_pct > 0 ? target_humidity_pct : 45.0f);
@@ -1224,7 +1438,7 @@ esp_err_t thermostat_create(const char *name, const uint8_t sensor_eui[8],
     return group_create_thermostat(name, GROUP_THERMO_KIND_TEMP, sensor_eui, NULL, switch_eui, NULL,
                                    target_c, 45.0f, THERMOSTAT_DEFAULT_GAP_C,
                                    THERMOSTAT_DEFAULT_HYSTERESIS_C, false, mode, homekit_expose,
-                                   id_out);
+                                   NULL, NULL, NULL, NULL, id_out);
 }
 
 esp_err_t group_update(uint8_t id, const group_update_t *upd)
@@ -1259,6 +1473,30 @@ esp_err_t group_update(uint8_t id, const group_update_t *upd)
         }
         if (upd->set_cooler) {
             memcpy(g->cooler_eui, upd->cooler_eui, 8);
+        }
+        if (upd->set_sensor_ref) {
+            copy_ref(g->sensor_ref, sizeof(g->sensor_ref), upd->sensor_ref);
+            if (ref_is_remote(g->sensor_ref)) {
+                memset(g->sensor_eui, 0, sizeof(g->sensor_eui));
+            }
+        }
+        if (upd->set_switch_ref) {
+            copy_ref(g->switch_ref, sizeof(g->switch_ref), upd->switch_ref);
+            if (ref_is_remote(g->switch_ref)) {
+                memset(g->switch_eui, 0, sizeof(g->switch_eui));
+            }
+        }
+        if (upd->set_cooler_ref) {
+            copy_ref(g->cooler_ref, sizeof(g->cooler_ref), upd->cooler_ref);
+            if (ref_is_remote(g->cooler_ref)) {
+                memset(g->cooler_eui, 0, sizeof(g->cooler_eui));
+            }
+        }
+        if (upd->set_window_ref) {
+            copy_ref(g->window_ref, sizeof(g->window_ref), upd->window_ref);
+            if (!g->window_ref[0]) {
+                g->window_open = false;
+            }
         }
         if (upd->set_target) {
             g->target_c = clamp_target(upd->target_c);
@@ -1316,10 +1554,10 @@ esp_err_t group_remove(uint8_t id)
     }
     if (g->type == GROUP_TYPE_THERMOSTAT) {
         if (g->heating) {
-            set_actuator(g->switch_eui, false);
+            set_actuator_ex(g->switch_eui, g->switch_ref, false);
         }
         if (g->cooling) {
-            set_actuator(g->cooler_eui, false);
+            set_actuator_ex(g->cooler_eui, g->cooler_ref, false);
         }
     }
     memset(g, 0, sizeof(*g));

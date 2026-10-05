@@ -22,11 +22,17 @@
  *
  */
 
+#include <errno.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <esp_timer.h>
 #include <json_generator.h>
 #include <json_parser.h>
 #include <hap_platform_memory.h>
 #include <esp_log.h>
 #include <esp_memory_utils.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <string.h>
 #include <esp_mfi_debug.h>
 #include <esp_hap_main.h>
@@ -170,6 +176,11 @@ static int hap_http_pair_verify_handler(httpd_req_t *req)
 			 */
             int fd = httpd_req_to_sockfd(req);
 			((hap_secure_session_t *)ctx)->conn_identifier = fd;
+
+            const int nodelay = 1;
+            if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
+                 ESP_MFI_DEBUG(ESP_MFI_DEBUG_ERR, "setsockopt on pair verified socket failed for TCP_NODELAY");
+            }
 
             struct timeval timeout;
             timeout.tv_sec = hap_priv.cfg.recv_timeout;
@@ -1417,6 +1428,7 @@ static struct httpd_uri hap_prepare = {
 /* Serialize EVENT builds — zigbee/httpd must not call hap_http_send_notif(). */
 static SemaphoreHandle_t s_notif_mu;
 static TaskHandle_t s_notif_task;
+static int s_retry_streak;
 
 static void hap_send_notification(void *arg)
 {
@@ -1471,7 +1483,8 @@ static void hap_send_notification(void *arg)
     /* Flag to indicate if any controller was connected */
     bool ctrl_connected = false;
     bool any_delivered = false;
-	char buf[250];
+    bool need_retry = false;
+    bool saw_stall = false;
 	for (i = 0; i < HAP_MAX_SESSIONS; i++) {
 		session = hap_priv.sessions[i];
 		if (!session)
@@ -1481,15 +1494,11 @@ static void hap_send_notification(void *arg)
 #define HTTPD_HDR_STR      "EVENT/1.0 200 OK\r\n"                   \
 		"Content-Type: application/hap+json\r\n"           \
 		"Content-Length: %d\r\n"
-		char notif_json[1024];
-		json_gen_str_t jstr;
-		json_gen_str_start(&jstr, notif_json, sizeof(notif_json), NULL, NULL);
-		json_gen_start_object(&jstr);
-		json_gen_push_array(&jstr, "characteristics");
-
-        int j;
-        bool notif_to_send = false;
-        for (j = 0; j < num_notif_chars; j++) {
+        /* One characteristic per EVENT. iOS drops the whole message if any
+         * aid/iid in the array is one it did not subscribe to, which left the
+         * open Home screen stale until a force-quit GET. */
+        bool session_failed = false;
+        for (int j = 0; j < num_notif_chars && !session_failed; j++) {
             hap_char_t *hc = char_arr[j];
             if (!hap_char_is_registered(hc)) {
                 ESP_LOGW("hap", "EVENT skip char %p — not on bridge", (void *)hc);
@@ -1498,73 +1507,117 @@ static void hap_send_notification(void *arg)
             __hap_char_t *_hc = ( __hap_char_t *)hc;
             hap_serv_t *hs = hap_char_get_parent(hc);
             hap_acc_t *ha = hs ? hap_serv_get_parent(hs) : NULL;
-            /* Stale/corrupt char after accessory rebuild or a raced flush — skip. */
             if (!hs || !ha) {
                 ESP_LOGW("hap", "EVENT skip char %p — missing service/accessory parent",
                          (void *)hc);
                 continue;
             }
-            /* Owner skip is only for write-echo. External/hardware updates must
-             * always reach Home — clear owner and deliver. */
             if (hap_char_is_ctrl_owner(hc, i)) {
                 _hc->owner_ctrl = 0;
             }
             if (!hap_char_is_ctrl_subscribed(hc, i)) {
-                /* Never force-EV Name/Configured Name — string EVENTs provoked
-                 * session churn and wedged C3 Wi‑Fi / the portal httpd. */
                 if (_hc->format == HAP_CHAR_FORMAT_STRING) {
                     continue;
                 }
                 hap_char_manage_notification((hap_char_t *)hc, i, true);
             }
 
+            static char notif_json[384];
+            json_gen_str_t jstr;
+            json_gen_str_start(&jstr, notif_json, sizeof(notif_json), NULL, NULL);
+            json_gen_start_object(&jstr);
+            json_gen_push_array(&jstr, "characteristics");
             json_gen_start_object(&jstr);
             int aid = ((__hap_acc_t *)ha)->aid;
             json_gen_obj_set_int(&jstr, "aid", aid);
             json_gen_obj_set_int(&jstr, "iid", _hc->iid);
             hap_add_char_val_json(_hc->format, "value", &_hc->val, &jstr);
             json_gen_end_object(&jstr);
-            notif_to_send = true;
-        }
-        if (!notif_to_send) {
-            /* No notification required for this controller. Just continue */
-            continue;
-        }
+            json_gen_pop_array(&jstr);
+            json_gen_end_object(&jstr);
+            json_gen_str_end(&jstr);
 
-        json_gen_pop_array(&jstr);
-		json_gen_end_object(&jstr);
-		json_gen_str_end(&jstr);
-
-		snprintf(buf, sizeof(buf), HTTPD_HDR_STR,
-				strlen(notif_json));
-		int hdr_ok = hap_httpd_send(hap_priv.server, fd, buf, strlen(buf), 0);
-		/* Space for sending additional headers based on set_header */
-		int sep_ok = hap_httpd_send(hap_priv.server, fd, "\r\n", strlen("\r\n"), 0);
-		int body_ok = hap_httpd_send(hap_priv.server, fd, notif_json, strlen(notif_json), 0);
-        if (hdr_ok > 0 && sep_ok > 0 && body_ok > 0) {
-            any_delivered = true;
-        } else {
-            ESP_LOGW("hap", "EVENT send failed fd=%d hdr=%d sep=%d body=%d — closing session",
-                     fd, hdr_ok, sep_ok, body_ok);
-            wifi_manager_note_tx_fail();
-            hap_close_session(session);
-            continue;
+            static char msg[512];
+            int hdr_len = snprintf(msg, sizeof(msg), HTTPD_HDR_STR "\r\n", (int)strlen(notif_json));
+            size_t body_len = strlen(notif_json);
+            int msg_len = -1;
+            if (hdr_len > 0 && (size_t)hdr_len + body_len < sizeof(msg)) {
+                memcpy(msg + hdr_len, notif_json, body_len);
+                msg_len = hdr_len + (int)body_len;
+            }
+            int hdr_ok = msg_len > 0 ? hap_httpd_send(hap_priv.server, fd, msg, (unsigned)msg_len, 0) : -1;
+            int send_err = errno;
+            if (hdr_ok > 0) {
+                any_delivered = true;
+                httpd_sess_update_lru_counter(hap_priv.server, fd);
+                ESP_LOGW("hap", "EVENT notif → fd=%d %s", fd, notif_json);
+            } else if (session->state == STATE_INVALID ||
+                       send_err == EPIPE || send_err == ECONNRESET || send_err == ENOTCONN ||
+                       send_err == EBADF || send_err == ECONNABORTED) {
+                /* A partial frame or a dead socket cannot be retried. RST so
+                 * Home drops it immediately and opens a new one; a quiet FIN
+                 * is what left the open app on the last GET. */
+                ESP_LOGW("hap", "EVENT send failed fd=%d errno=%d — reset session", fd, send_err);
+                wifi_manager_note_tx_fail();
+                struct linger lin = {.l_onoff = 1, .l_linger = 0};
+                setsockopt(fd, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+                hap_close_session(session);
+                session_failed = true;
+            } else if (send_err == EBUSY) {
+                /* Encrypt lock is busy with an HTTP response. The nonce did
+                 * not move. Try this characteristic again shortly, and do not
+                 * count it as a dead socket. */
+                session_failed = true;
+                need_retry = true;
+            } else {
+                /* Nothing was written and the nonce was not advanced. */
+                ESP_LOGW("hap", "EVENT send stalled fd=%d errno=%d — will retry", fd, send_err);
+                wifi_manager_note_tx_fail();
+                session_failed = true;
+                need_retry = true;
+                saw_stall = true;
+            }
         }
-        httpd_sess_update_lru_counter(hap_priv.server, fd);
-		ESP_LOGI("hap", "EVENT notif → fd=%d (%d char) %s", fd, num_notif_chars, notif_json);
 	}
-    ESP_LOGI("hap", "EVENT batch: %d char(s), ctrl_connected=%d delivered=%d", num_notif_chars,
+    ESP_LOGW("hap", "EVENT batch: %d char(s), ctrl_connected=%d delivered=%d", num_notif_chars,
              (int)ctrl_connected, (int)any_delivered);
     if (any_delivered) {
         wifi_manager_note_traffic();
+        s_retry_streak = 0;
+    } else if (need_retry && !saw_stall) {
+        vTaskDelay(pdMS_TO_TICKS(40));
+        for (int j = 0; j < num_notif_chars; j++) {
+            if (char_arr[j]) {
+                hap_char_raise_event(char_arr[j]);
+            }
+        }
+    } else if (need_retry) {
+        s_retry_streak++;
+        if (s_retry_streak >= 3) {
+            /* Three stalls means this socket is not reaching Home. Reset it
+             * so the controller reconnects and reads the stored value. */
+            s_retry_streak = 0;
+            ESP_LOGW("hap", "EVENT still stalled — reset Home sessions");
+            for (int s = 0; s < HAP_MAX_SESSIONS; s++) {
+                hap_secure_session_t *stuck = hap_priv.sessions[s];
+                if (!stuck) {
+                    continue;
+                }
+                struct linger lin = {.l_onoff = 1, .l_linger = 0};
+                setsockopt(stuck->conn_identifier, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+                hap_close_session(stuck);
+            }
+        } else {
+            for (int j = 0; j < num_notif_chars; j++) {
+                if (char_arr[j]) {
+                    hap_char_raise_event(char_arr[j]);
+                }
+            }
+        }
     }
-    /* Spec R15: bump mDNS when no controller is connected. */
-    if (!ctrl_connected && !hap_priv.disconnected_event_sent) {
-        hap_mdns_announce(false);
-        hap_priv.disconnected_event_sent = true;
-    }
-    /* Undelivered EVENT with a live controller usually means TX stall — session
-     * already closed above. Do not provoke (mDNS/session storms flapped STA). */
+    /* No mDNS work here. hap_mdns_announce takes the mDNS lock with no
+     * timeout and was stalling this loop, so later switch changes never
+     * became EVENTs. A controller with a socket only learns from EVENT/1.0. */
     if (!any_delivered && ctrl_connected) {
         ESP_LOGW("hap", "EVENT undelivered (%d char, ctrl=%d) — skip provoke",
                  num_notif_chars, (int)ctrl_connected);
@@ -1587,29 +1640,44 @@ void hap_http_debug_disable()
 
 void hap_http_send_notif()
 {
-	/* Run on the HAP loop (caller). httpd_queue_work is non-blocking and was
-	 * silently dropping EVENT pushes under load — Home then only refreshed on
-	 * unlock/GET. Direct send is safe: hap_httpd_send() uses send() on the fd. */
+	/* Send on the HAP loop. httpd_queue_work posts a UDP control message that
+	 * was dropped whenever the HomeKit task was inside a request, so the
+	 * characteristic value was saved and no EVENT ever left. hap_httpd_send
+	 * holds the encrypt mutex, so this does not race a response on the httpd
+	 * task for the ChaCha nonce. */
+	ESP_LOGW("hap", "EVENT flush");
 	hap_send_notification(NULL);
 }
 
+static esp_timer_handle_t s_state_timer;
+
+static void hap_state_refresh_timer(void *arg)
+{
+    (void)arg;
+    /* Queue only. NVS for s# must not run on the esp_timer task. */
+    if (hap_send_event(HAP_INTERNAL_EVENT_PROVOKE_REFRESH) != HAP_SUCCESS) {
+        ESP_LOGW("hap", "state refresh: HAP loop queue full");
+    }
+}
+
 /**
- * Force HomeKit to re-fetch characteristics the same way lock→unlock does:
- * close pair-verify sessions and bump mDNS s#. EVENT/1.0 alone is unreliable
- * for bridged switches while the Home UI stays open (no live EV socket).
+ * Ask Home to re-read characteristics by publishing a new mDNS s#.
+ * Trailing-edge so a click's press/release pair publishes the final latch.
+ * Sessions stay up; closing them is what made the open app wait for a relaunch.
  */
 void hap_provoke_controller_refresh(void)
 {
-    static int64_t s_last_us;
-    int64_t now = esp_timer_get_time();
-    /* Debounce — rapid remote presses share one reconnect; also protects C3 Wi‑Fi. */
-    if (s_last_us && (now - s_last_us) < 4000000) {
-        return;
+    if (!s_state_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = hap_state_refresh_timer,
+            .name = "hap_snum",
+        };
+        if (esp_timer_create(&args, &s_state_timer) != ESP_OK) {
+            return;
+        }
     }
-    s_last_us = now;
-    if (hap_send_event(HAP_INTERNAL_EVENT_PROVOKE_REFRESH) != HAP_SUCCESS) {
-        ESP_LOGW("hap", "provoke refresh: HAP loop queue full");
-    }
+    esp_timer_stop(s_state_timer);
+    esp_timer_start_once(s_state_timer, 250000);
 }
 
 static bool hap_http_registered;

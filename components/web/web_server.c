@@ -25,6 +25,7 @@
 #include "zigbee_host.h"
 #include "homekit_bridge.h"
 #include "thermostat.h"
+#include "peer_link.h"
 #include "ezsp.h"
 #include "fw_ota.h"
 #include "esp_app_desc.h"
@@ -542,7 +543,7 @@ static esp_err_t api_status(httpd_req_t *req)
     }
     pos += (size_t)snprintf(s_json + pos, sizeof(s_json) - pos, "],\"groups\":[");
     first = true;
-    for (uint16_t i = 0; i < GROUP_MAX && pos + 520 < sizeof(s_json); i++) {
+    for (uint16_t i = 0; i < GROUP_MAX && pos + 700 < sizeof(s_json); i++) {
         group_t g;
         if (!group_get_at(i, &g)) {
             continue;
@@ -561,18 +562,27 @@ static esp_err_t api_status(httpd_req_t *req)
                 ? "on"
                 : (g.power_fail_mode == GROUP_POWER_FAIL_OFF ? "off" : "previous"));
         if (g.type == GROUP_TYPE_THERMOSTAT) {
-            char seui[40], sweui[40], ceui[40], heui[40];
-            ezsp_format_eui64(g.sensor_eui, seui, sizeof(seui));
-            if (group_thermo_has_heater(&g)) {
+            char seui[40], sweui[40], ceui[40], heui[40], weui[40];
+            if (g.sensor_ref[0]) {
+                snprintf(seui, sizeof(seui), "%s", g.sensor_ref);
+            } else {
+                ezsp_format_eui64(g.sensor_eui, seui, sizeof(seui));
+            }
+            if (g.switch_ref[0]) {
+                snprintf(sweui, sizeof(sweui), "%s", g.switch_ref);
+            } else if (group_thermo_has_heater(&g)) {
                 ezsp_format_eui64(g.switch_eui, sweui, sizeof(sweui));
             } else {
                 sweui[0] = '\0';
             }
-            if (group_thermo_has_cooler(&g)) {
+            if (g.cooler_ref[0]) {
+                snprintf(ceui, sizeof(ceui), "%s", g.cooler_ref);
+            } else if (group_thermo_has_cooler(&g)) {
                 ezsp_format_eui64(g.cooler_eui, ceui, sizeof(ceui));
             } else {
                 ceui[0] = '\0';
             }
+            snprintf(weui, sizeof(weui), "%s", g.window_ref);
             bool has_hum_sensor = false;
             for (int bi = 0; bi < 8; bi++) {
                 if (g.humidity_sensor_eui[bi] != 0) {
@@ -588,13 +598,15 @@ static esp_err_t api_status(httpd_req_t *req)
             pos += (size_t)snprintf(
                 s_json + pos, sizeof(s_json) - pos,
                 "\"regulation\":\"%s\",\"sensor_eui\":\"%s\",\"humidity_sensor_eui\":\"%s\","
-                "\"switch_eui\":\"%s\",\"cooler_eui\":\"%s\","
+                "\"switch_eui\":\"%s\",\"cooler_eui\":\"%s\",\"window_eui\":\"%s\","
+                "\"window_open\":%s,"
                 "\"target_c\":%.1f,\"target_humidity\":%.0f,\"gap_c\":%.1f,\"hysteresis_c\":%.1f,"
                 "\"humidity_force_heat\":%s,\"mode\":\"%s\","
                 "\"heating\":%s,\"cooling\":%s,\"has_current_temp\":%s,\"current_temp_c\":%.2f,"
                 "\"has_current_humidity\":%s,\"current_humidity_pct\":%.1f,\"members\":[]}",
                 g.thermo_kind == GROUP_THERMO_KIND_HUMIDITY ? "humidity" : "temperature", seui,
-                heui, sweui, ceui, (double)g.target_c, (double)g.target_humidity_pct,
+                heui, sweui, ceui, weui, g.window_open ? "true" : "false",
+                (double)g.target_c, (double)g.target_humidity_pct,
                 (double)g.gap_c, (double)g.hysteresis_c, g.humidity_force_heat ? "true" : "false",
                 thermo_mode_json(&g), g.heating ? "true" : "false", g.cooling ? "true" : "false",
                 g.has_current_temp ? "true" : "false", (double)g.current_temp_c,
@@ -1598,6 +1610,26 @@ static const char *thermo_mode_json(const group_t *g)
     return "off";
 }
 
+/** Local hex EUI, or "remote:<id>" into ref with a zero EUI. Empty is ok when optional. */
+static bool parse_dev_ref(const char *s, uint8_t eui[8], char *ref, size_t refn, bool optional)
+{
+    memset(eui, 0, 8);
+    if (ref && refn) {
+        ref[0] = '\0';
+    }
+    if (!s || !s[0] || strcmp(s, "none") == 0) {
+        return optional;
+    }
+    if (strncmp(s, "remote:", 7) == 0 && s[7]) {
+        if (!ref || refn < 8) {
+            return false;
+        }
+        snprintf(ref, refn, "%s", s);
+        return true;
+    }
+    return parse_eui64(s, eui);
+}
+
 /** Parse optional EUI: empty / "none" → zero EUI (ok). Invalid non-empty → false. */
 static bool parse_optional_eui64(const char *s, uint8_t out[8])
 {
@@ -1625,12 +1657,15 @@ static esp_err_t api_group_create(httpd_req_t *req)
     esp_err_t err = ESP_ERR_INVALID_ARG;
     if (strcmp(type_s, "thermostat") == 0) {
         char seui_s[40] = {0}, sweui_s[40] = {0}, ceui_s[40] = {0}, heui_s[40] = {0};
+        char weui_s[40] = {0};
+        char sref[40] = {0}, href[40] = {0}, cref[40] = {0}, wref[40] = {0};
         char mode_s[16] = {0}, reg_s[16] = {0};
         uint8_t seui[8], sweui[8], ceui[8], heui[8];
         json_get_string(body, "sensor_eui", seui_s, sizeof(seui_s));
         json_get_string(body, "switch_eui", sweui_s, sizeof(sweui_s));
         json_get_string(body, "cooler_eui", ceui_s, sizeof(ceui_s));
         json_get_string(body, "humidity_sensor_eui", heui_s, sizeof(heui_s));
+        json_get_string(body, "window_eui", weui_s, sizeof(weui_s));
         json_get_string(body, "mode", mode_s, sizeof(mode_s));
         json_get_string(body, "regulation", reg_s, sizeof(reg_s));
         float target = json_get_float(body, "target_c", 21.0f);
@@ -1638,17 +1673,23 @@ static esp_err_t api_group_create(httpd_req_t *req)
         float gap = json_get_float(body, "gap_c", THERMOSTAT_DEFAULT_GAP_C);
         float hyst = json_get_float(body, "hysteresis_c", THERMOSTAT_DEFAULT_HYSTERESIS_C);
         bool force_rh = json_get_bool(body, "humidity_force_heat", false);
-        if (!parse_eui64(seui_s, seui) || !parse_optional_eui64(sweui_s, sweui) ||
-            !parse_optional_eui64(ceui_s, ceui) || !parse_optional_eui64(heui_s, heui)) {
+        if (!parse_dev_ref(seui_s, seui, sref, sizeof(sref), false) ||
+            !parse_dev_ref(sweui_s, sweui, href, sizeof(href), true) ||
+            !parse_dev_ref(ceui_s, ceui, cref, sizeof(cref), true) ||
+            !parse_dev_ref(weui_s, (uint8_t[8]){0}, wref, sizeof(wref), true) ||
+            !parse_optional_eui64(heui_s, heui)) {
             httpd_resp_set_status(req, "400 Bad Request");
             httpd_resp_set_type(req, "application/json");
             return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid sensor/actuator eui\"}");
         }
+        if (wref[0] == 0 && weui_s[0] && strncmp(weui_s, "remote:", 7) != 0) {
+            snprintf(wref, sizeof(wref), "%s", weui_s);
+        }
         uint8_t kind = parse_thermo_kind_str(reg_s[0] ? reg_s : "temperature");
         if (kind == GROUP_THERMO_KIND_HUMIDITY) {
-            /* Humidity regulator still needs a single actuator in switch_eui. */
-            if (sweui[0] == 0 && sweui[1] == 0 && sweui[2] == 0 && sweui[3] == 0 &&
-                sweui[4] == 0 && sweui[5] == 0 && sweui[6] == 0 && sweui[7] == 0) {
+            bool have_sw = href[0] || sweui[0] || sweui[1] || sweui[2] || sweui[3] || sweui[4] ||
+                           sweui[5] || sweui[6] || sweui[7];
+            if (!have_sw) {
                 httpd_resp_set_status(req, "400 Bad Request");
                 httpd_resp_set_type(req, "application/json");
                 return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"switch_eui required\"}");
@@ -1656,7 +1697,7 @@ static esp_err_t api_group_create(httpd_req_t *req)
         }
         uint8_t mode = parse_thermo_mode_str(mode_s, kind);
         err = group_create_thermostat(name, kind, seui, heui, sweui, ceui, target, target_rh, gap,
-                                      hyst, force_rh, mode, hk, &id);
+                                      hyst, force_rh, mode, hk, sref, href, cref, wref, &id);
     } else {
         /* Default: general grouped device */
         uint8_t members[GROUP_MAX_MEMBERS][8];
@@ -1713,7 +1754,7 @@ static esp_err_t api_thermo_create(httpd_req_t *req)
     uint8_t zero[8] = {0};
     esp_err_t err = group_create_thermostat(name, kind, seui, zero, sweui, zero, target, 45.0f,
                                             THERMOSTAT_DEFAULT_GAP_C, THERMOSTAT_DEFAULT_HYSTERESIS_C,
-                                            false, mode, hk, &id);
+                                            false, mode, hk, NULL, NULL, NULL, NULL, &id);
     httpd_resp_set_type(req, "application/json");
     if (err != ESP_OK) {
         httpd_resp_set_status(req, "400 Bad Request");
@@ -1737,26 +1778,54 @@ static esp_err_t api_group_update(httpd_req_t *req)
     }
     group_update_t upd = {0};
     char name[32] = {0}, seui_s[40] = {0}, sweui_s[40] = {0}, ceui_s[40] = {0}, heui_s[40] = {0};
+    char weui_s[40] = {0};
     char mode_s[16] = {0}, reg_s[16] = {0};
     if (json_get_string(body, "name", name, sizeof(name)) && name[0]) {
         upd.set_name = true;
         snprintf(upd.name, sizeof(upd.name), "%s", name);
     }
-    if (json_get_string(body, "sensor_eui", seui_s, sizeof(seui_s)) &&
-        parse_eui64(seui_s, upd.sensor_eui)) {
-        upd.set_sensor = true;
+    if (json_get_string(body, "sensor_eui", seui_s, sizeof(seui_s))) {
+        if (!parse_dev_ref(seui_s, upd.sensor_eui, upd.sensor_ref, sizeof(upd.sensor_ref), false)) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid sensor\"}");
+        }
+        upd.set_sensor = upd.sensor_ref[0] == 0;
+        upd.set_sensor_ref = true;
     }
     if (json_get_string(body, "humidity_sensor_eui", heui_s, sizeof(heui_s)) &&
         parse_optional_eui64(heui_s, upd.humidity_sensor_eui)) {
         upd.set_humidity_sensor = true;
     }
-    if (json_get_string(body, "switch_eui", sweui_s, sizeof(sweui_s)) &&
-        parse_optional_eui64(sweui_s, upd.switch_eui)) {
+    if (json_get_string(body, "switch_eui", sweui_s, sizeof(sweui_s))) {
+        if (!parse_dev_ref(sweui_s, upd.switch_eui, upd.switch_ref, sizeof(upd.switch_ref), true)) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid heater\"}");
+        }
         upd.set_switch = true;
+        upd.set_switch_ref = true;
     }
-    if (json_get_string(body, "cooler_eui", ceui_s, sizeof(ceui_s)) &&
-        parse_optional_eui64(ceui_s, upd.cooler_eui)) {
+    if (json_get_string(body, "cooler_eui", ceui_s, sizeof(ceui_s))) {
+        if (!parse_dev_ref(ceui_s, upd.cooler_eui, upd.cooler_ref, sizeof(upd.cooler_ref), true)) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid cooler\"}");
+        }
         upd.set_cooler = true;
+        upd.set_cooler_ref = true;
+    }
+    if (json_get_string(body, "window_eui", weui_s, sizeof(weui_s))) {
+        uint8_t ignore[8];
+        if (!parse_dev_ref(weui_s, ignore, upd.window_ref, sizeof(upd.window_ref), true)) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid window sensor\"}");
+        }
+        if (!upd.window_ref[0] && weui_s[0] && strcmp(weui_s, "none") != 0) {
+            snprintf(upd.window_ref, sizeof(upd.window_ref), "%s", weui_s);
+        }
+        upd.set_window_ref = true;
     }
     if (json_get_string(body, "regulation", reg_s, sizeof(reg_s)) && reg_s[0]) {
         upd.set_thermo_kind = true;
@@ -1853,6 +1922,246 @@ static esp_err_t api_thermo_remove(httpd_req_t *req)
     return api_group_remove(req);
 }
 
+static const char *zb_peer_kind(zb_device_kind_t kind)
+{
+    switch (kind) {
+    case ZB_DEVICE_KIND_SENSOR:
+        return "climate";
+    case ZB_DEVICE_KIND_SWITCH:
+        return "switch";
+    case ZB_DEVICE_KIND_LIGHT:
+        return "light";
+    case ZB_DEVICE_KIND_OUTLET:
+        return "plug";
+    case ZB_DEVICE_KIND_CONTACT:
+        return "contact";
+    case ZB_DEVICE_KIND_MOTION:
+        return "motion";
+    case ZB_DEVICE_KIND_IRRIGATION:
+        return "valve";
+    default:
+        return "device";
+    }
+}
+
+static int zb_write_peer_devices(char *buf, size_t len)
+{
+    size_t pos = 0;
+    if (!buf || len < 3) {
+        return -1;
+    }
+    buf[pos++] = '[';
+    bool first = true;
+    for (uint16_t i = 0; i < ZB_HOST_MAX_DEVICES; i++) {
+        zb_device_t d;
+        if (!zigbee_host_get_device_at(i, &d) || !d.used) {
+            continue;
+        }
+        zb_device_kind_t kind = zigbee_host_device_kind(&d);
+        bool contact = kind == ZB_DEVICE_KIND_CONTACT;
+        bool onoff = zigbee_host_is_onoff_actuator(&d);
+        if (!contact && !d.has_temp && !onoff) {
+            continue;
+        }
+        char id[24], name[80];
+        ezsp_format_eui64(d.eui64, id, sizeof(id));
+        json_escape(d.name[0] ? d.name : id, name, sizeof(name));
+        int n = snprintf(buf + pos, len - pos,
+                         "%s{\"id\":\"%s\",\"name\":\"%s\",\"kind\":\"%s\","
+                         "\"has_temp\":%s,\"temp_c\":%.2f,\"has_onoff\":%s,\"on\":%s,"
+                         "\"has_contact\":%s,\"contact_open\":%s}",
+                         first ? "" : ",", id, name, zb_peer_kind(kind),
+                         d.has_temp ? "true" : "false", d.has_temp ? (double)d.temperature_c : 0.0,
+                         onoff ? "true" : "false", d.onoff_on ? "true" : "false",
+                         contact ? "true" : "false", (contact && d.binary_on) ? "true" : "false");
+        if (n < 0 || (size_t)n >= len - pos) {
+            return -1;
+        }
+        pos += (size_t)n;
+        first = false;
+    }
+    if (pos + 2 > len) {
+        return -1;
+    }
+    buf[pos++] = ']';
+    buf[pos] = '\0';
+    return (int)pos;
+}
+
+static esp_err_t zb_peer_set_on(const char *id, bool on)
+{
+    uint8_t eui[8];
+    if (!id || !parse_eui64(id, eui)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return zigbee_host_set_onoff(eui, on);
+}
+
+static bool peer_token(httpd_req_t *req)
+{
+    char token[48];
+    if (httpd_req_get_hdr_value_str(req, "X-Peer-Token", token, sizeof(token)) != ESP_OK) {
+        return false;
+    }
+    return peer_link_token_ok(token);
+}
+
+static esp_err_t peer_json(httpd_req_t *req, const char *body)
+{
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t peer_fail(httpd_req_t *req, const char *msg)
+{
+    httpd_resp_set_status(req, "400 Bad Request");
+    char body[160];
+    snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\"}", msg);
+    return peer_json(req, body);
+}
+
+static esp_err_t peer_result(httpd_req_t *req, esp_err_t err, const char *fail)
+{
+    if (err != ESP_OK) {
+        return peer_fail(req, fail);
+    }
+    return peer_json(req, "{\"ok\":true}");
+}
+
+static esp_err_t api_peer_get(httpd_req_t *req)
+{
+    char *json = malloc(3072);
+    if (!json) {
+        return peer_fail(req, "Link status is unavailable");
+    }
+    int n = peer_link_status_json(json, 3072);
+    esp_err_t err = (n < 0) ? peer_fail(req, "Link status is unavailable") : peer_json(req, json);
+    free(json);
+    return err;
+}
+
+static esp_err_t api_peer_devices_get(httpd_req_t *req)
+{
+    if (!peer_token(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        return peer_json(req, "{\"ok\":false,\"error\":\"Not linked\"}");
+    }
+    char *json = malloc(3072);
+    if (!json) {
+        return peer_fail(req, "Device list is unavailable");
+    }
+    int n = peer_link_write_local_devices(json, 3072);
+    esp_err_t err = (n < 0) ? peer_fail(req, "Device list is unavailable") : peer_json(req, json);
+    free(json);
+    return err;
+}
+
+static esp_err_t api_peer_discover(httpd_req_t *req)
+{
+    return peer_result(req, peer_link_discover(), "Could not look for a gateway");
+}
+
+static esp_err_t api_peer_pair(httpd_req_t *req)
+{
+    char body[160] = {0}, host[48] = {0};
+    read_body(req, body, sizeof(body));
+    if (!json_get_string(body, "host", host, sizeof(host)) || !host[0]) {
+        return peer_fail(req, "Address is required");
+    }
+    esp_err_t err = peer_link_pair(host);
+    if (err == ESP_ERR_INVALID_STATE) {
+        return peer_fail(req, "Already linked, or this gateway has no IP yet");
+    }
+    return peer_result(req, err, "The other gateway did not answer");
+}
+
+static esp_err_t api_peer_accept(httpd_req_t *req)
+{
+    return peer_result(req, peer_link_accept(), "Could not accept the link");
+}
+
+static esp_err_t api_peer_decline(httpd_req_t *req)
+{
+    return peer_result(req, peer_link_decline(), "Could not decline");
+}
+
+static esp_err_t api_peer_unpair(httpd_req_t *req)
+{
+    return peer_result(req, peer_link_unpair(), "Could not unpair");
+}
+
+static esp_err_t api_peer_invite(httpd_req_t *req)
+{
+    char body[320] = {0};
+    char id[20] = {0}, name[40] = {0}, role[12] = {0}, host[48] = {0}, token[40] = {0};
+    read_body(req, body, sizeof(body));
+    json_get_string(body, "id", id, sizeof(id));
+    json_get_string(body, "name", name, sizeof(name));
+    json_get_string(body, "role", role, sizeof(role));
+    json_get_string(body, "host", host, sizeof(host));
+    json_get_string(body, "token", token, sizeof(token));
+    esp_err_t err = peer_link_on_invite(id, name, role, host, token);
+    if (err != ESP_OK) {
+        return peer_fail(req, "This gateway is already linked");
+    }
+    return peer_json(req, "{\"ok\":true,\"name\":\"ICC Zigbee Gateway\",\"role\":\"zigbee\"}");
+}
+
+static esp_err_t api_peer_confirm(httpd_req_t *req)
+{
+    char body[320] = {0};
+    char id[20] = {0}, name[40] = {0}, role[12] = {0}, host[48] = {0}, token[48] = {0};
+    read_body(req, body, sizeof(body));
+    json_get_string(body, "id", id, sizeof(id));
+    json_get_string(body, "name", name, sizeof(name));
+    json_get_string(body, "role", role, sizeof(role));
+    json_get_string(body, "host", host, sizeof(host));
+    json_get_string(body, "token", token, sizeof(token));
+    char hdr[48];
+    if (httpd_req_get_hdr_value_str(req, "X-Peer-Token", hdr, sizeof(hdr)) == ESP_OK && hdr[0]) {
+        snprintf(token, sizeof(token), "%s", hdr);
+    }
+    return peer_result(req, peer_link_on_confirm(id, name, role, host, token),
+                       "This link request is no longer waiting");
+}
+
+static esp_err_t api_peer_bye(httpd_req_t *req)
+{
+    char token[48] = {0};
+    if (httpd_req_get_hdr_value_str(req, "X-Peer-Token", token, sizeof(token)) != ESP_OK) {
+        char body[120] = {0};
+        read_body(req, body, sizeof(body));
+        json_get_string(body, "token", token, sizeof(token));
+    }
+    return peer_result(req, peer_link_on_bye(token), "Not linked");
+}
+
+static esp_err_t api_peer_set(httpd_req_t *req)
+{
+    if (!peer_token(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        return peer_json(req, "{\"ok\":false,\"error\":\"Not linked\"}");
+    }
+    char body[120] = {0}, id[24] = {0};
+    read_body(req, body, sizeof(body));
+    if (!json_get_string(body, "id", id, sizeof(id)) || !id[0]) {
+        return peer_fail(req, "Device id is required");
+    }
+    bool on = json_get_bool(body, "on", false);
+    return peer_result(req, peer_link_set_local(id, on), "Could not reach that device");
+}
+
+static esp_err_t api_peer_command(httpd_req_t *req)
+{
+    char body[120] = {0}, id[24] = {0};
+    read_body(req, body, sizeof(body));
+    if (!json_get_string(body, "id", id, sizeof(id)) || !id[0]) {
+        return peer_fail(req, "Device id is required");
+    }
+    bool on = json_get_bool(body, "on", false);
+    return peer_result(req, peer_link_set_remote(id, on), "The other gateway did not accept the command");
+}
+
 esp_err_t web_server_start(void)
 {
 #if !CONFIG_WIFI_ENABLED
@@ -1870,13 +2179,21 @@ esp_err_t web_server_start(void)
     if (!s_root_mu) {
         s_root_mu = xSemaphoreCreateMutex();
     }
+    static const peer_link_cfg_t peer_cfg = {
+        .role = "zigbee",
+        .name = "ICC Zigbee Gateway",
+        .write_devices = zb_write_peer_devices,
+        .set_on = zb_peer_set_on,
+    };
+    peer_link_start(&peer_cfg);
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = CONFIG_WEB_HTTP_PORT;
     /* Above HAP httpd (idle+5) so a busy Home session cannot starve the portal. */
     config.task_priority = tskIDLE_PRIORITY + 6;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 36;
+    config.max_uri_handlers = 48;
+    /* 16384 does not fit in internal RAM beside the HomeKit server. */
     config.stack_size = 12288;
     /* OTA upload streams ~1 MiB; keep headroom between flash-write chunks. */
     config.recv_wait_timeout = 10;
@@ -1926,6 +2243,18 @@ esp_err_t web_server_start(void)
         {.uri = "/library/test/success.html", .method = HTTP_GET, .handler = captive_ok},
         {.uri = "/ncsi.txt", .method = HTTP_GET, .handler = captive_ok},
         {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = captive_ok},
+        {.uri = "/api/peer", .method = HTTP_GET, .handler = api_peer_get},
+        {.uri = "/api/peer/devices", .method = HTTP_GET, .handler = api_peer_devices_get},
+        {.uri = "/api/peer/discover", .method = HTTP_POST, .handler = api_peer_discover},
+        {.uri = "/api/peer/pair", .method = HTTP_POST, .handler = api_peer_pair},
+        {.uri = "/api/peer/accept", .method = HTTP_POST, .handler = api_peer_accept},
+        {.uri = "/api/peer/decline", .method = HTTP_POST, .handler = api_peer_decline},
+        {.uri = "/api/peer/unpair", .method = HTTP_POST, .handler = api_peer_unpair},
+        {.uri = "/api/peer/invite", .method = HTTP_POST, .handler = api_peer_invite},
+        {.uri = "/api/peer/confirm", .method = HTTP_POST, .handler = api_peer_confirm},
+        {.uri = "/api/peer/bye", .method = HTTP_POST, .handler = api_peer_bye},
+        {.uri = "/api/peer/set", .method = HTTP_POST, .handler = api_peer_set},
+        {.uri = "/api/peer/command", .method = HTTP_POST, .handler = api_peer_command},
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         httpd_register_uri_handler(s_server, &routes[i]);

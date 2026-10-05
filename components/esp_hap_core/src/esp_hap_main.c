@@ -45,7 +45,30 @@
 #include <sys/socket.h>
 
 static QueueHandle_t xQueue;
+static TaskHandle_t s_hap_loop_task;
 ESP_EVENT_DEFINE_BASE(HAP_EVENT);
+
+void hap_loop_wake(void)
+{
+    TaskHandle_t task = s_hap_loop_task;
+    if (!task) {
+        return;
+    }
+    if (xPortInIsrContext() == pdTRUE) {
+        BaseType_t woken = pdFALSE;
+        vTaskNotifyGiveFromISR(task, &woken);
+        if (woken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
+    } else {
+        xTaskNotifyGive(task);
+    }
+}
+
+bool hap_loop_is_current(void)
+{
+    return s_hap_loop_task && s_hap_loop_task == xTaskGetCurrentTaskHandle();
+}
 
 const char * hap_get_version(void)
 {
@@ -143,30 +166,11 @@ static void hap_common_sm(hap_internal_event_t event)
  */
             hap_http_send_notif();
             return;
-        case HAP_INTERNAL_EVENT_PROVOKE_REFRESH: {
-            /* Drop pair-verify sessions so Home reconnects and GETs — same effect as
-             * lock/unlock. Only used when EVENT could not be delivered.
-             * Prefer TXT s# bump over mdns stop/start (force_reannounce starved C3 Wi‑Fi). */
-            int n = 0;
-            for (int i = 0; i < HAP_MAX_SESSIONS; i++) {
-                hap_secure_session_t *s = hap_priv.sessions[i];
-                if (!s) {
-                    continue;
-                }
-                n++;
-                if (s->conn_identifier >= 0) {
-                    struct linger lin = {.l_onoff = 1, .l_linger = 0};
-                    setsockopt(s->conn_identifier, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
-                    shutdown(s->conn_identifier, SHUT_RDWR);
-                }
-            }
-            ESP_LOGI("hap", "provoke refresh: close %d session(s) + mDNS s#", n);
-            hap_close_all_sessions();
-            hap_priv.disconnected_event_sent = false;
-            /* Never force_reannounce here — mdns stop/start starved C3 Wi‑Fi. */
-            hap_mdns_announce(false);
+        case HAP_INTERNAL_EVENT_PROVOKE_REFRESH:
+            /* s# does not repaint a controller that already has a socket, and
+             * the TXT update takes the mDNS lock with no timeout. Doing it
+             * here stalled the loop that has to send EVENT/1.0. */
             return;
-        }
         case HAP_INTERNAL_EVENT_NETWORK_SWITCH:
             ESP_MFI_DEBUG(ESP_MFI_DEBUG_INFO, "Taking the network down");
             /* wait for some time, close all the active sessions and then
@@ -203,30 +207,40 @@ static void hap_common_sm(hap_internal_event_t event)
 static void hap_loop_task(void *param)
 {
     hap_state_t cur_state = HAP_STATE_NONE;
-    /* Larger than stock 10 so button TRIGGER_NOTIF is not dropped under load.
-     * Sensor bursts used to fill this and fall back to a cross-task inline EVENT
-     * flush (removed) — prefer headroom here instead. */
     xQueue = xQueueCreate( 48, sizeof(hap_event_ctx_t) );
     hap_event_ctx_t hap_event;
     bool loop_continue = true;
-    ESP_MFI_DEBUG(ESP_MFI_DEBUG_INFO, "HAP Main Loop Started");
+    s_hap_loop_task = xTaskGetCurrentTaskHandle();
+    ESP_LOGW("hap", "hap-loop running");
     while (loop_continue) {
-        /* Only short-poll when notifs are pending (deferred TRIGGER). A permanent
-         * 100ms idle flush starved Wi‑Fi; blocking forever left EVENTs stuck. */
-        TickType_t wait = hap_notif_pending() ? pdMS_TO_TICKS(40) : portMAX_DELAY;
-        if (xQueueReceive(xQueue, &hap_event, wait) != pdTRUE) {
-            if (hap_notif_pending()) {
-                hap_http_send_notif();
+        /* Characteristic events first. They live on their own queue and are
+         * woken with a task notification, so a busy control queue cannot
+         * leave Home showing the previous switch state. */
+        if (hap_notif_pending()) {
+            hap_http_send_notif();
+        }
+        if (xQueueReceive(xQueue, &hap_event, 0) == pdTRUE) {
+            if (hap_event.event == HAP_INTERNAL_EVENT_LOOP_STOP) {
+                loop_continue = false;
+                continue;
             }
+            if (hap_event.event == HAP_INTERNAL_EVENT_TRIGGER_NOTIF) {
+                continue;
+            }
+            hap_common_sm(hap_event.event);
+            hap_nw_configured_sm(hap_event.event, &cur_state);
             continue;
         }
-        if (hap_event.event == HAP_INTERNAL_EVENT_LOOP_STOP) {
-            loop_continue = false;
+        if (hap_notif_pending()) {
             continue;
         }
-        hap_common_sm(hap_event.event);
-        hap_nw_configured_sm(hap_event.event, &cur_state);
+        /* Idle until a characteristic wake or hap_send_event(). Also wake
+         * once a second: a missed task notification used to leave the
+         * characteristic queued until Home was quit and opened again.
+         * The body does no network work unless a value is actually pending. */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
     }
+    s_hap_loop_task = NULL;
     vQueueDelete(xQueue);
     xQueue = NULL;
     ESP_MFI_DEBUG(ESP_MFI_DEBUG_INFO, "HAP Main Loop Stopped");
@@ -238,8 +252,11 @@ int hap_loop_start()
 {
     if (!loop_started) {
         loop_started = true;
-        xTaskCreate(hap_loop_task, "hap-loop", hap_priv.cfg.task_stack_size, NULL,
-                        hap_priv.cfg.task_priority, NULL);
+        if (xTaskCreate(hap_loop_task, "hap-loop", hap_priv.cfg.task_stack_size, NULL,
+                        hap_priv.cfg.task_priority, NULL) != pdPASS) {
+            loop_started = false;
+            ESP_LOGE("hap", "hap-loop create failed");
+        }
     }
     return HAP_SUCCESS;
 }
@@ -263,11 +280,10 @@ int hap_send_event(hap_internal_event_t event)
     if (xPortInIsrContext() == pdTRUE) {
         ret = xQueueSendFromISR(xQueue, &hap_event, NULL);
     } else {
-        /* Never drop notification triggers — Home misses On state otherwise. */
-        TickType_t wait = (event == HAP_INTERNAL_EVENT_TRIGGER_NOTIF) ? pdMS_TO_TICKS(200) : 0;
-        ret = xQueueSend(xQueue, &hap_event, wait);
+        ret = xQueueSend(xQueue, &hap_event, 0);
     }
     if (ret == pdTRUE) {
+        hap_loop_wake();
         return HAP_SUCCESS;
     }
     return HAP_FAIL;

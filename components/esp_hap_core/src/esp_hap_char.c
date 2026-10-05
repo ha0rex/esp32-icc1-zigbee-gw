@@ -126,9 +126,14 @@ bool hap_char_is_registered(hap_char_t *needle)
     if (!hap_heap_ptr_ok(needle)) {
         return false;
     }
-    for (ha = hap_get_first_acc(); ha; ha = hap_acc_get_next(ha)) {
-        for (hs = hap_acc_get_first_serv(ha); hs; hs = hap_serv_get_next(hs)) {
-            for (hc = hap_serv_get_first_char(hs); hc; hc = hap_char_get_next(hc)) {
+    /* A corrupted next pointer must not wedge the HAP loop. The open Home
+     * tile stays stale for as long as this walk fails to return. */
+    int acc_n = 0;
+    for (ha = hap_get_first_acc(); ha && acc_n < 32; ha = hap_acc_get_next(ha), acc_n++) {
+        int serv_n = 0;
+        for (hs = hap_acc_get_first_serv(ha); hs && serv_n < 48; hs = hap_serv_get_next(hs), serv_n++) {
+            int char_n = 0;
+            for (hc = hap_serv_get_first_char(hs); hc && char_n < 64; hc = hap_char_get_next(hc), char_n++) {
                 if (hc == needle) {
                     return true;
                 }
@@ -190,12 +195,14 @@ static int hap_queue_event(hap_char_t *hc)
         ret = xQueueSend(hap_event_queue, &hc, 0);
     }
     if (ret == pdTRUE) {
-        /* Never flush EVENTs from the caller task (zigbee/httpd). Concurrent
-         * hap_send_notification raced the HAP loop and LoadProhibited in
-         * hap_serv_get_parent after sensor bursts. HAP loop drains via
-         * TRIGGER_NOTIF and the short-poll when hap_notif_pending(). */
-        if (hap_send_event(HAP_INTERNAL_EVENT_TRIGGER_NOTIF) != HAP_SUCCESS) {
-            ESP_LOGW("hap", "TRIGGER_NOTIF deferred — HAP loop will flush pending");
+        /* The HAP loop is priority 3 and has been failing to start or to
+         * wake, so a queued characteristic never became an EVENT. Send from
+         * this task. hap_send_notification takes its own mutex, and it
+         * refuses to re-enter if a retry queues the same characteristic. */
+        if (xPortInIsrContext() == pdTRUE || hap_loop_is_current()) {
+            hap_loop_wake();
+        } else {
+            hap_http_send_notif();
         }
         return HAP_SUCCESS;
     }
@@ -357,6 +364,14 @@ int hap_char_update_val(hap_char_t *hc, hap_val_t *val)
         _hc->owner_ctrl = 0;
     }
 	return HAP_SUCCESS;
+}
+
+int hap_char_raise_event(hap_char_t *hc)
+{
+    if (!hc) {
+        return HAP_FAIL;
+    }
+    return hap_queue_event(hc);
 }
 
 int hap_char_update_val_silent(hap_char_t *hc, hap_val_t *val)

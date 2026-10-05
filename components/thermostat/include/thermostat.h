@@ -69,6 +69,18 @@ typedef struct {
     bool heating; /**< Heater / humidity actuator on */
     bool cooling; /**< Cooler on (temp kind only) */
 
+    /**
+     * "remote:<id>" when the device lives on the linked gateway.
+     * Empty means the matching EUI is a local Zigbee device.
+     */
+    char sensor_ref[40];
+    char switch_ref[40];
+    char cooler_ref[40];
+    char window_ref[40];
+    bool window_open;
+    bool window_hold;    /**< Heat is held off because the window is open */
+    bool saved_heating;  /**< Heater state to restore when the window closes */
+
     /* General group members */
     uint8_t member_count;
     uint8_t members[GROUP_MAX_MEMBERS][8];
@@ -115,6 +127,14 @@ typedef struct {
     bool set_humidity_sensor;
     bool set_switch;
     bool set_cooler;
+    char sensor_ref[40];
+    char switch_ref[40];
+    char cooler_ref[40];
+    char window_ref[40];
+    bool set_sensor_ref;
+    bool set_switch_ref;
+    bool set_cooler_ref;
+    bool set_window_ref;
     bool set_target;
     bool set_target_humidity;
     bool set_gap;
@@ -147,7 +167,8 @@ esp_err_t group_create_thermostat(const char *name, uint8_t thermo_kind, const u
                                   const uint8_t cooler_eui[8], float target_c,
                                   float target_humidity_pct, float gap_c, float hysteresis_c,
                                   bool humidity_force_heat, uint8_t mode, bool homekit_expose,
-                                  uint8_t *id_out);
+                                  const char *sensor_ref, const char *switch_ref,
+                                  const char *cooler_ref, const char *window_ref, uint8_t *id_out);
 
 esp_err_t group_create_general(const char *name, const uint8_t members[][8], uint8_t member_count,
                                bool homekit_expose, uint8_t power_fail_mode, uint8_t *id_out);

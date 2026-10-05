@@ -66,6 +66,10 @@ typedef enum {
 int hap_loop_start();
 int hap_loop_stop();
 int hap_send_event(hap_internal_event_t event);
+/** Wake the HAP loop without using its control queue. Characteristic
+ *  notifications use this so a full control queue cannot swallow them. */
+void hap_loop_wake(void);
+bool hap_loop_is_current(void);
 int hap_update_config_number();
 bool is_hap_loop_started();
 void hap_report_event(hap_event_t event, void *data, size_t data_size);

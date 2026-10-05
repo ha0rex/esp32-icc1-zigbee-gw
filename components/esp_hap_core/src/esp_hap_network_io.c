@@ -28,6 +28,12 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+
 #include <sodium/crypto_aead_chacha20poly1305.h>
 #include <byte_convert.h>
 
@@ -91,11 +97,18 @@ int hap_encrypt_data(hap_encrypt_frame_t *frame, hap_secure_session_t *session,
     crypto_aead_chacha20poly1305_ietf_encrypt_detached(frame->data, frame->data + buflen, &mlen,
                 buf, buflen, frame->pkt_size, 2, NULL, newnonce, session->encrypt_key);
 
-	/* Increment nonce after every frame */
+	/* Nonce advances only after this frame is accepted by TCP. Incrementing
+	 * here used to desynchronize Home whenever send() stalled: the accessory
+	 * moved on, the controller never saw the frame, and every later EVENT was
+	 * undecryptable until the app was quit and a new pair-verify started. */
+	return 2 + buflen + 16; /* Total length of the encrypted data */
+}
+
+static void hap_encrypt_nonce_commit(hap_secure_session_t *session)
+{
 	uint64_t int_nonce = get_u64_le(session->encrypt_nonce);
 	int_nonce++;
 	put_u64_le(session->encrypt_nonce, int_nonce);
-	return 2 + buflen + 16; /* Total length of the encrypted data */
 }
 
 static int hap_session_error(hap_secure_session_t *session)
@@ -157,55 +170,120 @@ int hap_decrypt_data(hap_decrypt_frame_t *frame, hap_secure_session_t *session,
 	return bytes;
 }
 
-/** Non-blocking send with a short wait — dead Home sessions must not stall
- * the HAP loop (that dropped TRIGGER_NOTIF and killed the portal). */
+/** Non-blocking send. A single 100ms stall used to fail the write, and the
+ * caller then tore down the Home event socket. Allow about a second for the
+ * Wi-Fi TX path (shared with the Thread border router) before giving up.
+ * Hard errors still return immediately so a dead session is not held. */
 static int hap_sock_send(int sockfd, const void *buf, size_t len, int flags)
 {
     size_t off = 0;
+    int waits = 0;
+    /* One frame only. A peer that accepts a byte at a time used to reset the
+     * wait counter forever and hold the encrypt mutex, so the HAP loop never
+     * reached the next characteristic. */
+    int64_t deadline = esp_timer_get_time() + 1000000;
     while (off < len) {
         int n = send(sockfd, (const uint8_t *)buf + off, len - off, flags | MSG_DONTWAIT);
         if (n > 0) {
             off += (size_t)n;
+            waits = 0;
             continue;
         }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ENOMEM)) {
+            if (waits >= 10 || esp_timer_get_time() >= deadline) {
+                errno = ETIMEDOUT;
+                /* Bytes already queued must be visible to the caller so it can
+                 * drop the session. Retrying the frame would append a second
+                 * copy onto this partial one. */
+                return off > 0 ? (int)off : -1;
+            }
             fd_set wfds;
             FD_ZERO(&wfds);
             FD_SET(sockfd, &wfds);
             struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
             int sel = select(sockfd + 1, NULL, &wfds, NULL, &tv);
-            if (sel > 0) {
-                continue;
+            /* Always count the wait. select() can report the socket writable
+             * while send() still returns EAGAIN/ENOMEM because the lwIP pbuf
+             * pool is empty (Thread and Wi-Fi share it). Continuing only when
+             * select succeeded spun the HAP loop forever, so the queued
+             * characteristic never became an EVENT. */
+            waits++;
+            if (sel < 0 && errno != EINTR) {
+                return off > 0 ? (int)off : -1;
             }
-            errno = ETIMEDOUT;
-            return -1;
+            if (sel > 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            continue;
         }
-        return -1;
+        return off > 0 ? (int)off : -1;
     }
     return (int)len;
 }
 
+static SemaphoreHandle_t s_hap_send_mu;
+
 int hap_httpd_send(httpd_handle_t hd, int sockfd, const char *buf, unsigned buf_len, int flags)
 {
-	hap_secure_session_t *session = httpd_sess_get_ctx(hap_priv.server, sockfd);
-	if (session && (session->state == STATE_VERIFIED)) {
-		uint8_t *buf_ptr = (uint8_t *)buf;
-		int tmp_buf_len = buf_len;
-		while (tmp_buf_len) {
-			hap_encrypt_frame_t encrypt_frame;
-			memset(&encrypt_frame, 0, sizeof(encrypt_frame));
-			int len = min(tmp_buf_len, HAP_MAX_NW_FRAME_SIZE);
-			int send_len = hap_encrypt_data(&encrypt_frame, session, buf_ptr, len);
-			if (hap_sock_send(sockfd, (uint8_t *)&encrypt_frame, (size_t)send_len, flags) <= 0)
-				return HAP_FAIL;
-			tmp_buf_len -= len;
-			buf_ptr += len;
+	(void)hd;
+	/* Prefer the pair-verify session table. httpd_sess_get_ctx() is only the
+	 * live request context while the httpd task is inside a handler. */
+	hap_secure_session_t *session = NULL;
+	for (int i = 0; i < HAP_MAX_SESSIONS; i++) {
+		hap_secure_session_t *candidate = hap_priv.sessions[i];
+		if (candidate && candidate->conn_identifier == sockfd &&
+				candidate->state == STATE_VERIFIED) {
+			session = candidate;
+			break;
 		}
-		/* Return the total length at the end since this API expects so
-		 */
-		return buf_len;
 	}
-	return hap_sock_send(sockfd, buf, buf_len, flags);
+	if (!session) {
+		session = httpd_sess_get_ctx(hap_priv.server, sockfd);
+	}
+	if (!session || session->state != STATE_VERIFIED) {
+		/* A cleartext write on a pair-verified socket desynchronizes Home.
+		 * It then ignores the connection until the app is force-quit. */
+		ESP_LOGW("hap", "drop send fd=%d — session not verified", sockfd);
+		errno = ENOTCONN;
+		return HAP_FAIL;
+	}
+	if (!s_hap_send_mu) {
+		s_hap_send_mu = xSemaphoreCreateMutex();
+	}
+	if (s_hap_send_mu && xSemaphoreTake(s_hap_send_mu, pdMS_TO_TICKS(200)) != pdTRUE) {
+		/* The httpd task is mid-response. Retrying later keeps the nonce
+		 * unchanged. Waiting forever is what left Home on the last GET. */
+		errno = EBUSY;
+		return HAP_FAIL;
+	}
+	uint8_t *buf_ptr = (uint8_t *)buf;
+	int tmp_buf_len = (int)buf_len;
+	int rc = (int)buf_len;
+	bool committed = false;
+	while (tmp_buf_len) {
+		hap_encrypt_frame_t encrypt_frame;
+		memset(&encrypt_frame, 0, sizeof(encrypt_frame));
+		int len = min(tmp_buf_len, HAP_MAX_NW_FRAME_SIZE);
+		int send_len = hap_encrypt_data(&encrypt_frame, session, buf_ptr, len);
+		int n = hap_sock_send(sockfd, (uint8_t *)&encrypt_frame, (size_t)send_len, flags);
+		if (n != send_len) {
+			rc = HAP_FAIL;
+			if (n > 0 || committed) {
+				/* A partial frame is already on the wire. The controller's
+				 * decrypt counter will never match again. */
+				session->state = STATE_INVALID;
+			}
+			break;
+		}
+		hap_encrypt_nonce_commit(session);
+		committed = true;
+		tmp_buf_len -= len;
+		buf_ptr += len;
+	}
+	if (s_hap_send_mu) {
+		xSemaphoreGive(s_hap_send_mu);
+	}
+	return rc;
 }
 
 int hap_httpd_recv(httpd_handle_t hd, int sockfd, char *buf, unsigned buf_len, int flags)
