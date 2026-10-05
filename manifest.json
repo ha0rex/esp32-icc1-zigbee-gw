@@ -1,0 +1,32 @@
+{
+  "version": "0.3.51-20261005.5b535cd4",
+  "url": "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota-nightly/esp32_icc1_zigbee_gw.bin",
+  "sha256": "85e9f78be45af08119cef16765f4734cf904fccba5dcf72255234c037844b2c7",
+  "targets": {
+    "esp32c3": {
+      "url": "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota-nightly/esp32_icc1_zigbee_gw-esp32c3.bin",
+      "sha256": "85e9f78be45af08119cef16765f4734cf904fccba5dcf72255234c037844b2c7"
+    },
+    "esp32s3": {
+      "url": "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota-nightly/esp32_icc1_zigbee_gw-esp32s3.bin",
+      "sha256": "c44ca815e73d0baaa5ad7076dc469ab63db6daec9572970889a1b400ad9a27ec"
+    }
+  },
+  "channel": "ota-nightly",
+  "built": "2026-10-05T15:52:36Z",
+  "commit": "5b535cd4c4400b39f026163302c6d5de2ccf02ae",
+  "changelog": [
+    {
+      "sha": "5b535cd",
+      "message": "Pair with the Thread gateway and pause heating while a window is open."
+    },
+    {
+      "sha": "38db93b",
+      "message": "Add SNZB-02D wake-button thermostat cycling and EXT1 display (0.3.51)."
+    },
+    {
+      "sha": "106a341",
+      "message": "Add ESP32-S3 dual-target support with board-aware OTA and migration."
+    }
+  ]
+}
