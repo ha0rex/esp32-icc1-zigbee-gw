@@ -1,0 +1,24 @@
+{
+  "version": "0.3.53-20261029.b010f9bc",
+  "url": "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota-nightly/esp32_icc1_zigbee_gw.bin",
+  "sha256": "fb5162f77c811ecbe0dd800235b45b16e63b7aaf83f8e470ef3c01e4b4971991",
+  "targets": {
+    "esp32c3": {
+      "url": "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota-nightly/esp32_icc1_zigbee_gw-esp32c3.bin",
+      "sha256": "fb5162f77c811ecbe0dd800235b45b16e63b7aaf83f8e470ef3c01e4b4971991"
+    },
+    "esp32s3": {
+      "url": "https://raw.githubusercontent.com/ha0rex/esp32-icc1-zigbee-gw/ota-nightly/esp32_icc1_zigbee_gw-esp32s3.bin",
+      "sha256": "6993740aa0395b29f0210820bea4a1d1fbdfae9ead9b89315fc31d112c9cec48"
+    }
+  },
+  "channel": "ota-nightly",
+  "built": "2026-10-29T15:34:11Z",
+  "commit": "b010f9bc703801d465ee9603e3439e2a6a3c0a2f",
+  "changelog": [
+    {
+      "sha": "b010f9b",
+      "message": "Let a paired e-ink reader supply the thermostat and show its own climate and battery (0.3.53)."
+    }
+  ]
+}
