@@ -19,7 +19,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lwip/sockets.h"
 #include "sdkconfig.h"
+
+#include <unistd.h>
 
 #include "wifi_manager.h"
 #include "zigbee_host.h"
@@ -2162,6 +2165,112 @@ static esp_err_t api_peer_command(httpd_req_t *req)
     return peer_result(req, peer_link_set_remote(id, on), "The other gateway did not accept the command");
 }
 
+#define THERMO_DISCOVER_PORT 41241
+
+static esp_err_t api_thermo_remote_get(httpd_req_t *req)
+{
+    char body[1536];
+    size_t pos = 0;
+    pos += (size_t)snprintf(body + pos, sizeof(body) - pos, "{\"ok\":true,\"thermostats\":[");
+    bool first = true;
+    for (uint16_t i = 0; i < GROUP_MAX && pos + 180 < sizeof(body); i++) {
+        group_t g;
+        if (!group_get_at(i, &g) || g.type != GROUP_TYPE_THERMOSTAT ||
+            g.thermo_kind != GROUP_THERMO_KIND_TEMP) {
+            continue;
+        }
+        char name[80];
+        json_escape(g.name, name, sizeof(name));
+        pos += (size_t)snprintf(
+            body + pos, sizeof(body) - pos,
+            "%s{\"id\":%u,\"name\":\"%s\",\"has_current\":%s,\"current_c\":%.2f,\"target_c\":%.1f}",
+            first ? "" : ",", (unsigned)g.id, name, g.has_current_temp ? "true" : "false",
+            (double)g.current_temp_c, (double)g.target_c);
+        first = false;
+    }
+    snprintf(body + pos, sizeof(body) - pos, "]}");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t api_thermo_remote_post(httpd_req_t *req)
+{
+    char body[128] = {0};
+    read_body(req, body, sizeof(body));
+    int id = json_get_int(body, "id", 0);
+    if (id <= 0 || id > 255 || !strstr(body, "\"target_c\"")) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"id and target_c required\"}");
+    }
+    group_t g;
+    if (!group_get_by_id((uint8_t)id, &g) || g.type != GROUP_TYPE_THERMOSTAT ||
+        g.thermo_kind != GROUP_THERMO_KIND_TEMP) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"not a temperature thermostat\"}");
+    }
+    float target = json_get_float(body, "target_c", g.target_c);
+    esp_err_t err = thermostat_set_target((uint8_t)id, target);
+    if (err == ESP_OK) {
+        homekit_bridge_sync_devices();
+    }
+    httpd_resp_set_type(req, "application/json");
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"ok\":false}");
+    }
+    group_get_by_id((uint8_t)id, &g);
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":%u,\"target_c\":%.1f}", (unsigned)g.id,
+             (double)g.target_c);
+    return httpd_resp_sendstr(req, resp);
+}
+
+static void thermo_discover_task(void *arg)
+{
+    (void)arg;
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "thermostat discovery socket failed");
+        vTaskDelete(NULL);
+        return;
+    }
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(THERMO_DISCOVER_PORT),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        ESP_LOGE(TAG, "thermostat discovery bind failed");
+        close(fd);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "Thermostat remote discovery on UDP %d", THERMO_DISCOVER_PORT);
+    char buf[64];
+    for (;;) {
+        struct sockaddr_in from;
+        socklen_t flen = sizeof(from);
+        int n = recvfrom(fd, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &flen);
+        if (n < 11) {
+            continue;
+        }
+        buf[n] = '\0';
+        if (strncmp(buf, "ICC-THERMO?", 11) != 0) {
+            continue;
+        }
+        char reply[40];
+        int rn = snprintf(reply, sizeof(reply), "ICC-THERMO port=%d", CONFIG_WEB_HTTP_PORT);
+        if (rn > 0) {
+            sendto(fd, reply, (size_t)rn, 0, (struct sockaddr *)&from, flen);
+        }
+    }
+}
+
 esp_err_t web_server_start(void)
 {
 #if !CONFIG_WIFI_ENABLED
@@ -2192,7 +2301,7 @@ esp_err_t web_server_start(void)
     /* Above HAP httpd (idle+5) so a busy Home session cannot starve the portal. */
     config.task_priority = tskIDLE_PRIORITY + 6;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 48;
+    config.max_uri_handlers = 52;
     /* 16384 does not fit in internal RAM beside the HomeKit server. */
     config.stack_size = 12288;
     /* OTA upload streams ~1 MiB; keep headroom between flash-write chunks. */
@@ -2234,6 +2343,8 @@ esp_err_t web_server_start(void)
         {.uri = "/api/thermostats/create", .method = HTTP_POST, .handler = api_thermo_create},
         {.uri = "/api/thermostats/update", .method = HTTP_POST, .handler = api_thermo_update},
         {.uri = "/api/thermostats/remove", .method = HTTP_POST, .handler = api_thermo_remove},
+        {.uri = "/api/thermo-remote", .method = HTTP_GET, .handler = api_thermo_remote_get},
+        {.uri = "/api/thermo-remote", .method = HTTP_POST, .handler = api_thermo_remote_post},
         {.uri = "/api/ota", .method = HTTP_GET, .handler = api_ota_status},
         {.uri = "/api/ota/channel", .method = HTTP_POST, .handler = api_ota_channel},
         {.uri = "/api/ota/offer", .method = HTTP_POST, .handler = api_ota_offer},
@@ -2264,6 +2375,12 @@ esp_err_t web_server_start(void)
      * delayed silent-STA SoftAP recovery by ~25s after every boot/restart. */
     if (!s_watch_task) {
         xTaskCreate(web_watchdog_task, "web_wd", 3072, NULL, 3, &s_watch_task);
+    }
+
+    static bool s_thermo_udp;
+    if (!s_thermo_udp &&
+        xTaskCreate(thermo_discover_task, "thermo_udp", 3072, NULL, 3, NULL) == pdPASS) {
+        s_thermo_udp = true;
     }
 
     ESP_LOGI(TAG, "Production portal on port %d", CONFIG_WEB_HTTP_PORT);
