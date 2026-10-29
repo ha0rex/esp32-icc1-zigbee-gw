@@ -1,4 +1,6 @@
+#include "battery.h"
 #include "buttons.h"
+#include "climate.h"
 #include "epd.h"
 #include "link.h"
 #include "pins.h"
@@ -50,6 +52,11 @@ void app_main(void)
     int64_t hold_target_until = 0;
     float held_target = 0;
     bool have_list = false;
+    float shown_t = 0;
+    float shown_h = 0;
+    bool shown_ok = false;
+    int shown_batt = -1;
+    bool shown_chg = false;
 
     for (;;) {
         btn_ev_t ev = buttons_poll();
@@ -71,7 +78,7 @@ void app_main(void)
             if (!link_connect(20000)) {
                 static bool told;
                 if (!told) {
-                    ui_message("WIFI FAILED", "HOLD L+R");
+                    ui_message("WIFI FAILED", "HOLD CENTER");
                     told = true;
                 }
                 vTaskDelay(pdMS_TO_TICKS(1000));
@@ -96,6 +103,13 @@ void app_main(void)
             }
         }
 
+        float local_t = 0;
+        float local_h = 0;
+        bool has_local = climate_read(&local_t, &local_h);
+        int batt_pct = 0;
+        bool charging = false;
+        battery_read(&batt_pct, &charging);
+
         bool changed = false;
         if (have_list && list.count > 0) {
             if (index >= list.count) {
@@ -109,8 +123,10 @@ void app_main(void)
                     held_target = next;
                     hold_target_until = esp_timer_get_time() + 3000000;
                     if (!link_set_target(cur->id, next)) {
-                        ui_thermo(cur->name, cur->has_current, cur->current_c, cur->target_c, index,
-                                  list.count, "NOT SAVED");
+                        ui_thermo(cur->name, has_local, local_t, has_local, local_h, cur->target_c,
+                                  index, list.count, "NOT SAVED", batt_pct, charging);
+                        shown_batt = batt_pct;
+                        shown_chg = charging;
                     } else {
                         changed = true;
                     }
@@ -169,10 +185,39 @@ void app_main(void)
             next_poll = now + 15000000;
         }
 
+        static int64_t next_post;
+        if (has_local && now >= next_post) {
+            link_post_climate(local_t, local_h);
+            next_post = now + 20000000;
+        }
+        if (list.count > 0) {
+            float dt = shown_t - local_t;
+            float dh = shown_h - local_h;
+            if (dt < 0) {
+                dt = -dt;
+            }
+            if (dh < 0) {
+                dh = -dh;
+            }
+            int db = batt_pct - shown_batt;
+            if (db < 0) {
+                db = -db;
+            }
+            if (has_local != shown_ok || (has_local && (dt >= 0.1f || dh >= 1.0f)) ||
+                shown_batt < 0 || charging != shown_chg || db >= 3) {
+                changed = true;
+            }
+        }
+
         if (changed && list.count > 0) {
             link_thermo_t *cur = &list.items[index];
-            const char *st = cur->has_current ? "LINKED" : "NO TEMP YET";
-            ui_thermo(cur->name, cur->has_current, cur->current_c, cur->target_c, index, list.count, st);
+            ui_thermo(cur->name, has_local, local_t, has_local, local_h, cur->target_c, index,
+                      list.count, NULL, batt_pct, charging);
+            shown_t = local_t;
+            shown_h = local_h;
+            shown_ok = has_local;
+            shown_batt = batt_pct;
+            shown_chg = charging;
         } else if (changed && list.count == 0) {
             ui_message("NO THERMOSTAT", "CREATE ONE");
         }

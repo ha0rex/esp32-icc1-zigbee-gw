@@ -30,4 +30,5 @@ bool link_connect(int timeout_ms);
 bool link_discover(void);
 bool link_fetch(link_list_t *out);
 bool link_set_target(uint8_t id, float target_c);
+bool link_post_climate(float temp_c, float humidity);
 void link_forget(void);

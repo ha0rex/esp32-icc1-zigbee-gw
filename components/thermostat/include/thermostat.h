@@ -71,9 +71,11 @@ typedef struct {
 
     /**
      * "remote:<id>" when the device lives on the linked gateway.
+     * "eink:<mac>" when it is a paired e-ink reader.
      * Empty means the matching EUI is a local Zigbee device.
      */
     char sensor_ref[40];
+    char humidity_sensor_ref[40]; /**< "eink:<mac>" or empty (then use humidity EUI / sensor) */
     char switch_ref[40];
     char cooler_ref[40];
     char window_ref[40];
@@ -128,10 +130,12 @@ typedef struct {
     bool set_switch;
     bool set_cooler;
     char sensor_ref[40];
+    char humidity_sensor_ref[40];
     char switch_ref[40];
     char cooler_ref[40];
     char window_ref[40];
     bool set_sensor_ref;
+    bool set_humidity_sensor_ref;
     bool set_switch_ref;
     bool set_cooler_ref;
     bool set_window_ref;
@@ -192,6 +196,20 @@ esp_err_t group_set_brightness(uint8_t id, uint8_t brightness_pct);
 
 /** Re-read sensor into any thermostat using this EUI and re-evaluate heat/cool. */
 void group_on_sensor_updated(const uint8_t sensor_eui[8]);
+
+#define EINK_READER_MAX 4
+
+typedef struct {
+    char eui[20]; /**< "eink:" + 12 hex MAC digits */
+    char name[24];
+    float temp_c;
+    float humidity_pct;
+    int64_t last_seen_ms; /**< 0 until a reading arrives this boot */
+} eink_reader_info_t;
+
+/** Remember a paired reader and refresh thermostats that use it. */
+bool eink_reader_report(const char *mac12, float temp_c, float humidity_pct);
+int eink_reader_copy(eink_reader_info_t *out, int max);
 
 /**
  * Wake-button on a climate sensor: bump target of the first temperature thermostat

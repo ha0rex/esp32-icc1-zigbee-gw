@@ -1,42 +1,52 @@
 #include "ui.h"
 
 #include "epd.h"
-#include "font5x7.h"
+#include "font_ui.h"
 #include "pins.h"
 
 #include <stdio.h>
 #include <string.h>
 
-static void text(int x, int y, const char *s, int scale)
+static int face_width(const ui_face_t *face, const char *s)
 {
-    for (const char *p = s; *p; p++) {
-        char c = *p;
-        if (c >= 'a' && c <= 'z') {
-            c = (char)(c - 'a' + 'A');
+    int w = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < face->first || *p >= face->first + face->count) {
+            continue;
         }
-        int idx = (unsigned char)c - 32;
-        if (idx < 0 || idx >= 59) {
-            idx = 0;
+        w += face->glyphs[*p - face->first].advance;
+    }
+    return w;
+}
+
+static int draw_face(const ui_face_t *face, int x, int y, const char *s)
+{
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < face->first || *p >= face->first + face->count) {
+            continue;
         }
-        for (int col = 0; col < 5; col++) {
-            uint8_t bits = FONT5X7[idx][col];
-            for (int row = 0; row < 7; row++) {
-                if (bits & (1 << row)) {
-                    for (int sy = 0; sy < scale; sy++) {
-                        for (int sx = 0; sx < scale; sx++) {
-                            epd_pixel(x + col * scale + sx, y + row * scale + sy, true);
-                        }
-                    }
+        const ui_glyph_t *g = &face->glyphs[*p - face->first];
+        int stride = (g->w + 7) / 8;
+        for (int row = 0; row < g->h; row++) {
+            for (int col = 0; col < g->w; col++) {
+                uint8_t bits = face->bits[g->off + row * stride + col / 8];
+                if (bits & (uint8_t)(1 << (7 - (col & 7)))) {
+                    epd_pixel(x + g->dx + col, y + g->dy + row, true);
                 }
             }
         }
-        x += 6 * scale;
+        x += g->advance;
     }
+    return x;
 }
 
-static int text_width(const char *s, int scale)
+static void centered(int y, const char *s)
 {
-    return (int)strlen(s) * 6 * scale;
+    int x = (EPD_W - face_width(&FONT_SM, s)) / 2;
+    if (x < 4) {
+        x = 4;
+    }
+    draw_face(&FONT_SM, x, y, s);
 }
 
 static void hline(int x, int y, int w, int t)
@@ -57,77 +67,109 @@ static void vline(int x, int y, int h, int t)
     }
 }
 
-static void seg_digit(int x, int y, char ch, int w, int h, int t)
+static void ring(int cx, int cy, int r)
 {
-    if (ch == ' ') {
-        return;
-    }
-    int mid = h / 2;
-    bool a = false, b = false, c = false, d = false, e = false, f = false, g = false;
-    switch (ch) {
-    case '0': a = b = c = d = e = f = true; break;
-    case '1': b = c = true; break;
-    case '2': a = b = d = e = g = true; break;
-    case '3': a = b = c = d = g = true; break;
-    case '4': b = c = f = g = true; break;
-    case '5': a = c = d = f = g = true; break;
-    case '6': a = c = d = e = f = g = true; break;
-    case '7': a = b = c = true; break;
-    case '8': a = b = c = d = e = f = g = true; break;
-    case '9': a = b = c = d = f = g = true; break;
-    case '-': g = true; break;
-    default: break;
-    }
-    if (a) {
-        hline(x + t, y, w - 2 * t, t);
-    }
-    if (g) {
-        hline(x + t, y + mid - t / 2, w - 2 * t, t);
-    }
-    if (d) {
-        hline(x + t, y + h - t, w - 2 * t, t);
-    }
-    if (f) {
-        vline(x, y + t, mid - t, t);
-    }
-    if (b) {
-        vline(x + w - t, y + t, mid - t, t);
-    }
-    if (e) {
-        vline(x, y + mid + t / 2, h - mid - t, t);
-    }
-    if (c) {
-        vline(x + w - t, y + mid + t / 2, h - mid - t, t);
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            int d2 = dx * dx + dy * dy;
+            if (d2 <= r * r && d2 >= (r - 1) * (r - 1)) {
+                epd_pixel(cx + dx, cy + dy, true);
+            }
+        }
     }
 }
 
-static void big_temp(int y, float value, bool known, int digit_h)
+/* Small ring and a normal C, sitting on the top of the big digits. */
+static int draw_celsius(int x, int top)
 {
-    char buf[8];
-    if (!known) {
-        snprintf(buf, sizeof(buf), "--.-");
-    } else {
-        snprintf(buf, sizeof(buf), "%4.1f", (double)value);
+    int r = 2;
+    ring(x + r, top + r + 1, r);
+    draw_face(&FONT_SM, x + r * 2 + 3, top, "C");
+    return r * 2 + 3 + face_width(&FONT_SM, "C");
+}
+
+static void draw_drop(int x, int y, int h)
+{
+    int r = h / 3;
+    if (r < 3) {
+        r = 3;
     }
-    int w = digit_h / 2;
-    int t = digit_h > 40 ? 4 : 3;
-    int gap = 4;
-    int total = 0;
-    for (char *p = buf; *p; p++) {
-        total += (*p == '.') ? t + 2 : w + gap;
-    }
-    int x = (EPD_W - total) / 2;
-    for (char *p = buf; *p; p++) {
-        if (*p == '.') {
-            epd_pixel(x + 1, y + digit_h - 3, true);
-            epd_pixel(x + 2, y + digit_h - 3, true);
-            epd_pixel(x + 1, y + digit_h - 2, true);
-            epd_pixel(x + 2, y + digit_h - 2, true);
-            x += t + 2;
-        } else {
-            seg_digit(x, y, *p, w, digit_h, t);
-            x += w + gap;
+    int cx = x + r;
+    int cy = y + h - r - 1;
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            if (dx * dx + dy * dy <= r * r) {
+                epd_pixel(cx + dx, cy + dy, true);
+            }
         }
+    }
+    int base = cy - r / 3;
+    int span = base - y;
+    if (span < 1) {
+        span = 1;
+    }
+    for (int row = y; row <= base; row++) {
+        int half = (row - y) * r / span;
+        for (int dx = -half; dx <= half; dx++) {
+            epd_pixel(cx + dx, row, true);
+        }
+    }
+}
+
+static void stamp(int x, int y, const uint8_t *rows, int n, bool black)
+{
+    for (int row = 0; row < n; row++) {
+        uint8_t bits = rows[row];
+        for (int col = 0; col < 8; col++) {
+            if (bits & (1 << (7 - col))) {
+                epd_pixel(x + col, y + row, black);
+            }
+        }
+    }
+}
+
+static void draw_bolt(int x, int y)
+{
+    static const uint8_t bolt[] = {
+        0x18, 0x38, 0x7c, 0x3e, 0x1c, 0x3c, 0x78, 0x70, 0x60,
+    };
+    static const uint8_t halo[] = {
+        0x3c, 0x7c, 0xfe, 0x7f, 0x3e, 0x7e, 0xfc, 0xf8, 0xf0, 0xe0,
+    };
+    stamp(x - 1, y - 1, halo, 10, false);
+    stamp(x, y, bolt, 9, true);
+}
+
+static void draw_battery(int x, int y, int pct, bool charging)
+{
+    const int w = 28;
+    const int h = 14;
+    const int nub_w = 3;
+    const int nub_h = 6;
+    if (pct < 0) {
+        pct = 0;
+    }
+    if (pct > 100) {
+        pct = 100;
+    }
+    hline(x, y, w, 1);
+    hline(x, y + h - 1, w, 1);
+    vline(x, y, h, 1);
+    vline(x + w - 1, y, h, 1);
+    int ny = y + (h - nub_h) / 2;
+    hline(x + w, ny, nub_w, 1);
+    hline(x + w, ny + nub_h - 1, nub_w, 1);
+    vline(x + w + nub_w - 1, ny, nub_h, 1);
+    int inner_w = w - 4;
+    int fill = (pct * inner_w + 50) / 100;
+    if (pct > 0 && fill < 2) {
+        fill = 2;
+    }
+    for (int i = 0; i < fill; i++) {
+        vline(x + 2 + i, y + 2, h - 4, 1);
+    }
+    if (charging) {
+        draw_bolt(x + (w - 8) / 2, y + (h - 9) / 2);
     }
 }
 
@@ -144,21 +186,12 @@ static void frame(void)
     }
 }
 
-static void centered(int y, const char *s, int scale)
-{
-    int x = (EPD_W - text_width(s, scale)) / 2;
-    if (x < 4) {
-        x = 4;
-    }
-    text(x, y, s, scale);
-}
-
 void ui_message(const char *title, const char *line2)
 {
     frame();
-    centered(40, title ? title : "", 2);
+    centered(72, title ? title : "");
     if (line2 && line2[0]) {
-        centered(80, line2, 2);
+        centered(100, line2);
     }
     epd_show();
 }
@@ -166,38 +199,73 @@ void ui_message(const char *title, const char *line2)
 void ui_setup(void)
 {
     frame();
-    centered(16, "WIFI SETUP", 2);
-    centered(48, "JOIN", 2);
-    centered(70, "THERMOREMOTE", 1);
-    centered(90, "PASS", 2);
-    centered(112, "THERMOSTAT", 1);
-    centered(140, "OPEN", 2);
-    centered(162, "192.168.4.1", 1);
+    centered(16, "WIFI SETUP");
+    centered(42, "JOIN");
+    centered(64, "THERMOREMOTE");
+    centered(92, "PASS");
+    centered(114, "THERMOSTAT");
+    centered(142, "OPEN");
+    centered(164, "192.168.4.1");
     epd_show();
 }
 
-void ui_thermo(const char *name, bool has_current, float current_c, float target_c, int index,
-               int count, const char *status)
+void ui_thermo(const char *name, bool has_temp, float temp_c, bool has_hum, float humidity_pct,
+               float target_c, int index, int count, const char *status, int battery_pct,
+               bool charging)
 {
     frame();
-    char title[40];
-    const char *nm = (name && name[0]) ? name : "THERMO";
+    char title[48];
+    const char *nm = (name && name[0]) ? name : "Thermo";
     if (count > 1) {
-        snprintf(title, sizeof(title), "%.16s %d/%d", nm, index + 1, count);
+        snprintf(title, sizeof(title), "%.18s %d/%d", nm, index + 1, count);
     } else {
         snprintf(title, sizeof(title), "%.24s", nm);
     }
-    centered(8, title, 1);
-    big_temp(28, current_c, has_current, 56);
-    centered(96, "NOW", 1);
+    centered(8, title);
 
-    char tgt[16];
-    snprintf(tgt, sizeof(tgt), "TARGET %.1f", (double)target_c);
-    centered(130, tgt, 2);
-    centered(160, "LEFT-  RIGHT+", 1);
-    if (count > 1) {
-        centered(174, "CENTER NEXT", 1);
+    char temp[8];
+    if (!has_temp) {
+        snprintf(temp, sizeof(temp), "--.-");
+    } else {
+        snprintf(temp, sizeof(temp), "%.1f", (double)temp_c);
     }
-    centered(EPD_H - 16, status ? status : "", 1);
+    int unit_w = 4 + 2 * 2 + 3 + face_width(&FONT_SM, "C");
+    int num_w = face_width(&FONT_LG, temp);
+    int tx = (EPD_W - num_w - unit_w) / 2;
+    if (tx < 2) {
+        tx = 2;
+    }
+    int temp_y = 32;
+    int after = draw_face(&FONT_LG, tx, temp_y, temp);
+    int digit_top = temp_y + FONT_LG.glyphs['0' - FONT_LG.first].dy;
+    draw_celsius(after + 4, digit_top);
+
+    char hum[8];
+    if (has_hum) {
+        snprintf(hum, sizeof(hum), "%.0f%%", (double)humidity_pct);
+    } else {
+        snprintf(hum, sizeof(hum), "--%%");
+    }
+    int drop_h = 16;
+    int drop_w = (drop_h / 3) * 2 + 1;
+    int gap = 6;
+    int row_w = drop_w + gap + face_width(&FONT_MD, hum);
+    int hx = (EPD_W - row_w) / 2;
+    if (hx < 4) {
+        hx = 4;
+    }
+    int hy = 112;
+    draw_drop(hx, hy + 4, drop_h);
+    draw_face(&FONT_MD, hx + drop_w + gap, hy, hum);
+
+    char tgt[20];
+    snprintf(tgt, sizeof(tgt), "Target %.1f", (double)target_c);
+    centered(150, tgt);
+
+    draw_battery(6, EPD_H - 8 - 14, battery_pct, charging);
+    if (status && status[0]) {
+        int sw = face_width(&FONT_SM, status);
+        draw_face(&FONT_SM, EPD_W - 8 - sw, EPD_H - 8 - FONT_SM.height, status);
+    }
     epd_show();
 }

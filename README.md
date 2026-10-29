@@ -18,7 +18,7 @@ Phone / Home app / browser
      Zigbee mesh
 ```
 
-**Current firmware version:** `0.3.52` (see `PROJECT_VER` in `CMakeLists.txt`)
+**Current firmware version:** `0.3.53` (see `PROJECT_VER` in `CMakeLists.txt`)
 
 **Repo:** [ha0rex/esp32-icc1-zigbee-gw](https://github.com/ha0rex/esp32-icc1-zigbee-gw)
 
@@ -43,7 +43,7 @@ One tree for all targets. Select the chip with `idf.py set-target …`. The port
 | **HomeKit bridge** | Opt-in exposure of devices and groups; setup code `111-22-333` |
 | **Remotes** | HomeKit buttons (stateless/stateful) **or** direct control of lights/switches/groups |
 | **Grouped devices** | General groups + **temperature** thermostats (optional heater/cooler, gap & hysteresis, humidity-forced heat) or **humidity** regulators; **After power failure** on general groups (mains power-on/brownout only — not flash/USB reboot) |
-| **E-ink remote** | A paired ESP32-C3 reader shows the temperature thermostat’s **current** temperature and changes the **target** with the side buttons (`thermo-remote/`) |
+| **E-ink remote** | A paired ESP32-C3 reader shows its own temperature and humidity, changes the thermostat **target** with the side buttons, and can be the thermostat’s temperature and humidity sensor (`thermo-remote/`) |
 | **Portal** | SoftAP + home Wi‑Fi management (scan APs by BSSID for mesh, primary + secondary fallback) |
 | **Sniffer** | Live Zigbee RX/TX/EVT log with friendly device names |
 | **OTA** | Dual-slot update with **Stable** / **Nightly** channels; CI builds each target and the portal picks the matching binary |
@@ -167,15 +167,17 @@ Do **not** form a new Zigbee network on the new ESP if the ICC still holds the o
 
 | Control | Action |
 | --- | --- |
-| Screen | Current temperature from the gateway thermostat (not the reader’s own sensor) |
+| Screen | Onboard temperature in a large typeface with a small °C, and humidity as a drop icon, the number, and %. Battery icon in the bottom-left corner shows the level and a bolt while charging. Target comes from the gateway thermostat |
 | Left | Target **−0.5 °C** |
 | Right | Target **+0.5 °C** |
 | Center | Next temperature thermostat, when more than one exists |
-| Hold left + right | Forget Wi-Fi and open setup again |
+| Hold center | Forget Wi-Fi and open setup again |
 
-Target stays in the gateway’s **10–38 °C** range. The reader does not use its temperature or humidity sensor.
+Target stays in the gateway’s **10–38 °C** range. The reader reads an onboard AHT30 or SHT30 and posts that reading to the gateway about every 20 seconds.
 
 On a gateway running **0.3.52+**, the reader discovers the portal with a UDP broadcast (`ICC-THERMO?` on port **41241**) and uses `GET`/`POST /api/thermo-remote`. Older gateway firmware still works if you type the portal IP on the setup page; the reader then uses `/api/status` and `/api/thermostats/update`.
+
+On **0.3.53+**, a reader that has reported in is listed as **Reader XXXX** in the thermostat form. Pick it as the temperature sensor, the humidity sensor, or both. If you pick it only as the temperature sensor and leave humidity empty, that same reader supplies humidity too. The choice is kept across a gateway reboot. A reading older than 10 minutes is not used to run the thermostat.
 
 Setup, when Wi-Fi is not saved: join **ThermoRemote** / **thermostat**, open `http://192.168.4.1`, enter the home Wi-Fi and an optional gateway IP.
 
@@ -194,7 +196,7 @@ Put the reader in ROM download mode first (hold **BOOT**, plug USB, release). Re
 esptool --chip esp32c3 --port /dev/cu.usbmodem101 --before default-reset write-flash 0 /path/to/flash-8MB.bin
 ```
 
-Pins, taken from the stock ebook firmware, live in `thermo-remote/main/pins.h`: SCK **10**, MOSI **7**, CS **12**, DC **13**, RST **20**, BUSY **21** (high while busy), 200×200. Left is GPIO**0**, right is GPIO**1**.
+Pins, taken from the stock ebook firmware, live in `thermo-remote/main/pins.h`: SCK **10**, MOSI **7**, CS **12**, DC **13**, RST **20**, BUSY **21** (high while busy), 200×200. The side buttons are one analog ladder on GPIO**1**. GPIO**0** is the battery divider, not a button. The corner icon uses the stock count curve on that pin (about **2200** empty, **2850** full, or a calibrated full-scale count the stock firmware left behind). A bolt is drawn while a USB host is attached — that cable charges the cell. The red charge LED is not wired to a GPIO, so a power-only adapter does not light the bolt. The climate chip is an AHT30 (I2C `0x38`) or SHT30 (`0x44`) on SDA **3** / SCL **2**.
 
 ---
 

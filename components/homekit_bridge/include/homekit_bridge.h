@@ -21,6 +21,8 @@ esp_err_t homekit_bridge_start(void);
 void homekit_bridge_get_status(homekit_bridge_status_t *out);
 /** Rebuild bridged accessories from Zigbee device table (call after edits). */
 esp_err_t homekit_bridge_sync_devices(void);
+/** Push current thermostat temperature, humidity, and heat state to HomeKit. */
+void homekit_bridge_refresh_groups(void);
 
 #ifdef __cplusplus
 }

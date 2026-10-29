@@ -458,6 +458,21 @@ bool link_fetch(link_list_t *out)
     return true;
 }
 
+bool link_post_climate(float temp_c, float humidity)
+{
+    uint8_t mac[6];
+    if (esp_wifi_get_mac(WIFI_IF_STA, mac) != ESP_OK) {
+        return false;
+    }
+    char body[96];
+    snprintf(body, sizeof(body),
+             "{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"temp_c\":%.2f,\"humidity\":%.1f}", mac[0], mac[1],
+             mac[2], mac[3], mac[4], mac[5], (double)temp_c, (double)humidity);
+    int status = 0;
+    http_call("/api/thermo-remote/climate", body, &status);
+    return status == 200;
+}
+
 bool link_set_target(uint8_t id, float target_c)
 {
     char body[64];

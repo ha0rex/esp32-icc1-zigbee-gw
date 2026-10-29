@@ -544,6 +544,27 @@ static esp_err_t api_status(httpd_req_t *req)
         }
         first = false;
     }
+    {
+        eink_reader_info_t readers[EINK_READER_MAX];
+        int nread = eink_reader_copy(readers, EINK_READER_MAX);
+        for (int i = 0; i < nread && pos + 520 < sizeof(s_json); i++) {
+            char rname[48];
+            json_escape(readers[i].name, rname, sizeof(rname));
+            pos += (size_t)snprintf(
+                s_json + pos, sizeof(s_json) - pos,
+                "%s{\"eui64\":\"%s\",\"node_id\":0,\"type\":\"end\",\"label\":\"\","
+                "\"name\":\"%s\",\"manufacturer\":\"Thermo\",\"model\":\"E-ink reader\","
+                "\"firmware\":\"\",\"kind\":\"sensor\",\"has_temp\":true,\"temperature_c\":%.2f,"
+                "\"has_humidity\":true,\"humidity_pct\":%.1f,\"has_battery\":false,\"battery_pct\":0,"
+                "\"has_onoff\":false,\"onoff_on\":false,\"binary_on\":false,\"has_level\":false,"
+                "\"brightness\":0,\"buttons\":0,\"button_modes\":[],\"button_on\":[],"
+                "\"button_names\":[],\"remote_type\":0,\"targets\":[],\"target_groups\":[],"
+                "\"rssi\":0,\"lqi\":0,\"homekit_expose\":false,\"last_seen_ms\":%lld}",
+                first ? "" : ",", readers[i].eui, rname, (double)readers[i].temp_c,
+                (double)readers[i].humidity_pct, (long long)readers[i].last_seen_ms);
+            first = false;
+        }
+    }
     pos += (size_t)snprintf(s_json + pos, sizeof(s_json) - pos, "],\"groups\":[");
     first = true;
     for (uint16_t i = 0; i < GROUP_MAX && pos + 700 < sizeof(s_json); i++) {
@@ -593,7 +614,9 @@ static esp_err_t api_status(httpd_req_t *req)
                     break;
                 }
             }
-            if (has_hum_sensor) {
+            if (g.humidity_sensor_ref[0]) {
+                snprintf(heui, sizeof(heui), "%s", g.humidity_sensor_ref);
+            } else if (has_hum_sensor) {
                 ezsp_format_eui64(g.humidity_sensor_eui, heui, sizeof(heui));
             } else {
                 heui[0] = '\0';
@@ -1630,17 +1653,33 @@ static bool parse_dev_ref(const char *s, uint8_t eui[8], char *ref, size_t refn,
         snprintf(ref, refn, "%s", s);
         return true;
     }
-    return parse_eui64(s, eui);
-}
-
-/** Parse optional EUI: empty / "none" → zero EUI (ok). Invalid non-empty → false. */
-static bool parse_optional_eui64(const char *s, uint8_t out[8])
-{
-    memset(out, 0, 8);
-    if (!s || !s[0] || strcmp(s, "none") == 0) {
+    if (strncmp(s, "eink:", 5) == 0) {
+        const char *m = s + 5;
+        if (!ref || refn < 18) {
+            return false;
+        }
+        for (int i = 0; i < 12; i++) {
+            char c = m[i];
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) {
+                return false;
+            }
+        }
+        if (m[12] != '\0') {
+            return false;
+        }
+        memcpy(ref, "eink:", 5);
+        for (int i = 0; i < 12; i++) {
+            char c = m[i];
+            if (c >= 'A' && c <= 'F') {
+                c = (char)(c - 'A' + 'a');
+            }
+            ref[5 + i] = c;
+        }
+        ref[17] = '\0';
         return true;
     }
-    return parse_eui64(s, out);
+    return parse_eui64(s, eui);
 }
 
 static esp_err_t api_group_create(httpd_req_t *req)
@@ -1661,7 +1700,7 @@ static esp_err_t api_group_create(httpd_req_t *req)
     if (strcmp(type_s, "thermostat") == 0) {
         char seui_s[40] = {0}, sweui_s[40] = {0}, ceui_s[40] = {0}, heui_s[40] = {0};
         char weui_s[40] = {0};
-        char sref[40] = {0}, href[40] = {0}, cref[40] = {0}, wref[40] = {0};
+        char sref[40] = {0}, href[40] = {0}, cref[40] = {0}, wref[40] = {0}, humref[40] = {0};
         char mode_s[16] = {0}, reg_s[16] = {0};
         uint8_t seui[8], sweui[8], ceui[8], heui[8];
         json_get_string(body, "sensor_eui", seui_s, sizeof(seui_s));
@@ -1680,7 +1719,7 @@ static esp_err_t api_group_create(httpd_req_t *req)
             !parse_dev_ref(sweui_s, sweui, href, sizeof(href), true) ||
             !parse_dev_ref(ceui_s, ceui, cref, sizeof(cref), true) ||
             !parse_dev_ref(weui_s, (uint8_t[8]){0}, wref, sizeof(wref), true) ||
-            !parse_optional_eui64(heui_s, heui)) {
+            !parse_dev_ref(heui_s, heui, humref, sizeof(humref), true)) {
             httpd_resp_set_status(req, "400 Bad Request");
             httpd_resp_set_type(req, "application/json");
             return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid sensor/actuator eui\"}");
@@ -1701,6 +1740,13 @@ static esp_err_t api_group_create(httpd_req_t *req)
         uint8_t mode = parse_thermo_mode_str(mode_s, kind);
         err = group_create_thermostat(name, kind, seui, heui, sweui, ceui, target, target_rh, gap,
                                       hyst, force_rh, mode, hk, sref, href, cref, wref, &id);
+        if (err == ESP_OK && humref[0]) {
+            group_update_t upd = {0};
+            upd.set_humidity_sensor = true;
+            upd.set_humidity_sensor_ref = true;
+            snprintf(upd.humidity_sensor_ref, sizeof(upd.humidity_sensor_ref), "%s", humref);
+            err = group_update(id, &upd);
+        }
     } else {
         /* Default: general grouped device */
         uint8_t members[GROUP_MAX_MEMBERS][8];
@@ -1796,9 +1842,15 @@ static esp_err_t api_group_update(httpd_req_t *req)
         upd.set_sensor = upd.sensor_ref[0] == 0;
         upd.set_sensor_ref = true;
     }
-    if (json_get_string(body, "humidity_sensor_eui", heui_s, sizeof(heui_s)) &&
-        parse_optional_eui64(heui_s, upd.humidity_sensor_eui)) {
+    if (json_get_string(body, "humidity_sensor_eui", heui_s, sizeof(heui_s))) {
+        if (!parse_dev_ref(heui_s, upd.humidity_sensor_eui, upd.humidity_sensor_ref,
+                           sizeof(upd.humidity_sensor_ref), true)) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid humidity sensor\"}");
+        }
         upd.set_humidity_sensor = true;
+        upd.set_humidity_sensor_ref = true;
     }
     if (json_get_string(body, "switch_eui", sweui_s, sizeof(sweui_s))) {
         if (!parse_dev_ref(sweui_s, upd.switch_eui, upd.switch_ref, sizeof(upd.switch_ref), true)) {
@@ -2228,6 +2280,29 @@ static esp_err_t api_thermo_remote_post(httpd_req_t *req)
     return httpd_resp_sendstr(req, resp);
 }
 
+static esp_err_t api_thermo_remote_climate(httpd_req_t *req)
+{
+    char body[160] = {0};
+    read_body(req, body, sizeof(body));
+    char mac[16] = {0};
+    if (!json_get_string(body, "mac", mac, sizeof(mac)) || !strstr(body, "\"temp_c\"") ||
+        !strstr(body, "\"humidity\"")) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"mac, temp_c, humidity required\"}");
+    }
+    float temp_c = json_get_float(body, "temp_c", -100.0f);
+    float humidity = json_get_float(body, "humidity", -1.0f);
+    if (!eink_reader_report(mac, temp_c, humidity)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"reading rejected\"}");
+    }
+    homekit_bridge_refresh_groups();
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 static void thermo_discover_task(void *arg)
 {
     (void)arg;
@@ -2301,7 +2376,7 @@ esp_err_t web_server_start(void)
     /* Above HAP httpd (idle+5) so a busy Home session cannot starve the portal. */
     config.task_priority = tskIDLE_PRIORITY + 6;
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 52;
+    config.max_uri_handlers = 53;
     /* 16384 does not fit in internal RAM beside the HomeKit server. */
     config.stack_size = 12288;
     /* OTA upload streams ~1 MiB; keep headroom between flash-write chunks. */
@@ -2345,6 +2420,7 @@ esp_err_t web_server_start(void)
         {.uri = "/api/thermostats/remove", .method = HTTP_POST, .handler = api_thermo_remove},
         {.uri = "/api/thermo-remote", .method = HTTP_GET, .handler = api_thermo_remote_get},
         {.uri = "/api/thermo-remote", .method = HTTP_POST, .handler = api_thermo_remote_post},
+        {.uri = "/api/thermo-remote/climate", .method = HTTP_POST, .handler = api_thermo_remote_climate},
         {.uri = "/api/ota", .method = HTTP_GET, .handler = api_ota_status},
         {.uri = "/api/ota/channel", .method = HTTP_POST, .handler = api_ota_channel},
         {.uri = "/api/ota/offer", .method = HTTP_POST, .handler = api_ota_offer},

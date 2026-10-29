@@ -12,6 +12,7 @@
 
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -150,6 +151,150 @@ static TaskHandle_t s_task;
 static TaskHandle_t s_power_task;
 static uint8_t s_next_id = 1;
 static bool s_power_applied;
+
+#define EINK_STALE_US (10LL * 60 * 1000000)
+
+typedef struct {
+    bool used;
+    char mac[13];
+    float temp_c;
+    float hum;
+    int64_t last_us;
+} eink_slot_t;
+
+static eink_slot_t s_eink[EINK_READER_MAX];
+
+static bool mac12_ok(const char *mac)
+{
+    if (!mac) {
+        return false;
+    }
+    for (int i = 0; i < 12; i++) {
+        char c = mac[i];
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) {
+            return false;
+        }
+    }
+    return mac[12] == '\0';
+}
+
+static char hex_lower(char c)
+{
+    if (c >= 'A' && c <= 'F') {
+        return (char)(c - 'A' + 'a');
+    }
+    return c;
+}
+
+static bool ref_is_eink(const char *ref)
+{
+    return ref && strncmp(ref, "eink:", 5) == 0 && mac12_ok(ref + 5);
+}
+
+static void mac_copy_lower(char dst[13], const char *src)
+{
+    for (int i = 0; i < 12; i++) {
+        dst[i] = hex_lower(src[i]);
+    }
+    dst[12] = '\0';
+}
+
+static const eink_slot_t *eink_find(const char *ref)
+{
+    if (!ref_is_eink(ref)) {
+        return NULL;
+    }
+    const char *mac = ref + 5;
+    for (int i = 0; i < EINK_READER_MAX; i++) {
+        if (!s_eink[i].used) {
+            continue;
+        }
+        bool same = true;
+        for (int c = 0; c < 12; c++) {
+            if (hex_lower(s_eink[i].mac[c]) != hex_lower(mac[c])) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return &s_eink[i];
+        }
+    }
+    return NULL;
+}
+
+static bool eink_live(const eink_slot_t *s, float *temp_c, float *humidity)
+{
+    if (!s || !s->used || s->last_us == 0) {
+        return false;
+    }
+    if (esp_timer_get_time() - s->last_us > EINK_STALE_US) {
+        return false;
+    }
+    if (temp_c) {
+        *temp_c = s->temp_c;
+    }
+    if (humidity) {
+        *humidity = s->hum;
+    }
+    return true;
+}
+
+static void eink_save_locked(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("einkrd", NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    typedef struct {
+        uint8_t used;
+        char mac[13];
+        float temp_c;
+        float hum;
+    } rec_t;
+    rec_t blob[EINK_READER_MAX];
+    memset(blob, 0, sizeof(blob));
+    for (int i = 0; i < EINK_READER_MAX; i++) {
+        blob[i].used = s_eink[i].used ? 1 : 0;
+        memcpy(blob[i].mac, s_eink[i].mac, sizeof(blob[i].mac));
+        blob[i].temp_c = s_eink[i].temp_c;
+        blob[i].hum = s_eink[i].hum;
+    }
+    if (nvs_set_blob(h, "v1", blob, sizeof(blob)) == ESP_OK) {
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
+static void eink_load_locked(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("einkrd", NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    typedef struct {
+        uint8_t used;
+        char mac[13];
+        float temp_c;
+        float hum;
+    } rec_t;
+    rec_t blob[EINK_READER_MAX];
+    size_t sz = sizeof(blob);
+    if (nvs_get_blob(h, "v1", blob, &sz) == ESP_OK && sz == sizeof(blob)) {
+        for (int i = 0; i < EINK_READER_MAX; i++) {
+            if (!blob[i].used || !mac12_ok(blob[i].mac)) {
+                continue;
+            }
+            s_eink[i].used = true;
+            mac_copy_lower(s_eink[i].mac, blob[i].mac);
+            s_eink[i].temp_c = blob[i].temp_c;
+            s_eink[i].hum = blob[i].hum;
+            s_eink[i].last_us = 0;
+        }
+    }
+    nvs_close(h);
+}
 
 static bool eui_is_zero(const uint8_t eui[8])
 {
@@ -347,6 +492,22 @@ static void nvs_save_locked(void)
             rn++;
         }
         nvs_set_blob(h, NVS_REFS, refs, sizeof(refs));
+        {
+            typedef struct {
+                uint8_t id;
+                char ref[40];
+            } humref_t;
+            humref_t hrs[GROUP_MAX];
+            memset(hrs, 0, sizeof(hrs));
+            for (uint16_t i = 0; i < GROUP_MAX; i++) {
+                if (!s_list[i].used || !s_list[i].humidity_sensor_ref[0]) {
+                    continue;
+                }
+                hrs[i].id = s_list[i].id;
+                copy_ref(hrs[i].ref, sizeof(hrs[i].ref), s_list[i].humidity_sensor_ref);
+            }
+            nvs_set_blob(h, "humref", hrs, sizeof(hrs));
+        }
         nvs_set_u8(h, "next_id", s_next_id);
         nvs_erase_key(h, NVS_KEY_V3);
         nvs_erase_key(h, NVS_KEY_V2);
@@ -577,6 +738,26 @@ static void nvs_load_locked(void)
             g->saved_heating = refs[i].saved_heating != 0;
         }
     }
+    {
+        typedef struct {
+            uint8_t id;
+            char ref[40];
+        } humref_t;
+        humref_t hrs[GROUP_MAX];
+        size_t hsz = sizeof(hrs);
+        if (nvs_get_blob(h, "humref", hrs, &hsz) == ESP_OK && hsz == sizeof(hrs)) {
+            for (uint16_t i = 0; i < GROUP_MAX; i++) {
+                if (hrs[i].id == 0 || !hrs[i].ref[0]) {
+                    continue;
+                }
+                group_t *g = find_by_id_locked(hrs[i].id);
+                if (g) {
+                    copy_ref(g->humidity_sensor_ref, sizeof(g->humidity_sensor_ref), hrs[i].ref);
+                }
+            }
+        }
+    }
+    eink_load_locked();
     nvs_close(h);
 }
 
@@ -621,6 +802,23 @@ static int find_free_slot_locked(void)
 
 static void refresh_humidity_locked(group_t *g)
 {
+    const char *href = NULL;
+    if (ref_is_eink(g->humidity_sensor_ref)) {
+        href = g->humidity_sensor_ref;
+    } else if (eui_is_zero(g->humidity_sensor_eui) && ref_is_eink(g->sensor_ref)) {
+        href = g->sensor_ref;
+    }
+    if (href) {
+        float temp_c = 0;
+        float humidity = 0;
+        if (!eink_live(eink_find(href), &temp_c, &humidity)) {
+            g->has_current_humidity = false;
+        } else {
+            g->has_current_humidity = true;
+            g->current_humidity_pct = humidity;
+        }
+        return;
+    }
     const uint8_t *hum_eui =
         eui_is_zero(g->humidity_sensor_eui) ? g->sensor_eui : g->humidity_sensor_eui;
     zb_device_t hum;
@@ -639,6 +837,18 @@ static void refresh_runtime_locked(group_t *g)
     }
     if (g->type == GROUP_TYPE_THERMOSTAT) {
         if (g->thermo_kind == GROUP_THERMO_KIND_HUMIDITY) {
+            if (ref_is_eink(g->sensor_ref)) {
+                float temp_c = 0;
+                float humidity = 0;
+                if (!eink_live(eink_find(g->sensor_ref), &temp_c, &humidity)) {
+                    g->has_current_humidity = false;
+                } else {
+                    g->has_current_humidity = true;
+                    g->current_humidity_pct = humidity;
+                }
+                g->has_current_temp = false;
+                return;
+            }
             zb_device_t sensor;
             if (!zigbee_host_get_device(g->sensor_eui, &sensor)) {
                 g->has_current_temp = false;
@@ -652,7 +862,16 @@ static void refresh_runtime_locked(group_t *g)
             g->has_current_temp = false;
             return;
         }
-        if (ref_is_remote(g->sensor_ref)) {
+        if (ref_is_eink(g->sensor_ref)) {
+            float temp_c = 0;
+            float humidity = 0;
+            if (!eink_live(eink_find(g->sensor_ref), &temp_c, &humidity)) {
+                g->has_current_temp = false;
+            } else {
+                g->has_current_temp = true;
+                g->current_temp_c = temp_c;
+            }
+        } else if (ref_is_remote(g->sensor_ref)) {
             peer_dev_t dev;
             if (!peer_link_device(g->sensor_ref + 7, &dev) || !dev.ok || !dev.has_temp) {
                 g->has_current_temp = false;
@@ -1104,6 +1323,96 @@ static void apply_thermo_control(group_t *g)
     }
 }
 
+static bool group_uses_eink(const group_t *g, const char *eui)
+{
+    if (!g || !eui || !eui[0]) {
+        return false;
+    }
+    const eink_slot_t *want = eink_find(eui);
+    if (!want) {
+        return false;
+    }
+    return eink_find(g->sensor_ref) == want || eink_find(g->humidity_sensor_ref) == want;
+}
+
+bool eink_reader_report(const char *mac12, float temp_c, float humidity_pct)
+{
+    if (!mac12_ok(mac12) || temp_c < -40.0f || temp_c > 85.0f || humidity_pct < 0.0f ||
+        humidity_pct > 100.0f) {
+        return false;
+    }
+    if (!s_mutex) {
+        return false;
+    }
+    char mac[13];
+    mac_copy_lower(mac, mac12);
+    char eui[20];
+    snprintf(eui, sizeof(eui), "eink:%s", mac);
+    lock();
+    int slot = -1;
+    int free_slot = -1;
+    for (int i = 0; i < EINK_READER_MAX; i++) {
+        if (s_eink[i].used && strcmp(s_eink[i].mac, mac) == 0) {
+            slot = i;
+            break;
+        }
+        if (!s_eink[i].used && free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (slot < 0) {
+        slot = free_slot;
+    }
+    if (slot < 0) {
+        slot = 0;
+    }
+    s_eink[slot].used = true;
+    memcpy(s_eink[slot].mac, mac, sizeof(s_eink[slot].mac));
+    s_eink[slot].temp_c = temp_c;
+    s_eink[slot].hum = humidity_pct;
+    s_eink[slot].last_us = esp_timer_get_time();
+    eink_save_locked();
+    for (uint16_t i = 0; i < GROUP_MAX; i++) {
+        if (s_list[i].used && s_list[i].type == GROUP_TYPE_THERMOSTAT &&
+            group_uses_eink(&s_list[i], eui)) {
+            apply_thermo_control(&s_list[i]);
+        }
+    }
+    unlock();
+    return true;
+}
+
+int eink_reader_copy(eink_reader_info_t *out, int max)
+{
+    if (!out || max <= 0 || !s_mutex) {
+        return 0;
+    }
+    int n = 0;
+    lock();
+    for (int i = 0; i < EINK_READER_MAX && n < max; i++) {
+        if (!s_eink[i].used) {
+            continue;
+        }
+        snprintf(out[n].eui, sizeof(out[n].eui), "eink:%s", s_eink[i].mac);
+        char tail[5];
+        for (int c = 0; c < 4; c++) {
+            char ch = s_eink[i].mac[8 + c];
+            if (ch >= 'a' && ch <= 'f') {
+                ch = (char)(ch - 'a' + 'A');
+            }
+            tail[c] = ch;
+        }
+        tail[4] = '\0';
+        snprintf(out[n].name, sizeof(out[n].name), "Reader %s", tail);
+        out[n].temp_c = s_eink[i].temp_c;
+        out[n].humidity_pct = s_eink[i].hum;
+        out[n].last_seen_ms = s_eink[i].last_us > 0 ? s_eink[i].last_us / 1000 : 0;
+        n++;
+    }
+    unlock();
+    return n;
+}
+
 void group_on_sensor_updated(const uint8_t sensor_eui[8])
 {
     if (!sensor_eui || !s_mutex) {
@@ -1273,7 +1582,7 @@ esp_err_t group_create_thermostat(const char *name, uint8_t thermo_kind, const u
         return ESP_ERR_INVALID_ARG;
     }
     thermo_kind = clamp_thermo_kind(thermo_kind);
-    bool remote_sensor = ref_is_remote(sensor_ref);
+    bool remote_sensor = ref_is_remote(sensor_ref) || ref_is_eink(sensor_ref);
     zb_device_t sens;
     memset(&sens, 0, sizeof(sens));
     if (!remote_sensor) {
@@ -1468,6 +1777,12 @@ esp_err_t group_update(uint8_t id, const group_update_t *upd)
         if (upd->set_humidity_sensor) {
             memcpy(g->humidity_sensor_eui, upd->humidity_sensor_eui, 8);
         }
+        if (upd->set_humidity_sensor_ref) {
+            copy_ref(g->humidity_sensor_ref, sizeof(g->humidity_sensor_ref), upd->humidity_sensor_ref);
+            if (ref_is_eink(g->humidity_sensor_ref)) {
+                memset(g->humidity_sensor_eui, 0, sizeof(g->humidity_sensor_eui));
+            }
+        }
         if (upd->set_switch) {
             memcpy(g->switch_eui, upd->switch_eui, 8);
         }
@@ -1476,7 +1791,7 @@ esp_err_t group_update(uint8_t id, const group_update_t *upd)
         }
         if (upd->set_sensor_ref) {
             copy_ref(g->sensor_ref, sizeof(g->sensor_ref), upd->sensor_ref);
-            if (ref_is_remote(g->sensor_ref)) {
+            if (ref_is_remote(g->sensor_ref) || ref_is_eink(g->sensor_ref)) {
                 memset(g->sensor_eui, 0, sizeof(g->sensor_eui));
             }
         }

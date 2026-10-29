@@ -2998,6 +2998,69 @@ static void hk_hap_event(hap_event_t event, void *data)
     }
 }
 
+void homekit_bridge_refresh_groups(void)
+{
+    if (!s_started) {
+        return;
+    }
+    hap_char_t *temp[GROUP_MAX];
+    hap_char_t *heat[GROUP_MAX];
+    hap_char_t *hum[GROUP_MAX];
+    hap_char_t *hd[GROUP_MAX];
+    float tv[GROUP_MAX];
+    float hv[GROUP_MAX];
+    uint8_t heatv[GROUP_MAX];
+    uint8_t hdv[GROUP_MAX];
+    bool has_t[GROUP_MAX];
+    bool has_h[GROUP_MAX];
+    bool is_hum[GROUP_MAX];
+    int n = 0;
+
+    if (s_sync_mu) {
+        xSemaphoreTake(s_sync_mu, portMAX_DELAY);
+    }
+    for (uint16_t ti = 0; ti < GROUP_MAX && n < GROUP_MAX; ti++) {
+        if (!s_groups[ti].used || s_groups[ti].group_type != GROUP_TYPE_THERMOSTAT) {
+            continue;
+        }
+        group_t t;
+        if (!group_get_by_id(s_groups[ti].group_id, &t) || !t.homekit_expose) {
+            continue;
+        }
+        is_hum[n] = t.thermo_kind == GROUP_THERMO_KIND_HUMIDITY;
+        has_t[n] = t.has_current_temp;
+        has_h[n] = t.has_current_humidity;
+        tv[n] = t.current_temp_c;
+        hv[n] = t.current_humidity_pct;
+        heatv[n] = hk_current_heat_cool_state(&t);
+        hdv[n] = hk_current_hd_state(&t);
+        temp[n] = s_groups[ti].curr_temp_char;
+        heat[n] = s_groups[ti].curr_state_char;
+        hum[n] = s_groups[ti].curr_hum_char;
+        hd[n] = s_groups[ti].curr_hd_state_char;
+        n++;
+    }
+    if (s_sync_mu) {
+        xSemaphoreGive(s_sync_mu);
+    }
+    for (int i = 0; i < n; i++) {
+        if (is_hum[i]) {
+            if (has_h[i]) {
+                update_char_float_notify(hum[i], hv[i], 0.0f, 100.0f);
+            }
+            update_char_uint8(hd[i], hdv[i], 0, 3);
+        } else {
+            if (has_t[i]) {
+                update_char_float_notify(temp[i], tv[i], 0.0f, 100.0f);
+            }
+            update_char_uint8(heat[i], heatv[i], 0, 2);
+            if (has_h[i]) {
+                update_char_float_notify(hum[i], hv[i], 0.0f, 100.0f);
+            }
+        }
+    }
+}
+
 esp_err_t homekit_bridge_sync_devices(void)
 {
     if (!s_started) {
